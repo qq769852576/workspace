@@ -1,0 +1,230 @@
+# Versal VE2802 定制板上板前 Bring-up 与 QDMA/Bender 迁移分析任务
+
+## 1. 项目背景
+
+目前项目基于 AMD Versal VE2802 平台进行开发。
+
+现阶段已有一块 AMD VEK280 公板作为验证平台，并已经在公板上开展 CPM5/QDMA 相关开发。
+
+后续将使用一块基于 VE2802 的定制板。
+
+目标是：
+
+1. 在 VEK280 公板上提前完成 QDMA + Bender 数字链路验证；
+2. 定制板回来后快速完成 Hardware Bring-up；
+3. 尽量复用已经验证通过的 RTL；
+4. 尽可能减少定制板回来之后重新调试 frontend、pipeline、adapter 等模块的时间；
+5. 明确 VEK280 工程迁移到定制板时哪些部分必须修改、哪些部分可以直接复用。
+
+---
+
+# 2. 当前计划
+
+定制板上板计划暂定为三个阶段。
+
+## Stage 1：JTAG / Hardware Manager 验证
+
+定制板：
+
+```text
+Power On
+   ↓
+USB / JTAG
+   ↓
+Vivado Hardware Manager
+   ↓
+识别 XCVE2802
+```
+
+目标：
+
+* 确认 VE2802 能被 Hardware Manager 正常识别；
+* 验证基础供电；
+* 验证 POR；
+* 验证 JTAG；
+* 验证 USB-JTAG 链路；
+* 暂时不关注 PCIe、QDMA、Bender。
+
+---
+
+## Stage 2：QDMA Golden PDI
+
+烧录已经在 VEK280 上验证过的 CPM5/QDMA PDI。
+
+验证：
+
+```text
+Hardware Manager
+       ↓
+Program PDI
+       ↓
+CPM5 / PCIe
+       ↓
+Windows PCIe Enumeration
+       ↓
+QDMA Driver
+       ↓
+QDMA Device
+```
+
+目标：
+
+* 验证 PDI 可以正常下载；
+* 验证 CPM5；
+* 验证 PCIe GT；
+* 验证 PCIe REFCLK；
+* 验证 PERST#；
+* 验证 PCIe x8；
+* 验证 Windows 能枚举 FPGA；
+* 验证 QDMA Driver 可以绑定设备。
+
+如果这个阶段失败：
+
+暂时不要分析 Bender RTL。
+
+---
+
+## Stage 3：QDMA + Bender
+
+计划在 VEK280 公板上提前完成：
+
+```text
+Windows Host
+    ↓
+QDMA H2C
+    ↓
+frontend
+    ↓
+instruction BRAM
+    ↓
+fetch
+    ↓
+decoder
+    ↓
+pipeline
+    ↓
+adapter
+    ↓
+ILA / checker
+```
+
+验证通过后冻结核心 RTL。
+
+定制板回来后原则上只修改 board-specific 部分。
+
+---
+
+# 3. 需要分析的资料
+
+请重点分析：
+
+## A. VEK280
+
+需要查找并整理：
+
+* AMD VEK280 schematic
+* VEK280 User Guide
+* VEK280 Master XDC
+* VE2802 package pin information
+* CPM5/QDMA 官方文档
+
+重点关注：
+
+```text
+VE2802 Device
+Package
+Speed Grade
+
+JTAG
+MODE
+POR_B
+
+PMC MIO
+
+CPM5
+
+PCIe GT Quad
+PCIe Lane0~7
+
+PCIe REFCLK
+
+PERST#
+
+PL Clock
+PL Reset
+```
+
+不要仅根据网上二手文章推断。
+
+优先使用：
+
+1. AMD 官方文档
+2. AMD 官方 schematic
+3. AMD 官方 XDC
+4. 当前 Vivado 工程
+5. 当前 RTL
+
+---
+
+# 4. 等待定制板 schematic
+
+后续会提供定制板 schematic。
+
+拿到 schematic 后，必须进行：
+
+```text
+VEK280
+   VS
+Custom VE2802 Board
+```
+
+逐项比较。
+
+---
+
+# 5. 第一项：器件确认
+
+建立表格：
+
+| Item        | VEK280 | Custom Board | Same? | Impact |
+| ----------- | ------ | ------------ | ----- | ------ |
+| Device      |        |              |       |        |
+| Package     |        |              |       |        |
+| Speed Grade |        |              |       |        |
+| CPM Type    |        |              |       |        |
+
+重点回答：
+
+* 是否为同一个 VE2802 part？
+* package 是否完全一致？
+* speed grade 是否一致？
+
+如果 FPGA part 不一致：
+
+明确说明 Vivado 工程需要修改哪些内容。
+
+---
+
+# 6. 第二项：JTAG 对比
+
+需要 trace：
+
+```text
+USB
+ ↓
+USB-JTAG Bridge
+ ↓
+TCK
+TMS
+TDI
+TDO
+ ↓
+XCVE2802
+```
+
+比较：
+
+```text
+VEK280 JTAG
+        VS
+```
