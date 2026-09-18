@@ -1,0 +1,15 @@
+我看了一下你之前给我的这些 pattern，想确认一下它们的设计思路。
+
+我现在有一点没太理解：比如 `parallel_access` 里面候选 row 看起来是按 0、1、2、3……这样连续生成的，`grid` 里面也会生成一批 row 地址后再排序。
+
+我原本理解的 RowHammer pattern 通常是围绕少量 aggressor row 反复访问，比如固定几个 row、相邻/间隔几个 row，或者按照一定概率在这些 aggressor row 之间切换，而不是连续访问很多 row。
+
+所以想确认一下：
+
+1. 这些 pattern 的主要目的，是模拟真实的 RowHammer access pattern，还是主要用于给 PRAC/RHR 逻辑构造不同的访问分布和压力测试？
+2. `parallel_access` 里连续 row（0、1、2……）是有特定实验含义，还是只是为了方便生成候选地址？
+3. `grid` 里面先随机生成地址、最后再按地址排序，这个排序是算法本身需要，还是只是仿真/统计方便？
+4. 如果后续要把这些 pattern 搬到 Bender 上，是不是只需要保持访问次数、概率分布和权重这些统计特征，而不需要严格复现现在生成出来的完整 ACT sequence？
+5. 有没有对应的论文、spec、已有 testcase，或者原始 pattern 定义可以参考？我想先把每种 pattern 的物理含义理解清楚，再考虑怎么映射到 Bender。
+
+主要是 Bender 的 instruction memory 比较有限，所以如果这些 pattern 本质上只是描述一种访问分布，我可能会考虑用少量地址 + loop/counter 来实现，而不是把所有 ACT 都展开成指令。
