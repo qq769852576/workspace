@@ -1,0 +1,12 @@
+cd pattern_to_FPGA/cyclic_xyz
+
+grep -n "module " *.sv
+grep -n "cyclic_xyz" *.sv
+grep -n "simulation.pat" *.sv
+grep -n "\$fopen\|\$fwrite\|\$fdisplay" *.sv
+grep -n "x_num\|y_num\|z_num\|burty_num" *.sv
+
+  grep -RniE "ACT|PRE|READ|WRITE|REF|row|bank|col|hammer" \
+    --include="*.sv" .
+
+  head -100 simulation.pat
