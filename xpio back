@@ -1,0 +1,352 @@
+我看下来，**你同事对“冲突发生在哪里”的定位基本对，但对 `ANY_CMT_REGION` 的风险判断偏保守了一点；公司 AI 说“只能仿真综合、无法实现”则下结论太早。**
+
+现在真正的问题不是“XPIO 直通 DRAM 这条路不可实现”，而是你当前这条参考时钟链：
+
+`Bank702 GC → IBUFDS → MMCM_X2Y0 → BUFGCE_X2Y23 → XPLL_X6Y0 → Bank703 XPHY`
+
+违反了 Vivado 默认的 `BUFGCE → XPLL` 同 clock-region 放置规则，所以 synthesis 能过，到了 placement 才报 `Place 30-6831`。AMD 明确说明，Versal 默认 `CLOCK_DEDICATED_ROUTE=TRUE` 时，global clock buffer 与 MMCM/XPLL/DPLL 要位于同一个 clock region。([AMD 文档][1])
+
+### 先说最重要的结论
+
+**我不赞成现在就得出“XPIO 直通只能仿真，不能实现”。**
+
+你的问题更准确地说是：
+
+> **板上给 Bank703/XPIO PHY 的参考时钟不在理想的本地 CMT，因此必须重新设计 XPLL reference clock 的来源/路由。**
+
+而 AMD 本身是允许跨 clock region 给 XPLL 提供参考时钟的。
+
+AMD 对 Versal 的描述非常明确：XPIO bank 的 global clock 输入可以访问本 bank 和邻接 bank 的 XPLL，而且非邻接区域也可以通过 BUFG/global clock network 送到 XPLL。([AMD 文档][2])
+
+所以“板子只有 Bank702 有外部时钟”**并不天然意味着 Bank703 的 XPIO 不能用**。
+
+---
+
+## `ANY_CMT_REGION` 能不能用？
+
+可以，而且这里有个很关键的认知要纠正。
+
+你同事说：
+
+> `ANY_CMT_REGION` 将 ERROR 降 WARNING，时钟跨列走普通全局布线，XPIO/DDR PHY 对抖动敏感，只建议验证阶段。
+
+这句话前半段可以，**“走普通布线、因此抖动风险很大”这个理解不准确。**
+
+AMD 对 Versal 的定义是：
+
+`CLOCK_DEDICATED_ROUTE ANY_CMT_REGION`
+
+允许 BUFGCE 驱动另一个 clock region 中的 MMCM/XPLL/DPLL，而且：
+
+> **This value ensures the net is routed using only global clock resources.**
+
+也就是说仍然是 **global clock resources**，不是普通 PL fabric routing。([AMD 文档][1])
+
+真正应该非常谨慎的是：
+
+```tcl
+set_property CLOCK_DEDICATED_ROUTE FALSE ...
+```
+
+因为 AMD 明确说 `FALSE` 会让时钟使用 **fabric + global clock resources**，从而可能明显影响 jitter/skew。([AMD 文档][1])
+
+所以三种情况实际上是：
+
+| 方式                                | 路由                             | 我的评价                     |
+| --------------------------------- | ------------------------------ | ------------------------ |
+| `TRUE`                            | 本 clock region 专用 global clock | 最理想                      |
+| `SAME_CMT_ROW` / `ANY_CMT_REGION` | **global clock resources**     | AMD 支持，可正式评估             |
+| `FALSE`                           | fabric + global clock          | 尽量不要给 XPIO/XPLL refclk 用 |
+
+因此你们现在加：
+
+```tcl
+set_property CLOCK_DEDICATED_ROUTE ANY_CMT_REGION [get_nets sys_clk_200]
+```
+
+**不是单纯“把 ERROR 压成 WARNING 的野路子”**。
+
+它是 AMD 专门为跨 CMT 的 `BUFG → PLL` 场景定义的约束。([AMD 文档][1])
+
+---
+
+## 但我不会第一步就用 `ANY_CMT_REGION`
+
+因为从你给的信息看：
+
+```text
+MMCM_X2Y0
+XPLL_X6Y0
+```
+
+两边看起来很可能是**同一个水平 CMT row，不同 X 位置**。
+
+如果确认确实 row-aligned，我会优先尝试：
+
+```tcl
+set_property CLOCK_DEDICATED_ROUTE SAME_CMT_ROW [get_nets sys_clk_200]
+```
+
+AMD 对 `SAME_CMT_ROW` 的定义就是：
+
+> BUFG 可以驱动同一个 horizontal clock-region row 中其他位置的 MMCM/XPLL/DPLL，并且仍只使用 global clock resources。([AMD 文档][1])
+
+所以我的优先级会是：
+
+**本地 XPLL 直连 > SAME_CMT_ROW > ANY_CMT_REGION >>> FALSE**
+
+而不是直接：
+
+`TRUE失败 → ANY_CMT_REGION → 算了`
+
+---
+
+# 更重要的是：我建议你们改掉当前 `MMCM → BUFGCE → XPLL` 这条链
+
+这可能才是真正值得解决的地方。
+
+Advanced IO Wizard 的 XPLL 本身就支持两类 reference clock：
+
+> GC clock pin
+> 或通过 BUFG/global clock network 提供的 clock。([AMD 文档][3])
+
+而且 PG320 明确有：
+
+```text
+bank<x>_pll_clkin
+```
+
+这是 Advanced IO Wizard 内部 XPLL 的输入参考时钟。([AMD 文档][4])
+
+因此，如果 Bank702 上那个 200 MHz 输入本身是 **GC/clock-capable pin**，而 Bank703 与它满足 XPIO 的邻接 connectivity，我更倾向于研究：
+
+```text
+             ┌────────────→ ctrl_clk
+Bank702 GC ──┤
+             └────────────→ Bank703 XPLL
+                              ↓
+                            XPHY
+                              ↓
+                         LPDDR6 pins
+```
+
+而不是：
+
+```text
+Bank702
+ GC
+ ↓
+IBUFDS
+ ↓
+MMCM_X2Y0
+ ↓
+BUFGCE_X2Y23
+ ↓
+跨 CMT
+ ↓
+XPLL_X6Y0
+ ↓
+XPHY
+```
+
+因为你真正需要保护的是：
+
+**XPLL reference → XPHY → DQ/DQS/WCK timing**
+
+而不是非得让这个 reference 先经过一个 MMCM。
+
+---
+
+# 你同事问的 `ctrl_clk` 和 `bank0_pll_clkin`，其实也不用混为一谈
+
+这是当前讨论里非常容易混淆的两个 clock。
+
+### `bank0_pll_clkin`
+
+这是：
+
+> **XPLL reference clock**
+
+负责让 XPLL 产生真正用于 XPHY 高速 I/O 的 clock。
+
+它最关键。
+
+---
+
+### `ctrl_clk`
+
+则不是 DDR 数据通路高速时钟。
+
+PG320 明确写道：
+
+> CTRL clock 是 mandatory，reset state machine 和 XPHY nibble control 使用这个时钟；它可以来自器件内部或外部，甚至可以直接使用 XPLL 的 `CLKOUT1`。([AMD 文档][5])
+
+所以完全可以设计成：
+
+```text
+external GC
+    │
+    ├──────────────→ XPLL reference
+    │
+    └→ 或其他分频/PLL → ctrl_clk
+```
+
+甚至：
+
+```text
+external GC
+     ↓
+   XPLL
+     ├────────────→ XPHY
+     │
+     └─ CLKOUT1 ─→ ctrl_clk
+```
+
+因此：
+
+> “Bank703 没有一个单独 PCB clock，所以 ctrl_clk 没来源”
+
+不是问题。
+
+`ctrl_clk` 根本不要求 Bank703 单独有外部时钟。
+
+---
+
+# 你那个 `fifo_wr_clk_from_strobe_nibble` 也不是这个问题的核心
+
+你贴出来：
+
+```verilog
+.fifo_wr_clk(fifo_wr_clk_from_strobe_nibble)
+```
+
+实际上反而挺符合 XPHY 的结构。
+
+Advanced IO Wizard 文档明确说明，SYNC/BYPASS 模式下，对于 source-synchronous interface：
+
+> `FIFO_WR_CLK` 可以由 strobe input 驱动。([AMD 文档][6])
+
+所以：
+
+```text
+DQS / strobe
+     ↓
+XPHY nibble
+     ↓
+fifo_wr_clk_from_strobe_nibble
+```
+
+这是 receive datapath 自己的 strobe-domain 时钟。
+
+它与：
+
+```text
+bank0_pll_clkin
+ctrl_clk
+```
+
+不是一回事。
+
+你们现在最应该盯的是：
+
+```text
+bank0_pll_clkin
+        ↓
+      XPLL
+        ↓
+      XPHY
+```
+
+---
+
+# 所以我对你现在这个问题的判断是
+
+我会把目前状态定义为：
+
+> **XPIO PHY 本身没有证明不可实现，现在只是当前 reference-clock topology 无法满足默认 clock placement rule。**
+
+甚至从 Vivado 给出的错误来看，它已经明确告诉你替代方案：
+
+```tcl
+set_property CLOCK_DEDICATED_ROUTE ANY_CMT_REGION [get_nets sys_clk_200]
+```
+
+如果硬件架构本身完全不允许这个连接，Vivado 通常不会把一个 AMD 正式支持的 `CLOCK_DEDICATED_ROUTE` 方案直接作为建议给出来。
+
+---
+
+## 我建议你们下一步按这个顺序做
+
+1. **先确认 Bank702 的 200 MHz 时钟到底是不是 GC pin。**
+
+2. 确认 Bank702 和 Bank703 对 XPLL 来说是不是邻接/row-aligned XPIO region。
+
+3. 如果是 row-aligned，先试：
+
+```tcl
+set_property CLOCK_DEDICATED_ROUTE SAME_CMT_ROW [get_nets sys_clk_200]
+```
+
+而不是一上来 `ANY_CMT_REGION`。
+
+4. 如果不能 SAME_CMT_ROW，再使用 Vivado 建议的：
+
+```tcl
+set_property CLOCK_DEDICATED_ROUTE ANY_CMT_REGION [get_nets sys_clk_200]
+```
+
+5. Implementation 通过以后，不要只看“bitstream 能生成”，至少检查：
+
+```tcl
+report_clock_utilization
+report_timing_summary
+report_methodology
+```
+
+重点看：
+
+```text
+XPLL CLKIN
+XPLL LOCK
+clock route
+clock skew
+setup/hold
+Advanced IO Wizard timing
+```
+
+6. **并行研究更干净的拓扑：702 GC 直接作为 703 XPLL reference，绕开中间 MMCM→BUFGCE 的级联。**
+
+---
+
+我反而认为最后这一步是最值得你和同事研究的。
+
+因为 AMD 对 Versal XPIO 的架构明确说明：**GC input 可以直接访问同 bank 和 adjacent bank 的 XPLL**。([AMD 文档][2])
+
+所以如果 **702 与 703 确实是相邻 XPIO bank，并且 702 上的板载时钟接在 GC pin 上**，理论上你们可能根本不需要现在这个：
+
+```text
+IBUFDS → MMCM_X2Y0 → BUFGCE_X2Y23 → XPLL_X6Y0
+```
+
+跨 CMT cascade。
+
+可以把问题转化成更干净的：
+
+```text
+Bank702 GC
+    │
+    ├──→ Bank703 XPLL → XPHY → LP6
+    │
+    └──→ ctrl clock generation
+```
+
+**所以我现在不会放弃“Bender + XPIO 直通 DRAM”这条路。**目前这个错误更像是**板级时钟资源受限后，XPIO reference-clock topology 需要重新规划**，不是 XPIO 本身做不了。([AMD 文档][3])
+
+如果你愿意，我下一步可以直接根据你们这个 **Bank702 → Bank703** 的结构，给你画出 **3套可实现时钟拓扑（推荐 / 次选 / 临时验证）**，并把 `ctrl_clk / bank0_pll_clkin / fifo_wr_clk / XPLL / MMCM` 每根线该怎么接都明确下来。
+
+[1]: https://docs.amd.com/r/2023.2-English/ug1387-acap-hardware-ip-platform-dev-methodology/Using-the-CLOCK_DEDICATED_ROUTE-Constraint "Using the CLOCK_DEDICATED_ROUTE Constraint - Using the CLOCK_DEDICATED_ROUTE Constraint - 2023.2 English - UG1387"
+[2]: https://docs.amd.com/r/en-US/am003-versal-clocking-resources/Global-Clock-Inputs "Global Clock Inputs - Global Clock Inputs - AM003"
+[3]: https://docs.amd.com/r/1.0-English/pg320-advanced-io-wizard/Clocking?utm_source=chatgpt.com "Clocking - Clocking - 1.0 English - PG320"
+[4]: https://docs.amd.com/r/en-US/pg320-advanced-io-wizard/Ports-Connected-to-Adaptive-SoC-General-Interconnect-Logic?utm_source=chatgpt.com "Ports Connected to Adaptive SoC General Interconnect Logic - Ports Connected to Adaptive SoC General Interconnect Logic - 1.0 English - PG320"
+[5]: https://docs.amd.com/r/1.0-English/pg320-advanced-io-wizard/CTRL-Clock?contentId=EIAJXPmKZt_Fiwwd7Cu6~Q "CTRL Clock - CTRL Clock - 1.0 English - PG320"
+[6]: https://docs.amd.com/r/1.0-English/pg320-advanced-io-wizard/FIFO-Modes?utm_source=chatgpt.com "FIFO Modes - FIFO Modes - 1.0 English - PG320"
