@@ -1,0 +1,30 @@
+### 加班必要性
+
+当前 LPDDR6 Bender 定制板到板时间有所延期，原计划的定制板现场调试暂无法开展。但项目已进入平台部署及后续 Rowhammer 测试准备阶段，定制板到位后需要尽快完成 bring-up 并打通测试链路。
+
+为降低后续上板调试风险、缩短定制板到位后的调试周期，计划利用假期时间提前完成定制板上板前的关键问题收敛、数据链路预验证及测试方案准备，为后续板卡到位后的快速调试做好准备。
+
+### 预计具体工作
+
+1. **LPDDR6 Bender 定制板上板前准备及链路预验证**
+
+   * 分析并收敛当前 XPIO、Advanced IO Wizard、时钟资源及跨时钟列等 Implementation 相关问题；
+   * 结合定制板 Bank、时钟及 XPIO 资源分配，明确后续约束调整方案及重点验证项；
+   * 对 Bender frontend、pipeline、adapter 及 PCIe/QDMA 数据链路开展可提前进行的功能检查和预验证；
+   * 梳理定制板上电、PDI 加载、PCIe 枚举、数据通路验证等 Bring-up 流程，并形成问题定位检查清单。
+
+2. **Rowhammer 测试方案准备**
+
+   * 对接后续 Rowhammer pattern 测试需求，梳理 pattern 到 Bender 指令的转换及执行流程；
+   * 结合 Bender 指令存储容量限制，完善长 Pattern 的执行方案；
+   * 明确 victim row 数据回读、结果保存及测试结果判定方式。
+
+### 预计成果
+
+假期结束后预计输出：
+
+* LPDDR6 Bender 定制板上板前问题分析及约束处理方案；
+* Bender + QDMA 链路预验证结果；
+* 定制板 Bring-up 操作流程及检查清单；
+* Rowhammer Pattern 在 Bender 平台上的执行及回读方案；
+* 定制板到位后的调试任务清单及风险项。
