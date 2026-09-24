@@ -1,0 +1,1414 @@
+# 14 实施计划
+
+## 14.1 实施目标
+
+DDR6 MC实施阶段的目标是在现有DDR5 MC RTL骨架基础上，按照前述架构设计逐步完成DDR6功能演进、模块级验证、系统集成以及FPGA实现闭环。
+
+实施过程遵循以下基本原则：
+
+a) 优先复用现有DDR5 MC模块层级、Pipeline及数据通路；
+
+b) 先建立公共Identity、Event及状态边界，再实现上层功能；
+
+c) 先完成控制语义和RTL功能闭环，再进行真实PHY集成；
+
+d) 未冻结的外部协议、PHY接口或Product参数采用Fail Closed，不以默认值猜测Positive Path；
+
+e) 每个模块只有满足Coding Gate后才能进入正式RTL实施；
+
+f) 模块集成必须依据依赖关系逐步推进，不采用全模块并行修改后一次性联调；
+
+g) FPGA资源、RAM端口及Fmax问题应在RTL阶段持续评估，不集中留到最终实现阶段处理；
+
+h) 验证与RTL实施同步推进，不采用“全部代码完成后再补DV”的方式。
+
+本章中的实施阶段表示**技术依赖顺序**，不代表固定日历工期。具体人员配置、时间计划及并行开发安排由项目实施阶段另行确定。
+
+## 14.2 总体实施路线
+
+根据现有方案，DDR6 MC实施按照以下依赖关系推进：
+
+```text id="0w2a60"
+基础语义与PI边界
+      │
+      ▼
+Timing / Bank State
+      │
+      ▼
+Normal Command Path
+      │
+      ▼
+PRE / ACT及Maintenance基础
+      │
+      ▼
+Refresh / RFM
+      │
+      ▼
+Read / Write Data Path
+      │
+      ▼
+HIF / IH / TE前端集成
+      │
+      ▼
+Config / Geometry / MR
+      │
+      ▼
+FSP / Power / Training
+      │
+      ▼
+Retry / Error / Reset
+      │
+      ▼
+ALPG Integration
+      │
+      ▼
+FPGA Capacity / Fmax Closure
+      │
+      ▼
+PHY / Hardware Bring-up
+```
+
+**图14 DDR6 MC总体实施路线**
+
+原设计中的18项RTL实施顺序保留如下：
+
+```text id="m4sz31"
+1   PI Semantic Shell / Command Issue
+2   Timing Base + Reservation
+3   OpenRow / BSM
+4   CC / OS / GS
+5   PRE / Qualified Close
+6   ACT Lifetime
+7   BAT / PRFM / RFM
+8   Refresh
+9   Read
+10  Write
+11  HIF / IH / TE
+12  Config / Geometry
+13  MR
+14  FSP / Power / Training
+15  Retry / Error
+16  Reset / Re-init Integration
+17  ALPG Integration
+18  FPGA Capacity / Fmax Closure
+```
+
+为便于工程执行，本章将上述18项工作进一步归并为六个实施阶段。
+
+## 14.3 第一阶段：公共语义及PI基础
+
+### 14.3.1 实施内容
+
+第一阶段主要完成：
+
+a) Common Identity及Event字段定义；
+
+b) Command Descriptor；
+
+c) Admission Sequence；
+
+d) Attempt、Generation及Session/Epoch公共类型；
+
+e) PI Semantic Shell；
+
+f) Command Issue基本框架；
+
+g) 1:8 Simplified DFI逻辑Command Word；
+
+h) P0～P7 Phase Placement框架；
+
+i) Command Hold、Occupancy及Occurrence/Feedback基本接口。
+
+该阶段对应原实施顺序中的：
+
+```text id="z35e76"
+1 PI Semantic Shell / Command Issue
+```
+
+### 14.3.2 实施原则
+
+PI Semantic Shell可以在正式PHY接口完全冻结前开始实施，但所有依赖真实PHY行为的接口必须保持：
+
+```text id="4n8h55"
+Stub
+或
+Fail Closed
+```
+
+不得根据DDR5 donor接口猜测DDR6 PHY的：
+
+a) Physical Accept；
+
+b) Registered-equivalent；
+
+c) Read Return Carrier；
+
+d) Write Drain；
+
+e) Reset Flush；
+
+f) Training Result；
+
+g) Finite Latency。
+
+### 14.3.3 阶段输出
+
+本阶段至少形成：
+
+a) 公共RTL Type定义；
+
+b) Command Record定义；
+
+c) PI输入/输出接口定义；
+
+d) 1:8 Command Word结构；
+
+e) Basic Command Placement仿真；
+
+f) PI Stub Testbench；
+
+g) 初始Assertion。
+
+### 14.3.4 阶段退出条件
+
+进入下一阶段前，应确认：
+
+```text id="zqtm2a"
+Command Identity稳定
+Admission Identity稳定
+PI逻辑边界明确
+1:8 Logical Phase定义明确
+未知PHY接口全部Gated
+```
+
+## 14.4 第二阶段：Timing及DRAM状态基础
+
+### 14.4.1 实施内容
+
+第二阶段完成：
+
+```text id="8qm6t8"
+2 Timing Base + Reservation
+3 OpenRow / BSM
+```
+
+主要包括：
+
+a) Timing State Store；
+
+b) Timing Query；
+
+c) Timing Reservation；
+
+d) Legal Phase Mask；
+
+e) Actual Update；
+
+f) Same-cycle Timing Reducer；
+
+g) BSM七状态；
+
+h) OpenRow唯一Row Truth；
+
+i) ACT/PRE基础状态更新接口；
+
+j) State Sequence/Freshness机制。
+
+### 14.4.2 实施重点
+
+本阶段首先实现：
+
+```text id="m4f4z4"
+Committed Timing State
++
+Provisional Reservation
+```
+
+统一Query模型。
+
+随后建立：
+
+```text id="kus56e"
+BSM
+OpenRow
+Timing
+```
+
+三类独立Owner。
+
+不得将DDR5中已有的Page状态、Bank FSM或Local Timing Counter简单整体复制为DDR6状态真值。
+
+### 14.4.3 Storage同步评审
+
+Timing、BSM和OpenRow开始RTL编码时，应同步完成Storage Review：
+
+a) Depth；
+
+b) Width；
+
+c) Read Port；
+
+d) Write Port；
+
+e) Same-address策略；
+
+f) Reset行为；
+
+g) FF/LUTRAM/BRAM候选；
+
+h) Fmax风险。
+
+### 14.4.4 阶段退出条件
+
+至少满足：
+
+a) BSM/OpenRow/Timing职责边界完成Review；
+
+b) Row-hit/Row-miss状态Query可运行；
+
+c) Timing Query与Reservation可联合工作；
+
+d) ACT/PRE Actual能够更新正确Owner；
+
+e) Same-cycle冲突有明确Reducer；
+
+f) Directed Test及Assertion通过。
+
+## 14.5 第三阶段：Normal Command Path及Bank操作
+
+### 14.5.1 实施内容
+
+第三阶段完成：
+
+```text id="032saq"
+4 CC / OS / GS
+5 PRE / Qualified Close
+6 ACT Lifetime
+```
+
+### 14.5.2 CC/OS/GS
+
+首先建立：
+
+```text id="8qfjvv"
+TE-like Request Stub
+       │
+       ▼
+CC Candidate
+       │
+       ▼
+OS Selection
+       │
+       ▼
+GS Admission
+       │
+       ▼
+PI
+```
+
+此阶段不要求HIF/IH/TE全部完成，可以使用受控的Synthetic Transaction输入验证命令后端。
+
+重点验证：
+
+```text id="sknjvi"
+Selection != Admission
+Admission != Actual
+```
+
+以及GS All-or-none Resource Commit。
+
+### 14.5.3 PRE及Qualified Close
+
+随后实现：
+
+a) PRE Command Target Set；
+
+b) Timing Target Set；
+
+c) Actual Close Member Set；
+
+d) Accounting Member Set；
+
+e) Qualified Close；
+
+f) Auto-precharge Close接口。
+
+### 14.5.4 ACT Lifetime
+
+建立：
+
+```text id="1fkc92"
+EMPTY
+ -> RESERVED
+ -> LIVE
+ -> RETIRE
+```
+
+及Activation Generation。
+
+ACT Lifetime应作为后续PRAC/BAT、PRE及Retry等功能的公共身份基础。
+
+### 14.5.5 阶段退出条件
+
+至少应完成：
+
+a) Row-hit RD/WR Candidate；
+
+b) Row-miss PRE→ACT→RD/WR命令链；
+
+c) OS Hold及GS Backpressure；
+
+d) ACT/PRE Actual状态闭环；
+
+e) Qualified Close；
+
+f) ACT Generation全生命周期；
+
+g) PI Stub环境下完整Command Lifecycle仿真。
+
+## 14.6 第四阶段：Maintenance及数据通路
+
+### 14.6.1 实施内容
+
+第四阶段包含：
+
+```text id="aqivkj"
+7  BAT / PRFM / RFM
+8  Refresh
+9  Read
+10 Write
+```
+
+该阶段建立MC主要Maintenance及Data Path能力。
+
+## 14.7 RFM/PRAC/BAT实施
+
+实施顺序建议为：
+
+```text id="7l22pd"
+ACT Lifetime
+     │
+     ▼
+Qualified Close
+     │
+     ▼
+BAT / PRAC Accounting
+     │
+     ▼
+PRFM Obligation
+     │
+     ▼
+RFM Service
+```
+
+不得先写RFM FSM，再反向补ACT Identity。
+
+首先完成：
+
+a) BAT State；
+
+b) Qualified Close Accounting；
+
+c) PRFM Obligation；
+
+d) Shared PRE接口；
+
+e) RFM Service Context；
+
+f) RFM Candidate；
+
+g) RFM Actual Accounting；
+
+h) tRFM及Service Release。
+
+## 14.8 Refresh实施
+
+Refresh原则上沿现有PAS_RC骨架演进。
+
+优先保留：
+
+a) Timer/Calendar相关结构；
+
+b) Debt/Postpone思想；
+
+c) Selector；
+
+d) Existing Arbitration Shell。
+
+重点修改：
+
+```text id="4v7gxe"
+REFsb
+   ↓
+REF_AB / REF_DIST
+```
+
+并增加：
+
+a) Exact Target Expansion；
+
+b) Coverage；
+
+c) Shared PRE；
+
+d) Deadline；
+
+e) Latest-safe-start；
+
+f) Exact REF Actual Accounting。
+
+Refresh与RFM前端Accounting应独立实施，只共享后端Preparation及GS/PI通路。
+
+## 14.9 Read实施
+
+Read建议优先复用：
+
+```text id="12foxv"
+rt/rt.sv
+rd/rd.sv
+rd/rd_wrapper.sv
+```
+
+已有：
+
+a) Return Datapath；
+
+b) ECC/CRC；
+
+c) EOD；
+
+d) RMW/MRR分流；
+
+e) Host Read Data Path；
+
+原则上继续使用。
+
+新增重点为：
+
+```text id="abshri"
+Expected
+Return Correlation
+Assembly
+Result Hold
+Reclaim
+```
+
+实施顺序建议：
+
+```text id="2dujkn"
+Expected Allocation
+      │
+      ▼
+Assembly Allocation
+      │
+      ▼
+PI Return Map / ARM
+      │
+      ▼
+Return Match
+      │
+      ▼
+Assembly Reducer
+      │
+      ▼
+Result Hold
+      │
+      ▼
+Reclaim
+```
+
+Physical Return Carrier未冻结时，PI Return Semantic接口可以实施，但真实Positive Return Path应保持Gated。
+
+## 14.10 Write实施
+
+Write建议优先复用：
+
+```text id="l1pdza"
+memc_wu
+memc_wu_wdata_if
+HIF WDATA pointer相关结构
+```
+
+保留Payload RAM、Mask、Partial/RMW等已有数据处理逻辑。
+
+重点演进为：
+
+```text id="ls11rj"
+Raw Pointer
+   ↓
+Payload Handle {slot,generation}
+
+Payload
+   ≠
+Attempt
+   ≠
+Result
+```
+
+实施顺序为：
+
+```text id="1b4y0e"
+Payload Allocation
+      │
+      ▼
+Capture
+      │
+      ▼
+READY / Immutable
+      │
+      ▼
+GS Attempt Reservation
+      │
+      ▼
+PI Exact Join
+      │
+      ▼
+Physical Progress
+      │
+      ▼
+Result Hold
+      │
+      ▼
+Reservation Release
+      │
+      ▼
+Payload Reclaim
+```
+
+### 14.10.1 第四阶段退出条件
+
+本阶段完成后，应至少具备：
+
+a) Refresh基本Service闭环；
+
+b) RFM基本Service闭环；
+
+c) Shared PRE工作；
+
+d) Read Return完整内部生命周期；
+
+e) Write Payload及Attempt完整生命周期；
+
+f) Read/Write与GS/PI完成接口集成；
+
+g) Full/Backpressure情况下Existing Progress仍可继续；
+
+h) Directed Test和Assertion通过。
+
+## 14.11 第五阶段：前端及配置控制集成
+
+### 14.11.1 实施内容
+
+第五阶段包括：
+
+```text id="xcywqg"
+11 HIF / IH / TE
+12 Config / Geometry
+13 MR
+14 FSP / Power / Training
+```
+
+### 14.11.2 HIF/IH/TE
+
+由于前述后端命令及数据生命周期已经稳定，此阶段再将完整Host Request接入。
+
+主要实施：
+
+a) HIF Request/Order；
+
+b) Transaction Identity；
+
+c) Payload Handle关联；
+
+d) Parent/Child当前设计合同；
+
+e) IH Address Mapping；
+
+f) Geometry Canonicalization；
+
+g) Legality Check；
+
+h) TE Entry；
+
+i) Typed Dependency；
+
+j) Release Interface。
+
+其目标是形成完整：
+
+```text id="p33dh7"
+Host
+ -> HIF
+ -> IH
+ -> TE
+ -> CC
+ -> OS
+ -> GS
+ -> PI
+```
+
+主链。
+
+### 14.11.3 Config/Geometry
+
+在Normal Path基本稳定后，实现：
+
+```text id="yi180r"
+Candidate
+ -> Prepare
+ -> Safe Commit
+ -> Active Config / Geometry
+```
+
+重点确保：
+
+```text id="o2jtjy"
+NEW Config + OLD Geometry
+```
+
+或反向组合永远不可见。
+
+### 14.11.4 MR
+
+在Config、Geometry、GS、PI及Timing基本稳定后接入MR Service。
+
+实施重点：
+
+a) MRR；
+
+b) MRW；
+
+c) Pre/Post Wait；
+
+d) Readback Correlation；
+
+e) Programmed/Effective；
+
+f) MRUPDATE相关Context。
+
+### 14.11.5 FSP/Power/Training
+
+建议在MR、Timing和PI基本接口闭合后实施。
+
+主要实现：
+
+```text id="vx25ek"
+FSP：
+Quiesce → Switch → PHY → Training → Timing → Publish
+
+Power：
+Barrier → Entry → Low Power → Exit → Timing → Reopen
+
+Training：
+Dependency → PHY Request → Result → Retry/Complete
+```
+
+PHY Training算法不进入MC。
+
+### 14.11.6 第五阶段退出条件
+
+本阶段完成后，应形成：
+
+a) Normal Host Read/Write E2E；
+
+b) Active Config/Geometry；
+
+c) MR基本功能；
+
+d) FSP/Power/Training控制框架；
+
+e) 正常Host与Maintenance共同经过GS/PI；
+
+f) 关键Side-plane Service与Normal Traffic的Barrier机制；
+
+g) 对尚未关闭PHY接口的功能保持Fail Closed。
+
+## 14.12 第六阶段：异常恢复、ALPG及FPGA Closure
+
+### 14.12.1 实施内容
+
+最终控制集成阶段包括：
+
+```text id="7t1riw"
+15 Retry / Error
+16 Reset / Re-init Integration
+17 ALPG Integration
+18 FPGA Capacity / Fmax Closure
+```
+
+## 14.13 Retry/Error实施
+
+Retry应在Read、Write及PI Correlation基本稳定后实施，否则无法正确证明Old/Fresh Attempt边界。
+
+实施：
+
+```text id="j4gkw2"
+Fence Old
+ -> Correlation Proof
+ -> Authorization
+ -> Fresh Admission
+```
+
+Error Manager则在各Functional Owner已经具备Local Detector后完成统一：
+
+a) First Detail；
+
+b) Summary；
+
+c) Severity/Visibility；
+
+d) Containment；
+
+e) Recovery；
+
+f) Fatal Escalation。
+
+不得让Central Error Manager替代Local Safe Action。
+
+## 14.14 Reset/Re-init集成
+
+Reset属于全系统功能，因此安排在主要Owner和Side-plane功能稳定后进行最终集成。
+
+实施主链：
+
+```text id="fppqqh"
+Joint Host/HIF Boundary
+        │
+        ▼
+Local Owner Clear
+        │
+        ▼
+CDC/RDC Barrier
+        │
+        ▼
+PHY Flush
+        │
+        ▼
+DRAM Re-init
+        │
+        ▼
+Training
+        │
+        ▼
+Config/Geometry/Timing Reload
+        │
+        ▼
+Bank State Known
+        │
+        ▼
+MC Ready
+```
+
+各模块此前应已经完成Local Reset语义，本阶段负责建立跨Owner整体Recovery闭环。
+
+## 14.15 ALPG Integration
+
+ALPG应最后接入Normal MC公共后端。
+
+基本关系为：
+
+```text id="m1zi5m"
+Normal MC Command ----+
+                      |
+                      +--> Command MUX
+                      |
+ALPG Semantic Command-+
+                              │
+                              ▼
+                         Command Issue
+                              │
+                              ▼
+                         SDFI / PHY
+```
+
+实施前需要Normal MC具备稳定的：
+
+a) Quiesce；
+
+b) Drain；
+
+c) PI；
+
+d) Command Issue；
+
+e) Read/Write分流；
+
+f) Reset；
+
+g) Ownership状态。
+
+ALPG不得直接破坏Normal MC的BSM、OpenRow或Timing Owner关系。
+
+## 14.16 FPGA Capacity及Fmax Closure
+
+FPGA资源及Fmax并非第18项才第一次检查。
+
+前17项实施过程中应持续评估，最终阶段负责形成正式Closure。
+
+重点包括：
+
+a) RAM Primitive；
+
+b) Depth/Width；
+
+c) Read/Write Port；
+
+d) Same-address行为；
+
+e) Comparator Tree；
+
+f) Arbitration Tree；
+
+g) High Fanout；
+
+h) CDC；
+
+i) SLR Crossing；
+
+j) P0～P7 Placement；
+
+k) PI/PHY Boundary；
+
+l) ALPG MUX；
+
+m) Floorplan。
+
+最终要求每类Storage都能够回答：
+
+```text id="smy5of"
+谁写？
+多深？
+多宽？
+每拍几读几写？
+Full挡谁？
+Free条件是什么？
+Same-address怎么处理？
+Reset怎么处理？
+放什么Primitive？
+关键Fmax路径在哪里？
+```
+
+## 14.17 Coding Authorization Gate
+
+某一模块进入正式RTL Coding前，应满足表27要求。
+
+**表27 RTL Coding Authorization Gate**
+
+| 序号 | 检查项           | 进入要求                            |
+| -- | ------------- | ------------------------------- |
+| 1  | 职责边界          | 已完成设计Review                     |
+| 2  | DDR5 Donor    | Source/Donor映射已确认               |
+| 3  | 修改类型          | KEEP/MODIFY/NEW/DELETE明确        |
+| 4  | 必要规范值         | 已冻结或Positive Path明确Gated        |
+| 5  | Storage       | Depth/Width Formula闭合           |
+| 6  | RAM Port      | 读写端口及Same-address策略明确           |
+| 7  | Reset         | Local Reset语义明确                 |
+| 8  | Error/Timeout | 异常行为明确                          |
+| 9  | Interface     | 输入输出及Handshake稳定                |
+| 10 | External Gate | 不存在阻止当前Coding的G-CODE项           |
+| 11 | DV            | 至少已有对应Assertion/Directed Test计划 |
+
+只有满足Coding Gate，才将该模块状态从：
+
+```text id="ag0gi9"
+Design Candidate
+```
+
+推进至：
+
+```text id="nr9iqn"
+RTL Implementation Authorized
+```
+
+## 14.18 Open Gate对实施的影响
+
+Open Gate不应统一解释为“整个项目停止”。
+
+根据影响范围，可以划分为：
+
+```text id="fbf1bs"
+G-CODE
+G-INTEGRATION
+G-FEATURE
+G-PRODUCTION
+```
+
+### 14.18.1 G-CODE
+
+缺少的信息直接决定RTL逻辑，当前无法安全编码。
+
+此时相关Positive Path不得实施。
+
+### 14.18.2 G-INTEGRATION
+
+内部Semantic RTL可以完成，但不能连接真实PHY、TC或平台。
+
+如：
+
+```text id="3j2kq1"
+Read Return Logical Interface已定义
+Physical Return Carrier尚未签署
+```
+
+此时MC侧Semantic逻辑可以继续，真实PHY Positive Path保持Gated。
+
+### 14.18.3 G-FEATURE
+
+基础MC可以继续实施，但相关Feature不得Enable。
+
+如某一未冻结Topology或Command Variant。
+
+### 14.18.4 G-PRODUCTION
+
+功能和工程版本可以继续推进，但在关闭Gate前不能进行Production Signoff。
+
+## 14.19 Fail Closed实施原则
+
+对于未关闭的外部Gate，不允许通过假定值推进Positive Path。
+
+典型处理：
+
+### a) Mapping未知
+
+```text id="uvyg1s"
+Profile可被识别
+但对应Positive Mapping Disabled
+```
+
+### b) PHY Return Carrier未知
+
+```text id="lj9tto"
+MC Return Semantic Interface存在
+真实Read Positive Path Gated
+```
+
+### c) Timing Value未知
+
+```text id="gfh1q8"
+Timing Rule存在
+Value = UNKNOWN
+结果 = GATED
+```
+
+不得将Unknown Timing Value默认为0。
+
+### d) Training Requirement未知
+
+```text id="xxbg36"
+FSP Sequence可实施
+Normal Traffic Reopen保持Gated
+```
+
+## 14.20 Integration Authorization Gate
+
+正式连接真实FPGA PHY/TC前，至少以下接口必须关闭：
+
+a) Simplified DFI 1:8 Semantic Contract；
+
+b) PHY/TC Interface Control Document；
+
+c) Physical Clock及Reset；
+
+d) P0～P7解释；
+
+e) Physical Accept/Registered-equivalent；
+
+f) Read Return；
+
+g) Write Drain/Final Status；
+
+h) Training Request/Result；
+
+i) Reset Flush/No-old-feedback；
+
+j) ALPG Command/Data MUX；
+
+k) IO及Clock Feasibility。
+
+上述条件未满足时：
+
+```text id="ve3mzy"
+MC Semantic RTL
+```
+
+可以继续验证，但：
+
+```text id="umwozg"
+Real PHY Integration
+```
+
+不得宣称完成。
+
+## 14.21 FPGA Build实施阶段
+
+完成RTL Integration后，FPGA实施按照以下阶段推进。
+
+### 14.21.1 Compile Closure
+
+目标：
+
+a) 无Syntax Error；
+
+b) 无Type Error；
+
+c) 参数化Width合法；
+
+d) RAM Inference基本合理；
+
+e) CDC结构存在；
+
+f) Build脚本稳定。
+
+### 14.21.2 Functional RTL Closure
+
+目标：
+
+a) Directed Test通过；
+
+b) Assertion Clean；
+
+c) Same-cycle Case闭合；
+
+d) Full/Backpressure闭合；
+
+e) Reset闭合；
+
+f) Error/Retry基本闭合。
+
+### 14.21.3 Synthesis Closure
+
+检查：
+
+a) Primitive Mapping；
+
+b) LUT/FF/BRAM/URAM Resource；
+
+c) High Fanout；
+
+d) Comparator深度；
+
+e) Arbitration路径；
+
+f) Unexpected Replication；
+
+g) Early Fmax。
+
+若出现明显Fmax或Resource问题，应回到对应模块调整Pipeline、Storage或Arbitration结构，而不是仅依靠后期Placement解决。
+
+### 14.21.4 Place and Route Closure
+
+重点检查：
+
+a) WNS；
+
+b) TNS；
+
+c) Congestion；
+
+d) SLR Crossing；
+
+e) High Fanout；
+
+f) RAM Placement；
+
+g) PI/PHY Placement；
+
+h) P0～P7相关路径；
+
+i) IO/Clock路径。
+
+### 14.21.5 Hardware Bring-up
+
+硬件阶段按照：
+
+```text id="3ibahf"
+Clock / Reset
+     │
+     ▼
+PI / PHY Handshake
+     │
+     ▼
+Command Capture
+     │
+     ▼
+Initialization / Training
+     │
+     ▼
+Basic Write
+     │
+     ▼
+Basic Read
+     │
+     ▼
+Normal Read/Write
+     │
+     ▼
+Maintenance
+     │
+     ▼
+FSP / Power
+     │
+     ▼
+Reset / Recovery
+     │
+     ▼
+ALPG
+     │
+     ▼
+Stress / Margin
+```
+
+逐步推进。
+
+不得在基础Read/Write尚未闭环时直接开始复杂Maintenance或ALPG调试。
+
+## 14.22 设计与验证并行实施
+
+每一实施阶段均应同步产生：
+
+```text id="kv2raw"
+RTL
++
+Assertion
++
+Directed Test
++
+Storage/Port Review
+```
+
+而不是只提交RTL。
+
+推荐模块完成定义为：
+
+```text id="t17uv4"
+Design Reviewed
+AND
+RTL Implemented
+AND
+Basic Assertion Clean
+AND
+Directed Test Pass
+AND
+Storage/Port Reviewed
+```
+
+进入下一层Integration前，再增加：
+
+```text id="d9zhzj"
+Interface Test Pass
+AND
+Backpressure Test Pass
+AND
+Same-cycle Test Pass
+AND
+Reset Test Pass
+```
+
+## 14.23 Donor代码实施原则
+
+现有Synopsys DDR5代码作为主要工程Donor。
+
+每个模块修改前应形成简要Donor记录：
+
+```text id="lm5ewh"
+Current DDR5 Function
+        │
+        ▼
+DDR6 Requirement / Semantic Change
+        │
+        ▼
+KEEP / MODIFY / NEW / DELETE
+        │
+        ▼
+RTL Modification Point
+        │
+        ▼
+Verification Impact
+```
+
+实施过程中应避免两类倾向：
+
+a) 因DDR6存在新功能而整体重写已有成熟模块；
+
+b) 因DDR5已经存在某结构，就默认其固定参数或协议语义继续适用于DDR6。
+
+Synopsys DDR5 Donor用于证明现有实现骨架，不替代DDR6规范或PHY接口合同。
+
+## 14.24 模块实施Review要求
+
+每个模块进入Integration前至少应回答：
+
+a) 对应DDR5 Donor文件是什么；
+
+b) 原有Pipeline保留哪些部分；
+
+c) 新增状态保存在哪里；
+
+d) Authoritative State Owner是谁；
+
+e) Output什么时候稳定；
+
+f) Stall时如何处理；
+
+g) Same-cycle Mutation如何归约；
+
+h) Reset如何处理；
+
+i) Error如何处理；
+
+j) RAM端口需求是什么；
+
+k) Fmax主要风险是什么；
+
+l) DV如何验证。
+
+若上述问题仍大量为TBD，则模块不应直接进入集成阶段。
+
+## 14.25 实施阶段里程碑
+
+实施过程可形成以下技术里程碑。
+
+**表28 DDR6 MC主要实施里程碑**
+
+| 里程碑                   | 主要成果                                    | 退出条件                     |
+| --------------------- | --------------------------------------- | ------------------------ |
+| M1 语义基础完成             | Common Types、PI Shell、1:8 Command Issue | Logical PI接口可仿真          |
+| M2 状态/Timing完成        | Timing、BSM、OpenRow                      | ACT/PRE状态及Timing闭环       |
+| M3 Normal Command闭环   | CC/OS/GS、PRE、ACT Lifetime               | Row-hit/Row-miss命令链通过    |
+| M4 Maintenance/Data闭环 | Refresh、RFM、Read、Write                  | 维护及数据生命周期通过              |
+| M5 Full MC功能集成        | HIF/IH/TE、Config、MR、FSP/Power/Training  | Host→MC→PI完整功能闭环         |
+| M6 Recovery/Test集成    | Retry、Error、Reset、ALPG                  | 异常及Test Mode闭环           |
+| M7 FPGA实现闭环           | Synthesis、P&R、PHY Bring-up              | 基础硬件功能和时序闭合              |
+| M8 Signoff候选          | Coverage、Stress、Open Gate Closure       | 满足Production Signoff前置条件 |
+
+上述里程碑表示功能成熟度，不预设固定时间长度。
+
+## 14.26 Production Signoff前置条件
+
+进入Production Signoff前至少要求：
+
+```text id="3y176c"
+RTL Reviewed
+Simulation Clean
+Assertions Clean
+Coverage Closed
+CDC / RDC Clean
+
+Synthesis Expected
+P&R Timing Clean
+Resource Margin Acceptable
+
+PHY Bring-up Pass
+DDR6 Protocol Test Pass
+Stress Pass
+
+Reset / Recovery Pass
+Maintenance Pass
+ALPG Pass
+
+All Production-blocking Gates Closed
+```
+
+任何一项未满足时，不应将当前工程状态描述为Production Ready。
+
+## 14.27 实施交付物
+
+实施阶段应逐步形成以下交付物：
+
+a) RTL Source及版本记录；
+
+b) DDR5 Donor/DDR6 Modification Mapping；
+
+c) Common Type及Interface定义；
+
+d) Storage/Port Budget表；
+
+e) Assertion及Directed Test；
+
+f) Module Review记录；
+
+g) Integration Test结果；
+
+h) CDC/RDC报告；
+
+i) Synthesis Resource报告；
+
+j) P&R Timing报告；
+
+k) FPGA Bring-up记录；
+
+l) PHY/TC Interface Closure记录；
+
+m) Open Gate Register；
+
+n) Production Blocking Issue清单。
+
+## 14.28 实施原则总结
+
+DDR6 MC实施应遵循以下原则：
+
+a) 按依赖实施，不按功能清单无序并行；
+
+b) 优先建立Identity、Event及PI语义边界；
+
+c) Timing、BSM和OpenRow应早于复杂调度及Maintenance实施；
+
+d) ACT Lifetime应早于PRAC/BAT/RFM；
+
+e) Read/Write资源模型应在前端完整接入前先闭环；
+
+f) Retry必须在Physical Correlation边界清楚后实施；
+
+g) Reset/Re-init属于系统集成功能，应在各Owner Local Reset语义明确后完成；
+
+h) ALPG在Normal MC公共后端稳定后接入；
+
+i) 外部协议未冻结时采用Fail Closed；
+
+j) 不为Open Gate猜测默认Positive Path；
+
+k) 每个模块Coding前通过Coding Authorization Gate；
+
+l) 真实PHY集成前通过Integration Authorization Gate；
+
+m) RTL实施与DV同步推进；
+
+n) FPGA资源、RAM端口及Fmax从模块阶段开始持续评估；
+
+o) Production Signoff以完整工程证据为准，而不是以“RTL已经写完”为准。
+
+## 14.29 待确认实施条件
+
+进入正式RTL实施前或实施过程中，仍需持续关闭以下工程条件：
+
+a) DDR6规范相关未冻结参数；
+
+b) Product Profile及Topology；
+
+c) 1p12资源映射；
+
+d) PHY/TC ICD；
+
+e) P0～P7 Physical Mapping；
+
+f) Read Return Correlation Carrier；
+
+g) Write Accept/Drain/Status Carrier；
+
+h) Training Result Carrier；
+
+i) Reset Flush/No-old-feedback机制；
+
+j) FSP/Power Physical Handshake；
+
+k)各Storage最终Depth及Port Budget；
+
+l) Error及Retry Product Policy；
+
+m) ALPG与Normal MC的最终Ownership接口；
+
+n) FPGA IO/Clock及高速链路可行性；
+
+o) 最终Fmax及Resource Margin目标。
+
+上述条件应通过Open Gate Register统一管理，其风险和评审要求在第15章进一步汇总。
