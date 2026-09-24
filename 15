@@ -1,0 +1,1292 @@
+# 15 风险及待评审事项
+
+## 15.1 章节目的
+
+本章对前述设计中的未闭合事项、外部依赖、物理实现风险及需要专家裁决的问题进行统一管理。
+
+本章不是对各章节“TBD”的简单汇总，而是作为DDR6 MC进入RTL实施、FPGA集成及后续Production Signoff前的Open Gate Register。
+
+每一个Open Gate均应明确回答：
+
+```text
+当前已经确定什么？
+        │
+        ▼
+仍然缺失什么？
+        │
+        ▼
+缺失信息影响哪一层？
+        │
+        ▼
+当前设计如何Fail Closed？
+        │
+        ▼
+需要谁提供什么证据？
+        │
+        ▼
+什么条件下Gate可以关闭？
+        │
+        ▼
+关闭后允许解锁什么功能或阶段？
+```
+
+**图15 Open Gate闭环管理关系**
+
+本章中保留的Open Gate原则上应属于外部证据尚未闭合的事项。
+
+对于以下内部设计问题：
+
+```text
+State Owner
+FSM
+Canonical Event
+Internal Interface
+Storage Payload
+Basic Lifecycle
+```
+
+不应继续以“TBD”形式推迟至RTL阶段，而应在本详细设计中完成定义。
+
+## 15.2 当前设计状态
+
+根据现有设计材料，本方案当前定位为：
+
+```text
+ENGINEERING_CANDIDATE
+```
+
+当前设计已经可以支持：
+
+a) 模块职责划分；
+
+b) DDR5 donor定位；
+
+c) KEEP/MODIFY/NEW/DELETE分析；
+
+d) RTL修改范围识别；
+
+e) State、RAM、FIFO及Hold对象设计；
+
+f) FSM及Lifecycle设计；
+
+g) valid/ready及Backpressure设计；
+
+h) Same-cycle Reducer设计；
+
+i) Assertion及Directed Test设计；
+
+j) FPGA Storage/Port/Fmax规划；
+
+k) 专家技术评审。
+
+当前状态尚不能直接等价于：
+
+```text
+Architecture Signoff Complete
+
+PHY Integration Complete
+
+DDR6 Protocol Implementation Proven
+
+Production RTL Authorized
+
+Production Signoff Complete
+```
+
+其中部分原因并非MC内部架构尚未定义，而是正式DDR6规范裁决、Product Topology、PHY/TC接口和FPGA物理实现证据尚未完全闭合。
+
+## 15.3 Open Gate分类
+
+允许保留的Open Gate主要分为：
+
+```text
+SPEC_TBD
+
+PHY / TC ICD
+
+PRODUCT_NUMERIC
+
+MEASUREMENT_REQUIRED
+
+INTEGRATION_ADDRESS
+
+HUMAN_DECISION
+```
+
+各类含义如下：
+
+| Gate类别               | 含义                                    |
+| -------------------- | ------------------------------------- |
+| SPEC_TBD             | 需要正式协议、规范修订、Errata或权威解释确认             |
+| PHY / TC ICD         | 需要PHY/TC接口合同提供物理Carrier、Latency及状态边界  |
+| PRODUCT_NUMERIC      | 需要最终产品Topology、Depth、Profile或Policy参数 |
+| MEASUREMENT_REQUIRED | 必须通过综合、P&R、板级或Margin测量才能关闭            |
+| INTEGRATION_ADDRESS  | 依赖真实平台、Clock、Reset、CDC/RDC及外围集成       |
+| HUMAN_DECISION       | 多种方案均可行，需要架构/产品负责人最终裁决                |
+
+Open Gate不应被用来掩盖内部设计尚未完成的问题。
+
+## 15.4 Gate影响等级
+
+Open Gate按照其对项目推进的影响分为四类。
+
+### 15.4.1 G-CODE
+
+表示当前缺失信息直接决定RTL正确实现方式。
+
+Gate未关闭前，相关Positive Path不得进入正式Production RTL Coding。
+
+### 15.4.2 G-INTEGRATION
+
+内部Semantic RTL可以继续实现和验证，但不得连接真实PHY、TC或平台。
+
+### 15.4.3 G-FEATURE
+
+基础MC可以继续工作，但对应Feature不得Enable。
+
+### 15.4.4 G-PRODUCTION
+
+工程版本可以继续开发、仿真甚至部分上板，但在Gate关闭前不能完成Production Signoff。
+
+一个Gate可以同时属于多个影响等级。
+
+## 15.5 Fail-closed原则
+
+任何Open Gate未关闭时，不允许使用未经确认的默认值猜测Positive Path。
+
+典型处理如下。
+
+### 15.5.1 Mapping未知
+
+```text
+Profile Recognized
+       │
+       ▼
+Mapping Unknown
+       │
+       ▼
+Positive Path Disabled
+```
+
+不得自行假设Resource Mapping。
+
+### 15.5.2 PHY Carrier未知
+
+```text
+Semantic Interface Defined
+        │
+        ▼
+Physical Carrier Unknown
+        │
+        ▼
+Real Physical Positive Path Gated
+```
+
+内部Read、Write、Retry等Semantic逻辑可以继续实现。
+
+### 15.5.3 Timing值未知
+
+正确处理：
+
+```text
+Timing Rule Exists
+Timing Value = UNKNOWN
+        │
+        ▼
+GATED
+```
+
+不得：
+
+```text
+UNKNOWN -> 0
+```
+
+从而错误放开命令。
+
+### 15.5.4 Training要求未知
+
+FSP及Training的控制框架可以实现，但：
+
+```text
+Required Training Not Proven
+        │
+        ▼
+Normal Traffic Reopen = 0
+```
+
+直到对应Postcondition关闭。
+
+## 15.6 P0正确性Gate
+
+当前需要优先关闭的正确性Gate见表29。
+
+**表29 P0正确性Open Gate**
+
+| Gate                          | 当前已知                                                   | 尚缺失内容                                                                                                                | 当前Fail-closed措施                                 | 关闭证据                                                                | 关闭后解锁                       |
+| ----------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------- | --------------------------- |
+| PHY/TC Registered-equivalent  | MC↔PI固定1:8 Simplified DFI，P0～P7逻辑Phase及PI Lifecycle已定义 | Physical Clock、Phase Relation、Accept、Launch、Registered-equivalent、Read Return、Write Drain、Reset Flush、Finite Latency | PI真实Physical Positive Path保持Gated               | Signed PHY/TC ICD + Timing/CDC Review + Simulation Vector           | PI真实PHY集成                   |
+| PHY No-old-return/Retry Proof | Retry具有Fence/Correlation Proof/New Authorization三阶段合同  | Old Read/Write Feedback何时保证不再匹配                                                                                      | Retry Positive Path及Reset后Fresh Correlation复用受限 | End-to-end Stale-return Proof                                       | Normal Retry及安全Fresh Reopen |
+| Timing Canonical Source       | Timing架构、State、Reservation、Legal Phase机制已定义            | Rule Catalog、Source/Target Event、Scope、Symbol、Value Source及Validator一致性                                              | Unknown Rule/Value保持Gated                       | Canonical Timing Rule Catalog + Rule-to-state Binding + Test Vector | Timing Positive Path完整开放    |
+| Refresh Accounting            | Refresh Manager、Debt、Coverage、Selector及Service架构已定义    | DIST Debt/Credit、Sweep、Postpone及对应规范语义最终统一                                                                           | Refresh Accounting相关Production Coding受限         | 规范裁决 + Accounting Model Review + Vector                             | Refresh Production RTL      |
+| 1p12 Geometry                 | Profile框架及Canonical Geometry接口已定义                      | Exact Bank Mapping、Target Expansion、Raw/Canonical Permutation、Timing Relation、Packet Packing                         | 1p12 Positive Path Disabled                     | Normative Mapping Table + No-alias Exhaustive Vector                | 1p12 Feature                |
+| MR/FSP Timing Authority       | Programmed/Effective及Workpoint切换框架已定义                  | Field-dependent MR Scope、部分Timing Authority及High-rate语义                                                              | 未确认Field/Timing不得扩大作用域                          | Spec/MR/Timing联合裁决                                                  | 对应MR/FSP Positive Path      |
+| Reset/PHY Flush               | Joint Reset、Reset Epoch及Re-init框架已定义                   | Physical Flush/No-old-feedback Carrier                                                                               | `mc_ready`及Fresh Correlation受Gate控制             | Signed Flush Contract + Stale-feedback Test                         | 完整Reset/Re-init闭环           |
+
+上述Gate直接影响协议或状态正确性，应优先于性能类优化问题处理。
+
+## 15.7 PHY/TC接口风险
+
+### 15.7.1 当前已经固定的MC边界
+
+当前设计已经固定：
+
+```text
+MC / PI Logical Interface = 1:8 Simplified DFI
+```
+
+并使用：
+
+```text
+P0 P1 P2 P3 P4 P5 P6 P7
+```
+
+作为逻辑Command Placement空间。
+
+因此后续PHY问题不应通过重新改变MC 1:8架构来规避。
+
+### 15.7.2 仍需PHY/TC关闭的接口
+
+正式PHY/TC ICD至少需要明确：
+
+a) Physical Clock；
+
+b) P0～P7与Physical Timing关系；
+
+c) Command Accept；
+
+d) Launch；
+
+e) Registered-equivalent/Actual Event；
+
+f) Read Return Carrier；
+
+g) Earliest Read Return；
+
+h) Return Phase Alignment；
+
+i) Write Accept；
+
+j) Write Drain；
+
+k) Final Status；
+
+l) Cancel No-execute/No-future Proof；
+
+m) Reset Flush；
+
+n) Training Result；
+
+o) TC Mapping；
+
+p) Finite Latency Bound。
+
+这些接口未签署前，MC可以完成对应Semantic Shell，但不得声称Physical Lifecycle已经闭合。
+
+## 15.8 PHY高速可行性风险
+
+当前设计材料给出了一个必须由PHY/Platform专项关闭的P0物理风险。
+
+设计目标为：
+
+```text
+DDR6 Data Rate = 19.2 Gb/s per DQ
+```
+
+如果TC后端固定采用：
+
+```text
+TC Ratio = 1:4
+```
+
+则其对应链路速率为：
+
+```text
+19.2 / 4 = 4.8 Gb/s
+```
+
+而当前设计材料记录的X5IO已确认能力上限为：
+
+```text
+4.5 Gb/s
+```
+
+因此当前存在：
+
+```text
+Required = 4.8 Gb/s
+Available = 4.5 Gb/s
+```
+
+的物理能力缺口。
+
+该问题属于PHY/Platform Feasibility Risk，不属于MC Timing逻辑问题。
+
+不能通过：
+
+a) 修改MC Timing Rule；
+
+b) 修改ALPG；
+
+c) 将MC/PI 1:8 Simplified DFI改成其他Ratio；
+
+来掩盖该风险。
+
+关闭证据至少应包括：
+
+```text
+PHY Clocking Design
++
+Device Datasheet Limit
++
+Post-route Clock / IO Analysis
++
+Hardware Margin Measurement
+```
+
+在该风险关闭前，19.2 Gb/s目标不能视为已完成硬件可行性证明。
+
+## 15.9 Timing及协议规则风险
+
+### 15.9.1 Timing Rule一致性
+
+当前设计材料已经建立较完整的Timing Rule框架，并记录约107条Rule，但仍需对以下内容进行最终统一：
+
+```text
+Rule ID
+Source Event
+Target Event
+Resource Scope
+Relation
+Timing Symbol
+Timing Value Source
+Context
+Gate Status
+```
+
+最大风险不是缺少Comparator，而是：
+
+> 同一条DDR6 Timing关系在不同设计材料中采用了不同Source Event、Scope或Effective条件。
+
+因此正式Coding前应形成唯一Canonical Timing Rule Catalog。
+
+### 15.9.2 High-rate Timing
+
+当前部分MCME、MRUPDATE以及High-rate模式Timing Value仍需正式规范或修订表确认。
+
+可以提前实现：
+
+```text
+Rule Skeleton
+State
+Event
+Gating
+```
+
+但未知Value不得默认为0。
+
+### 15.9.3 Timeout参数
+
+Retry、Training、Power、Maintenance及其他Watchdog均需要：
+
+```text
+Latency Budget
+Maximum Bound
+Fault Injection Evidence
+```
+
+不得任意选择一个固定Cycle数作为Production Timeout。
+
+Timeout错误配置可能带来两种风险：
+
+```text
+过短 -> 合法操作被错误判Fault
+
+过长 -> 真正Deadlock/Failure长时间无法发现
+```
+
+## 15.10 Product及Geometry风险
+
+### 15.10.1 Product Topology
+
+当前MC已经定义参数化Geometry和Canonical Resource框架，但最终仍需要Product侧确定：
+
+a) Device/Package配置；
+
+b) PSD/BG/BA组合；
+
+c) Rank/CID等实际Topology；
+
+d) 首版DUT Whitelist；
+
+e) Supported Profile；
+
+f) Supported Density；
+
+g) Supported Workpoint；
+
+h) Feature Enable Matrix。
+
+Topology未冻结将直接影响：
+
+```text
+Width
+Depth
+Resource Count
+Target Expansion
+Feature Enable
+```
+
+因此不能在此阶段宣称所有Storage Width/Depth均已最终定值。
+
+### 15.10.2 1p12
+
+1p12保持独立Gate。
+
+当前仅认为：
+
+```text
+Profile Recognized
+```
+
+而不是：
+
+```text
+1p12 Full Positive Path Proven
+```
+
+仍需确认：
+
+a) Exact Address Mapping；
+
+b) 12DQ Position；
+
+c) BL24 Packing；
+
+d) Resource Mapping；
+
+e) Timing Relation；
+
+f) Read/Write Packet布局；
+
+g) Refresh/RFM Target Expansion。
+
+在关闭前：
+
+```text
+1p12 Feature Disabled
+```
+
+是安全处理方式。
+
+## 15.11 Refresh及RFM风险
+
+### 15.11.1 Refresh Accounting
+
+Refresh当前最大的待裁决问题不是Service FSM，而是Accounting Semantics。
+
+设计材料中存在需要专项确认的不同Accounting解释，包括：
+
+```text
+Fractional DIST Debt + Selector Sweep
+```
+
+与：
+
+```text
+AB-parent Debt + Full Selector Coverage Credit
+```
+
+需要最终与：
+
+a) tREFI/tREFIdb/tREFIqb；
+
+b) Postpone；
+
+c) Row/Bank Counter；
+
+d) REFab插入Distributed Refresh；
+
+e) DDR5 donor `postpone_cnt`及`bank_ref_done`；
+
+f) 当前Refresh Phase Contract；
+
+进行统一。
+
+在该问题关闭前，Refresh Architecture可以继续Review，但Refresh Accounting Production RTL不应直接授权。
+
+### 15.11.2 RFM/PRAC/BAT
+
+RFM架构已经明确：
+
+```text
+ACT Lifetime
+→ Qualified Close
+→ BAT/PRAC
+→ PRFM Obligation
+→ RFM Service
+```
+
+仍需最终确认：
+
+a) BAT Contribution；
+
+b) Threshold；
+
+c) Subtraction；
+
+d) PRFM Window；
+
+e) RFM Variant；
+
+f) Target Expansion；
+
+g) Product Enable；
+
+h) tRFM相关参数。
+
+这些内容主要属于SPEC_TBD和PRODUCT_NUMERIC。
+
+## 15.12 MR、FSP、Power及Training风险
+
+### 15.12.1 MR Authority
+
+MR设计已经区分：
+
+```text
+Programmed
+!=
+Effective
+```
+
+但部分MR Field作用范围、MRUPDATE Timing及High-rate语义仍需正式规范裁决。
+
+未确认的Field不得自行扩大到其他资源或模式。
+
+### 15.12.2 FSP Effective Boundary
+
+FSP设计已经定义：
+
+```text
+MR Programming
+→ Quiesce
+→ Switch
+→ PHY Transition
+→ Calibration / Training
+→ Timing Image
+→ Publication
+```
+
+当前仍需PHY/Spec明确：
+
+a) Frequency Switch Carrier；
+
+b) ZQ需求；
+
+c) Required Training Phase；
+
+d) Completion Carrier；
+
+e) 新Timing Image生效点；
+
+f) Effective Workpoint最终Publication条件。
+
+关闭前：
+
+```text
+FSP Sequence可实现
+Normal Reopen受Gate限制
+```
+
+### 15.12.3 Power
+
+Power主要开放项包括：
+
+a) Physical Entry/Exit Handshake；
+
+b) Product Power Mode；
+
+c) Exit Timing Class；
+
+d) PHY Low-power控制；
+
+e) Self Refresh Catch-up；
+
+f) Failure/Timeout Bound。
+
+Power Sequence框架可以保留，但未知Physical Completion不得用固定等待周期替代。
+
+### 15.12.4 Training
+
+Training当前最大风险位于MC与PHY之间的Physical Result Contract。
+
+MC侧已经明确：
+
+```text
+Training ID
+Phase ID
+Attempt ID
+Workpoint
+Context
+```
+
+以及Stale Result拒绝机制。
+
+仍需PHY/Spec提供：
+
+a) 实际Training Phase；
+
+b) Phase参数；
+
+c) Result Payload；
+
+d) PHY Context Generation；
+
+e) Pass/Fail条件；
+
+f) Postcondition；
+
+g) Retry要求。
+
+在Training Physical Result未闭合前，Bootstrap及需要Training的FSP Positive Path受Gate限制。
+
+## 15.13 Read/Write数据通路风险
+
+### 15.13.1 Read Return
+
+Read控制结构已经定义：
+
+```text
+Expected
+→ ARM / MATCHABLE
+→ Return Correlation
+→ Assembly
+→ Result
+```
+
+但真实Physical Return仍依赖PHY ICD确认：
+
+a) Physical Tag/Route；
+
+b) Return Phase；
+
+c) Earliest Return；
+
+d) Burst/Fragment布局；
+
+e) Non-backpressure特性；
+
+f) Finite Return Latency。
+
+最大风险是：
+
+> Semantic Read资源已经建立，但Physical Carrier不足以恢复Full Logical Key。
+
+关闭证据应包括完整Physical→Logical Correlation Vector及Stale-return Test。
+
+### 15.13.2 Write Physical Lifecycle
+
+Write侧已经逻辑区分：
+
+```text
+Presented
+Accepted
+Last Accepted
+Drained
+Final Status
+```
+
+但最终Carrier仍需PHY定义。
+
+如果平台实际只能提供其中部分事件，应重新证明：
+
+```text
+Attempt Done
+Reservation Release
+Payload Free
+```
+
+所需的安全证据能够由现有Carrier构造。
+
+不能因为缺少Physical Signal而将多个事件重新压成一个`write_done`。
+
+## 15.14 Retry及Reset风险
+
+### 15.14.1 Retry Proof
+
+Retry设计已经定义：
+
+```text
+Fence
+→ No-old-correlation Proof
+→ Authorization
+→ Fresh Admission
+```
+
+最大的外部依赖为：
+
+```text
+Old Physical Feedback何时真正不可能再次到达？
+```
+
+如果PHY不能提供明确Epoch、Tag Retirement、Flush或等效证明，则Normal Retry能力会受到限制。
+
+### 15.14.2 Device-visible Write Retry
+
+对于：
+
+```text
+UNKNOWN_VISIBLE
+PARTIAL_VISIBLE
+DEVICE_VISIBLE
+```
+
+Write操作是否允许Retry仍需Product/Protocol Policy明确。
+
+不能默认Write具有Idempotence。
+
+### 15.14.3 Reset Flush
+
+Joint Destructive Reset逻辑已定义，但Fresh Session重新开放仍依赖：
+
+```text
+PHY Flush / No-old-feedback Proof
+```
+
+如果该Proof无法关闭，则：
+
+```text
+Local Clear完成
+```
+
+也不能产生：
+
+```text
+mc_ready
+```
+
+## 15.15 FPGA Storage、Port及容量风险
+
+### 15.15.1 Storage Depth
+
+逻辑Storage Contract目前可以定义：
+
+```text
+Owner
+Payload
+Full
+Release
+Collision
+Reset
+```
+
+但最终Depth仍需结合：
+
+a) Traffic Model；
+
+b) Worst-case Occupancy；
+
+c) Backpressure；
+
+d) Maintenance Blocking；
+
+e) Retry Holding；
+
+f) Return Burst；
+
+g) Formal/Wait-for Analysis；
+
+h) FPGA Resource；
+
+综合确定。
+
+关闭证据建议为：
+
+```text
+Traffic Model
++
+Worst-case Occupancy
++
+Wait-for / Deadlock Analysis
++
+Synthesis Resource
+```
+
+### 15.15.2 Memory Primitive及Banking
+
+尚需根据综合结果选择：
+
+```text
+FF
+LUTRAM
+BRAM
+URAM
+Replication
+Banking
+```
+
+并确认：
+
+a) Read Port数量；
+
+b) Write Port数量；
+
+c) Same-address语义；
+
+d) Pipeline Latency；
+
+e) ECC/Parity；
+
+f) Reset Style。
+
+PPA优化不得以删除Generation、Identity或Stale隔离字段作为代价。
+
+### 15.15.3 Full导致Deadlock风险
+
+各Storage必须验证：
+
+```text
+Full只挡Fresh Allocation
+```
+
+而Existing：
+
+```text
+Progress
+Actual
+Return
+ACK
+Drain
+Release
+Free
+Error
+Reset
+```
+
+仍可继续。
+
+否则可能出现：
+
+```text
+Table Full
+    │
+    ▼
+Old Entry无法继续
+    │
+    ▼
+Old Entry无法Free
+    │
+    ▼
+Permanent Full / Deadlock
+```
+
+这是FPGA实现阶段的重点架构风险之一。
+
+## 15.16 CDC/RDC风险
+
+当前设计已经规定Whole-record CDC及Joint Reset基本原则，但最终仍需Integration提供：
+
+a) Clock关系；
+
+b) Reset Domain；
+
+c) Async FIFO配置；
+
+d) Synchronizer；
+
+e) Pointer Reset；
+
+f) Single-side Reset行为；
+
+g) Reset Barrier；
+
+h) Timing Constraint；
+
+i) CDC/RDC Tool检查结果。
+
+CDC/RDC未完成证明将直接影响：
+
+```text
+Old Feedback隔离
+Reset Epoch
+mc_ready
+```
+
+因此属于G-INTEGRATION及G-PRODUCTION Gate。
+
+## 15.17 Fmax及物理实现风险
+
+主要Fmax热点预计包括：
+
+a) TE Dependency Compare；
+
+b) CC Candidate Construct；
+
+c) OS Arbitration；
+
+d) GS Multi-resource Prepare；
+
+e) Timing Rule Compare；
+
+f) 1:8 Command Encode及Phase Placement；
+
+g) Write Data MUX；
+
+h) Read Return Correlation；
+
+i) Maintenance Target Expansion；
+
+j) ALPG Pattern Logic。
+
+其中1:8 Command Issue典型Critical Path为：
+
+```text
+Admitted Descriptor
+        │
+        ▼
+Command Encode
+        │
+        ▼
+Phase Select
+        │
+        ▼
+P0...P7 MUX
+        │
+        ▼
+Output Register
+```
+
+如一拍无法满足Fmax，可以增加Pipeline。
+
+但增加Latency后必须同步更新：
+
+```text
+PI Contract
+Timing Contract
+Reservation Lifetime
+PHY Latency Assumption
+```
+
+不能只在RTL中增加Pipeline而不更新系统语义。
+
+## 15.18 ALPG专项风险
+
+ALPG采用Exclusive Takeover架构。
+
+当前需要最终冻结：
+
+### 15.18.1 Takeover Boundary
+
+包括：
+
+```text
+Normal Block
+Drain
+Maintenance处理
+Bank/Timing Synchronization
+Ownership Return
+```
+
+### 15.18.2 Timing Mode
+
+至少需要明确不同测试模式的语义，如：
+
+```text
+EXACT_COMPLIANT
+AUTO_LEGAL
+RAW_MARGIN
+```
+
+不同模式下Timing Owner与Pattern Owner的权限需要明确。
+
+### 15.18.3 Read Checker
+
+仍需确认：
+
+a) Expected Generation；
+
+b) Physical Return Route；
+
+c) Compare Mask；
+
+d) Error Classification；
+
+e) Old Result隔离。
+
+### 15.18.4 Background Service Policy
+
+在ALPG Exact Pattern运行期间：
+
+```text
+Auto Refresh
+Power
+Training
+FSP
+```
+
+哪些自动关闭、哪些必须由Pattern显式控制，需要形成明确Policy。
+
+不能让Normal Maintenance和ALPG Pattern未经仲裁地同时修改DRAM状态。
+
+## 15.19 需要专家重点裁决的事项
+
+相比一般参数确认，以下问题更适合在本轮专家评审中重点讨论。
+
+**表30 建议专家重点裁决事项**
+
+| 序号 | 事项                          | 当前状态               | 需要专家确认的问题                                   |
+| -- | --------------------------- | ------------------ | ------------------------------------------- |
+| 1  | DDR5→DDR6整体演进策略             | 以保留Donor为主         | 当前修改边界是否合理，是否存在不必要重构                        |
+| 2  | BSM/OpenRow/Timing三Owner    | 已明确职责分离            | 是否存在遗漏的第二Truth或交叉写权                         |
+| 3  | CC/OS/GS三级边界                | 已明确                | Selection/Admission划分是否足够且不过度设计             |
+| 4  | Timing Reservation          | 已纳入                | Admission与Actual间是否确有必要保留Provisional Timing |
+| 5  | PRE四类集合                     | 已区分                | Command/Timing/Actual Close/BAT范围是否完整       |
+| 6  | ACT Lifetime                | 已独立建模              | 是否需要作为PRAC关闭时仍存在的基础Identity                 |
+| 7  | Refresh Accounting          | 未最终裁决              | DIST Debt/Coverage如何与规范及DDR5 donor统一        |
+| 8  | Parent/Child                | 当前方案保留             | 实际产品是否确有独立Child跟踪需求，能否进一步简化                 |
+| 9  | IH Input FIFO深度语义           | 不固定为功能语义           | DDR5现有Depth=2是否直接保留，是否存在实际证据要求调整            |
+| 10 | Read Expected/Assembly分离    | 已明确                | 物理实现是否合并Storage但保持逻辑边界                      |
+| 11 | Write Result/Release/Free分沿 | 已明确                | 当前三边界是否与实际PHY反馈能力匹配                         |
+| 12 | Retry三阶段                    | 已明确                | PHY是否能够提供EV042所需真实Proof                     |
+| 13 | Config/Geometry双Version     | 已明确                | ACV/GMV是否满足实际产品切换需求                         |
+| 14 | MR Programmed/Effective     | 已明确                | 各Field Effective Point如何由规范冻结               |
+| 15 | ALPG Ownership              | Exclusive Takeover | Background Service与RAW_MARGIN权限如何定义         |
+| 16 | 19.2 Gb/s PHY实现             | 存在当前物理风险           | X5IO/TC链路能力是否可满足目标                          |
+
+其中第8项和第9项属于典型HUMAN_DECISION：
+
+它们并非DDR6协议必然要求新增复杂结构，应根据真实产品需求、已有DDR5实现和性能测量结果决定，而不是仅因为新方案“更通用”就扩展硬件复杂度。
+
+## 15.20 当前Open Gate Register
+
+结合现有设计材料，当前主要Gate可归纳为表31。
+
+**表31 当前主要Open Gate Register**
+
+| ID    | Gate                             | 类型                             | 影响等级                       | 当前状态 | 当前Fail-closed措施                 | 责任方向             | 关闭后解锁                    |
+| ----- | -------------------------------- | ------------------------------ | -------------------------- | ---- | ------------------------------- | ---------------- | ------------------------ |
+| OG-01 | PHY/TC Registered-equivalent     | PHY/TC ICD                     | G-INTEGRATION/G-PRODUCTION | Open | Physical PI Positive Path Gated | PHY/TC           | 真实Command Lifecycle      |
+| OG-02 | No-old-return/Feedback Proof     | PHY/TC ICD                     | G-CODE/G-INTEGRATION       | Open | Retry/Fresh Reuse受限             | PHY/PI           | Retry及Reset后Fresh Reopen |
+| OG-03 | Canonical Timing Rule Catalog    | SPEC_TBD                       | G-CODE/G-PRODUCTION        | Open | Unknown Rule Gated              | Spec/Timing      | Timing Production RTL    |
+| OG-04 | Refresh Accounting               | SPEC_TBD/HUMAN_DECISION        | G-CODE                     | Open | Accounting Production Coding受限  | Spec/Refresh     | Refresh正式实现              |
+| OG-05 | Product Topology                 | PRODUCT_NUMERIC                | G-FEATURE/G-PRODUCTION     | Open | 仅支持已确认Tuple                     | Product          | 最终Geometry/Storage尺寸     |
+| OG-06 | 1p12 Mapping/Packing             | SPEC_TBD                       | G-FEATURE                  | Open | 1p12 Positive Path Disabled     | Spec/Datapath    | 1p12                     |
+| OG-07 | MR/Timing Authority              | SPEC_TBD                       | G-FEATURE/G-PRODUCTION     | Open | 未确认Field/Timing Gated           | Spec/MR/Timing   | 完整MR Feature             |
+| OG-08 | FSP/Training Physical Completion | PHY/TC ICD                     | G-INTEGRATION/G-FEATURE    | Open | Normal Reopen Gated             | PHY/Training     | FSP真实切换                  |
+| OG-09 | Storage Depth/Ports              | PRODUCT_NUMERIC/MEASUREMENT    | G-PRODUCTION               | Open | 参数化保守配置                         | RTL/FPGA/Product | Capacity Closure         |
+| OG-10 | CDC/RDC Proof                    | INTEGRATION_ADDRESS            | G-INTEGRATION/G-PRODUCTION | Open | 相关Domain Reopen受限               | Integration      | Full MC Ready            |
+| OG-11 | High-speed PHY Feasibility       | MEASUREMENT_REQUIRED           | G-INTEGRATION/G-PRODUCTION | Open | 不宣称19.2G Hardware Closure       | PHY/Platform     | 目标Data Rate              |
+| OG-12 | ALPG Takeover/Background Policy  | HUMAN_DECISION                 | G-FEATURE                  | Open | ALPG Feature受限                  | MC/ALPG/Product  | Full ALPG                |
+| OG-13 | Retry Policy for Visible Write   | HUMAN_DECISION/SPEC_TBD        | G-FEATURE                  | Open | 不执行普通Automatic Retry            | Retry/Product    | 扩展Retry                  |
+| OG-14 | Error Severity/Recovery Policy   | PRODUCT_NUMERIC/HUMAN_DECISION | G-PRODUCTION               | Open | 保守Containment/Fatal路径           | Product/Error    | 完整Field Recovery         |
+| OG-15 | Timeout Maximum                  | PRODUCT_NUMERIC/MEASUREMENT    | G-PRODUCTION               | Open | 不使用未经证明的Production常数            | 各Owner           | Production Watchdog      |
+
+该表应作为后续项目跟踪的主入口。
+
+每个Gate关闭时，应附带对应证据，而不是仅将状态字段从OPEN改成CLOSED。
+
+## 15.21 Gate关闭模板
+
+每个Open Gate建议采用统一关闭记录。
+
+```text
+Gate ID:
+Gate Name:
+
+Current Known:
+    已经冻结的内容
+
+Missing:
+    尚未确认的内容
+
+Impact:
+    G-CODE / G-INTEGRATION /
+    G-FEATURE / G-PRODUCTION
+
+Current Fail-closed:
+    Gate未关闭时RTL实际行为
+
+Evidence Provider:
+    Spec / PHY / Product /
+    Integration / Measurement / Human Review
+
+Closure Evidence:
+    文档 / Table / ICD / Simulation /
+    Synthesis / P&R / Hardware Measurement
+
+Closure Decision:
+    Accepted / Rejected / Limited Enable
+
+Unlocked Scope:
+    关闭后允许Coding、Integration、
+    Feature Enable或Production Signoff的范围
+```
+
+Gate关闭应具有版本和责任人记录。
+
+若证据仅支持部分Profile、部分Workpoint或部分Feature，则应：
+
+```text
+Partial Closure
+```
+
+而不是将整个Gate扩大解释为Fully Closed。
+
+## 15.22 风险处理原则
+
+项目后续风险处理遵循以下原则：
+
+a) 内部架构不确定性优先在详细设计阶段关闭；
+
+b) 外部规范未知采用Fail Closed；
+
+c) PHY接口未知时保留Semantic RTL，不猜Physical Carrier；
+
+d) Product参数未知时保持参数化，不提前固化错误Depth或Width；
+
+e) 物理性能风险必须依赖综合、P&R或Hardware Measurement关闭；
+
+f) 不通过删除Identity、Generation、Reservation等Correctness字段换取PPA；
+
+g) 不通过增大FIFO、增加Buffer等方式掩盖未证明的Deadlock；
+
+h) 不将Timeout作为Physical Completion Proof；
+
+i) 不将Software W1C作为Functional Recovery Proof；
+
+j) 不将Reset Clear作为DRAM Known-state Proof；
+
+k) 不将仿真通过扩大解释为PHY或Production Signoff；
+
+l) 不将单一Feature的Gate关闭扩大解释为Whole MC Freeze。
+
+## 15.23 专家评审建议检查项
+
+专家评审建议重点检查以下问题：
+
+a) 是否存在DDR6并不要求但方案额外引入的复杂状态或模块；
+
+b) 是否存在可以直接保留DDR5结构、但当前设计进行了不必要重构的地方；
+
+c) 每个新增Identity/Generation是否对应真实Late Feedback或ABA风险；
+
+d) 每个Reservation是否对应真实Admission与Actual间资源风险；
+
+e) 每个独立Owner是否确有必要，是否存在重复Truth；
+
+f) Timing、Refresh、RFM等协议语义是否有正式规范依据；
+
+g) Physical Carrier未知时是否真正Fail Closed；
+
+h) Storage Full是否可能阻塞Old Progress；
+
+i) Reset是否真正隔离Old Session；
+
+j) Retry是否能够证明Old Attempt不再可匹配；
+
+k) ALPG是否破坏Normal MC的Bank/Timing状态一致性；
+
+l) FPGA物理能力是否支持目标Data Rate及Fmax；
+
+m) 当前Open Gate是否足以覆盖所有Production Blocking风险。
+
+专家对上述问题的裁决应反馈至对应设计章节及Open Gate Register，而不是只形成会议纪要。
+
+## 15.24 评审后的状态推进
+
+本轮专家评审完成后，设计状态建议按照以下路径推进：
+
+```text
+Engineering Candidate
+        │
+        ▼
+Expert Review
+        │
+        ▼
+Resolve Architecture Findings
+        │
+        ▼
+Close G-CODE Gates
+        │
+        ▼
+Module RTL Authorization
+        │
+        ▼
+RTL + DV
+        │
+        ▼
+Close Integration Gates
+        │
+        ▼
+FPGA / PHY Integration
+        │
+        ▼
+Synthesis / P&R / Hardware
+        │
+        ▼
+Close Production Gates
+        │
+        ▼
+Production Signoff Candidate
+```
+
+评审本身不自动改变Gate状态。
+
+只有对应技术问题解决并获得明确关闭证据后，才能推进其授权范围。
+
+## 15.25 本阶段结论
+
+基于当前设计材料，DDR6 MC的主要内部架构边界已经具备进入专家评审和分模块RTL实施准备的条件。
+
+目前剩余风险主要集中在：
+
+```text
+DDR6规范细节
+PHY / TC Physical Contract
+Product Topology及Feature Enable
+1p12 Mapping
+Refresh Accounting
+MR/FSP/Training Physical Boundary
+Retry / Reset No-old-feedback Proof
+FPGA Storage / Port / Fmax
+高速PHY物理可行性
+ALPG最终Policy
+```
+
+这些问题应通过Open Gate方式管理，而不是继续反复修改已经确定的MC基础架构。
+
+后续工作重点应从：
+
+```text
+继续扩大设计
+```
+
+转向：
+
+```text
+专家攻击评审
+        +
+关闭真实Open Gate
+        +
+按依赖授权RTL
+        +
+DV / FPGA证据闭环
+```
+
+在所有Production Blocking Gate关闭之前，本设计应继续保持：
+
+```text
+ENGINEERING_CANDIDATE
+```
+
+状态，不宣称Production RTL或DDR6协议实现已经完成最终签核。
