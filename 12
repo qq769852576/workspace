@@ -1,0 +1,1894 @@
+# 11 数据通路设计
+
+## 11.1 功能范围与设计目标
+
+数据通路负责完成DDR6 MC中Read Data返回、Write Data存储与下发，以及相关结果、状态和资源生命周期管理。
+
+本章主要包括：
+
+a) Read Expected资源管理；
+
+b) Read Return Correlation；
+
+c) Read Assembly及Result生成；
+
+d) Write Payload Allocation及Capture；
+
+e) Write Attempt Reservation；
+
+f) PI侧Write Command/Data Join；
+
+g) Read/Write Physical Progress；
+
+h) Result Transfer、Reservation Release及内部资源Reclaim；
+
+i) Retry、Late Feedback及Reset场景的数据关联处理。
+
+现有DDR5 MC中的Read Tracking、Read Datapath、ECC/CRC/Protection、Write Data RAM、Mask及Partial/RMW数据处理结构原则上继续复用。
+
+DDR6数据通路的主要演进重点不是重新设计数据计算逻辑，而是建立更加明确的：
+
+```text
+Identity
+Reservation
+Correlation
+Completion
+Release
+Reclaim
+```
+
+边界。
+
+Read与Write均应遵循以下原则：
+
+```text
+Resource Reserved
+!=
+Command Presented
+!=
+Physical Progress
+!=
+Result Formed
+!=
+Host Transfer
+!=
+Internal Resource Reclaimed
+```
+
+## 11.2 总体结构
+
+数据通路总体结构如图11所示。
+
+```text
+                         Read Path
+
+TE / CC / OS
+     │
+     ▼
+    GS
+     │
+     │ Admission
+     ▼
+┌────────────────────┐
+│ Expected Reservation│
+│ Assembly Reservation│
+│ Return Ingress Credit│
+└─────────┬──────────┘
+          │
+          ▼
+         PI
+          │
+   Return Correlation
+          │
+          ▼
+         PHY
+          │
+       RDATA Return
+          │
+          ▼
+┌────────────────────┐
+│ Full-key Match     │
+└─────────┬──────────┘
+          ▼
+┌────────────────────┐
+│ Assembly           │
+│ Data/Mask/Status   │
+└─────────┬──────────┘
+          ▼
+      Result Hold
+          │
+          ▼
+         HIF
+          │
+          ▼
+         Host
+
+
+                         Write Path
+
+Host WDATA
+     │
+     ▼
+┌────────────────────┐
+│ Payload Store      │
+│ Data / Mask / Meta │
+└─────────┬──────────┘
+          │
+       READY
+          │
+          ▼
+TE / CC / OS
+     │
+     ▼
+    GS
+     │
+     │ Attempt Reservation
+     ▼
+         PI
+      /      \
+ Command    Payload
+   Half      Half
+      \      /
+       Exact Join
+          │
+          ▼
+         PHY
+          │
+ Accept / Drain / Status
+          │
+          ▼
+    Write Manager
+          │
+          ▼
+      Result Hold
+          │
+          ▼
+         HIF
+          │
+          ▼
+  Reservation Release
+          │
+     ┌────┴────┐
+     ▼         ▼
+   Retry     Terminal
+     │         │
+same Payload   ▼
+           Payload Free
+```
+
+**图11 Read/Write数据通路总体结构**
+
+Read和Write均由GS在Admission阶段提前确认未来所需资源，而不是等待数据已经返回或命令已经进入PI以后再尝试分配。
+
+## 11.3 Read数据通路
+
+### 11.3.1 Read功能职责
+
+Read数据通路负责：
+
+a) 在RD Admission前为未来返回预留Expected资源；
+
+b) 为返回数据预留Assembly空间；
+
+c) 为不可反压或有限反压的PHY Return预留Ingress Capacity；
+
+d) 建立PI Physical Return与Logical Read之间的Correlation；
+
+e) 对PHY Return进行Full-key Match；
+
+f) 将多个Fragment归并至Assembly；
+
+g) 处理Data、Byte Valid、Status及Protection信息；
+
+h) 形成稳定Read Result；
+
+i) 将Result提交HIF；
+
+j) 在Late Return风险及所有内部引用关闭后回收Expected和Assembly资源。
+
+Read数据通路不根据Host Response是否已经完成，直接推导内部Read资源已经可以复用。
+
+## 11.4 Read Admission及资源预留
+
+### 11.4.1 Admission前置资源
+
+一条RD命令完成GS Admission前，应确认至少存在：
+
+```text
+Expected Slot
+Assembly Slot
+Result处理能力
+PI Return Mapping资源
+Return Ingress Capacity
+```
+
+以及该Read所需的其他有限资源。
+
+只有全部资源同时Prepare成功时，GS才允许完成Admission Commit。
+
+因此：
+
+```text
+RD Timing Pass
+```
+
+并不意味着：
+
+```text
+RD可以直接Admission
+```
+
+还必须满足Read Data Path Capacity要求。
+
+### 11.4.2 原子Reservation
+
+GS Admission时应原子建立：
+
+```text
+Read Expected Reservation
+Assembly Reservation
+PI Return Correlation Credit
+Command/Timing Reservation
+```
+
+任何一个资源不足，本次Admission整体失败。
+
+不得采用：
+
+```text
+先发RD
+→ 等数据回来
+→ 再看有没有Read Buffer
+```
+
+的实现方式。
+
+### 11.4.3 Expected与Assembly分离
+
+Expected与Assembly承担不同职责。
+
+Expected回答：
+
+> 将来收到一份Return时，它应该属于哪一条Logical Read？
+
+Assembly回答：
+
+> 这条Logical Read的数据已经收到了多少，当前内容和状态是什么？
+
+因此：
+
+```text
+Expected
+!=
+Assembly
+```
+
+逻辑上应分别建模。
+
+二者可以在具体RTL中根据资源规模共享部分存储结构，但不得混淆功能职责和生命周期。
+
+## 11.5 Read Expected设计
+
+### 11.5.1 Expected Identity
+
+Expected应具有能够隔离Slot复用、Retry及Late Return的完整Identity。
+
+逻辑Full Key原则上包括：
+
+```text
+Transaction Identity
+Read Command ID
+Attempt ID
+Admission Sequence
+Expected Slot
+Expected Generation
+ACV / GMV
+Reset Epoch
+Channel / Correlation Context
+```
+
+具体Physical Return Carrier可以比上述逻辑Key更短，但PI必须能够依据自身Correlation Table恢复完整Logical Key。
+
+### 11.5.2 Read Command ID
+
+Read Command ID在HIF创建Read Child时建立。
+
+Retry不重新分配Read Command ID。
+
+逻辑关系为：
+
+```text
+Logical Read Child
+        │
+        ├── Read Command ID固定
+        │
+        ├── Attempt 1
+        │
+        ├── Attempt 2
+        │
+        └── ...
+```
+
+Read Command ID用于：
+
+a) Read Child标识；
+
+b) PI/Expected Correlation；
+
+c) Assembly关联；
+
+d) Stale Return隔离；
+
+e) HIF结果重建。
+
+### 11.5.3 Expected状态
+
+Expected至少应区分：
+
+```text
+FREE
+RESERVED
+MATCHABLE
+RETIRE_PENDING
+```
+
+其中Admission建立的是RESERVED状态。
+
+RESERVED仅表示：
+
+> 已经为这条Read预留了未来返回资源。
+
+此时不应允许PHY Return直接写Assembly。
+
+### 11.5.4 ARM及MATCHABLE
+
+PI建立能够覆盖未来PHY Return的Physical Correlation后，产生对应ARM事件。
+
+典型流程为：
+
+```text
+GS Admission
+     │
+     ▼
+Expected RESERVED
+Matchable = 0
+     │
+     ▼
+PI建立Exact Return Correlation
+     │
+     ▼
+ARM
+     │
+     ▼
+Expected MATCHABLE
+     │
+     ▼
+允许Exact Return Match
+```
+
+只有MATCHABLE状态的Expected允许合法Return产生Assembly Functional Write。
+
+### 11.5.5 为什么必须ARM
+
+如果Expected仅凭Slot Valid即可匹配，可能出现：
+
+```text
+旧Physical Return
+      │
+      ▼
+刚刚复用的Fresh Slot
+      │
+      ▼
+错误写入新Read
+```
+
+通过Generation、Attempt及ARM共同控制，可以将“资源已分配”和“返回已经允许匹配”分开。
+
+### 11.5.6 Return Before ARM
+
+若PHY Return可能在Expected ARM完成之前到达，则必须在接口设计中提供：
+
+a) 足够的Return Ingress Buffer；或
+
+b) 由PHY接口合同证明Return不可能早于ARM；或
+
+c) 明确将这种情况定义为协议/接口异常并Contain。
+
+不得假设：
+
+> Read Data通常会晚几拍，所以来得及建立Mapping。
+
+具体Earliest Return Boundary尚依赖正式PHY接口定义。
+
+## 11.6 Read Return Correlation
+
+### 11.6.1 PI Return Bridge
+
+PHY返回的数据首先由PI Return Bridge转换为MC内部Whole Record。
+
+逻辑内容原则上包括：
+
+```text
+Physical Correlation Context
+Logical Position / Fragment
+Data
+Byte Valid
+Final / Status
+CRC / ECC / Protection Evidence
+Occurrence Sequence
+Reset / Channel Epoch
+```
+
+PI根据Physical Tag、Route或其他Carrier恢复对应Logical Read Full Key。
+
+### 11.6.2 Return Match条件
+
+只有满足以下条件时，PHY Return才允许产生Assembly Functional Write：
+
+```text
+Expected.Valid
+AND
+Expected.Matchable
+AND
+Full Key Exact Match
+AND
+Context / Session Exact Match
+AND
+Logical Position Legal
+```
+
+若任一条件不满足：
+
+```text
+Assembly Data WE   = 0
+Assembly Bitmap WE = 0
+Assembly Status WE = 0
+Expected Progress WE = 0
+```
+
+并根据具体原因执行Telemetry、Error或Containment。
+
+### 11.6.3 Slot不能作为唯一匹配条件
+
+禁止使用：
+
+```text
+return_slot == expected_slot
+```
+
+作为Return Match的充分条件。
+
+至少应同时比较对应Generation、Attempt及其他必要Context。
+
+否则Slot复用后Old Return可能写入Fresh Read。
+
+## 11.7 Read Assembly设计
+
+### 11.7.1 Assembly功能
+
+Assembly负责保存一条Logical Read已经接收到的实际数据和状态。
+
+逻辑内容原则上包括：
+
+```text
+Valid
+Generation
+Expected Handle
+
+Required Position Mask
+Received Position Mask
+Required Byte Mask
+Received Byte Valid
+
+Data
+Status
+Protection / Error
+Final Evidence
+
+Context / Version
+```
+
+### 11.7.2 Fragment处理
+
+合法Read Fragment原则上包含：
+
+```text
+Position Index
+Payload Data
+Byte Valid
+Fragment Status
+Protection Evidence
+Final Marker
+```
+
+每个Fragment通过Expected精确匹配后，转换成Assembly Write Intent。
+
+### 11.7.3 Required Mask
+
+Read Completion应依据Required Mask判断，而不应简单使用固定Beat Count。
+
+原则上：
+
+```text
+(Received Mask & Required Mask)
+==
+Required Mask
+```
+
+才能证明要求的数据位置已经完整收到。
+
+这样可以支持：
+
+a) 不同Burst/Packet布局；
+
+b) Partial Data；
+
+c) Metadata；
+
+d) Profile相关Position；
+
+e) 其他非固定N Beat场景。
+
+Extra Position属于异常，不应因为计数已经达到Expected Count而静默忽略。
+
+### 11.7.4 Duplicate Fragment
+
+同一Position重复到达时，应区分：
+
+a) 完全相同的合法Duplicate；
+
+b) Data、Status或Protection不一致的Conflicting Duplicate。
+
+对于Bit-identical Duplicate，可以采用幂等Fold策略。
+
+对于Conflicting Duplicate，应阻止受保护状态被第二次覆盖，并记录异常。
+
+不得简单执行：
+
+```text
+data_ram[position] = latest_data
+```
+
+使Bitmap仍表现为正常完成。
+
+### 11.7.5 Multi-lane Return
+
+同一周期可能存在多个Read Return Lane同时写同一个Assembly Entry。
+
+应从统一PRE_STATE进行归约：
+
+```text
+Authenticate each lane
+        │
+        ▼
+Full-key Match
+        │
+        ▼
+Position Range Check
+        │
+        ▼
+Cross-lane Overlap Check
+        │
+        ├── Disjoint -> Merge
+        ├── Exact Duplicate -> Fold
+        └── Conflict -> Protected WE=0 / Error
+        │
+        ▼
+One Next Bitmap / Status / Complete
+```
+
+不得由多个always_ff分别更新同一Received Bitmap。
+
+## 11.8 Read Result设计
+
+### 11.8.1 Result形成
+
+Assembly满足完整性条件或形成规定的Terminal Error后，应将当前Read结果快照为稳定Result Record。
+
+典型流程为：
+
+```text
+Assembly Complete
+      │
+      ▼
+Snapshot
+      │
+      ▼
+Result Hold
+      │
+      ▼
+HIF
+```
+
+Result Hold产生后，后续Assembly变化不得改变已经提交给HIF的Result内容。
+
+### 11.8.2 Read Result Record
+
+Read Result原则上包括：
+
+```text
+Transaction / Child Identity
+Host Order Information
+Read Command ID
+Attempt Context
+
+Data / Extent
+Byte Valid
+Response Status
+Last / Terminal Information
+
+ACV / GMV
+Error / Protection Status
+Reset / Session
+```
+
+HIF负责Host Ordering和Host协议格式化，不重新执行Read Assembly。
+
+### 11.8.3 Result Backpressure
+
+当：
+
+```text
+result_valid = 1
+AND
+result_ready = 0
+```
+
+时，完整Result Record必须保持稳定。
+
+不得因Host反压而重新读取可能已经变化的Assembly Store形成输出。
+
+## 11.9 Read Reclaim
+
+### 11.9.1 Result Transfer不等于Reclaim
+
+HIF完成：
+
+```text
+result_fire
+```
+
+仅表示Read Result已经交给Host Response Owner。
+
+不表示Expected及Assembly已经可以立即复用。
+
+Expected Reclaim至少还应确认：
+
+```text
+Terminal Disposition Known
+Result Ownership Transferred
+Assembly Reader Reference Closed
+PI Return Map Reference Closed
+Return Ingress Old Reference Closed
+Old Return Impossible / Proven
+Retry Old Attempt Closed
+No Recovery Reference
+Context Retirement Legal
+```
+
+### 11.9.2 Assembly Reclaim
+
+Assembly Reclaim与Expected Reclaim可以最终同拍，但应具有独立逻辑条件。
+
+至少应确认：
+
+a) Result Snapshot不再读取Assembly Data；
+
+b) Expected及Read Manager不再引用Assembly；
+
+c) 不存在仍可合法写入Old Generation的Return。
+
+Assembly Data RAM本体不需要清零。
+
+Fresh Allocation时清除对应Valid、Generation、Bitmap及Control即可。
+
+## 11.10 Read Retry
+
+Read Retry应沿统一Retry Controller的Fence机制处理。
+
+基本过程为：
+
+```text
+Old Read Attempt
+      │
+      ▼
+Retry Requested
+      │
+      ▼
+Fence Old Attempt
+      │
+      │ Old in-flight exact return仍允许推进
+      ▼
+No-old-correlation Proof
+      │
+      ▼
+Old Expected Non-Matchable
+      │
+      ▼
+New Attempt Authorized
+      │
+      ▼
+Fresh GS Admission
+      │
+      ▼
+Fresh Expected / Assembly
+```
+
+Fence只阻止Old Attempt继续产生新的Issue或新的Correlation，不应立即把所有Old Return定义成Stale。
+
+若Old Fragment已经在PI或CDC路径中，并且Old Expected仍然MATCHABLE且Full Key匹配，则应继续写入Old Assembly。
+
+新的Expected及Assembly只有在Fresh GS Admission时创建。
+
+Retry Authorization本身不得直接分配新的Read资源。
+
+## 11.11 Write数据通路
+
+### 11.11.1 Write功能职责
+
+Write数据通路负责：
+
+a) 为Host Write请求分配稳定Payload Handle；
+
+b) 接收Host WDATA并写入Payload Store；
+
+c) 判断Payload是否完整；
+
+d) 保证READY Payload不可变；
+
+e) 在Write Admission时建立Attempt Reservation；
+
+f) 在PI完成Command与Payload的精确Join；
+
+g) 跟踪Write Physical Progress；
+
+h) 形成Write Attempt Result；
+
+i) 处理Retryable或Terminal Disposition；
+
+j) 完成Reservation Release；
+
+k) 在所有引用关闭后回收Payload。
+
+### 11.11.2 Payload、Attempt和Result分离
+
+Write中必须区分三个逻辑对象：
+
+```text
+Payload
+    = Host写入的数据本体
+
+Attempt
+    = 将该Payload执行到DRAM的一次尝试
+
+Result
+    = 某次Attempt产生的状态和处置结果
+```
+
+因此：
+
+```text
+Payload Identity
+!=
+Attempt Identity
+!=
+Result Sequence
+```
+
+Retry产生新的Attempt，但不重新捕获一份Host Payload。
+
+## 11.12 Write Payload设计
+
+### 11.12.1 Payload Handle
+
+Payload Handle原则上表示为：
+
+```text
+Payload Handle
+    =
+{Payload Slot, Payload Generation}
+```
+
+Generation用于隔离Slot复用后的旧Capture、旧Attempt或Late Feedback。
+
+HIF向IH/TE提交Write Descriptor时，只传递已经注册的Payload Handle。
+
+不得传递未稳定的Raw RAM Address或组合计算的未来Slot。
+
+### 11.12.2 Payload Entry
+
+Payload Entry逻辑上包括：
+
+```text
+Valid
+State
+Transaction Identity
+Payload Generation
+Config / Context
+
+Expected Extent
+Received Extent
+Segment Bitmap
+Payload Complete
+
+User Data
+Byte Valid / Mask
+Metadata
+Protection
+Error Sticky
+```
+
+Payload Entry不保存Attempt ID。
+
+这是保证同一份Payload能够跨Retry复用的基础。
+
+### 11.12.3 Payload状态
+
+建议状态包括：
+
+```text
+FREE
+CAPTURING
+READY
+RETIRE_PENDING
+```
+
+当Payload正在被某次Write Attempt使用时，可以通过Attempt Reservation表示其占用关系，而不必将Attempt Identity固化在Payload本体中。
+
+## 11.13 Payload Allocation及Capture
+
+### 11.13.1 Allocation
+
+Payload Allocation只建立控制状态：
+
+```text
+Valid = 1
+State = CAPTURING
+Generation = Fresh
+Segment Bitmap = 0
+Payload Complete = 0
+```
+
+Allocation沿：
+
+```text
+DATA RAM WE = 0
+MASK RAM WE = 0
+```
+
+### 11.13.2 Allocation与First Capture分沿
+
+不建议在分配Slot的同一周期立即使用新Slot组合驱动Payload RAM写地址。
+
+正确流程为：
+
+```text
+Cycle N:
+Payload Allocation
+  -> Registered Handle
+
+Cycle N+1 or later:
+Use Registered Handle
+  -> First WDATA Capture
+```
+
+这样可以避免：
+
+a) Free/Allocation/Capture同拍冲突；
+
+b) Generation尚未稳定；
+
+c) Host Lane MUX形成过长组合路径；
+
+d) FPGA RAM Read-during-write行为依赖器件实现。
+
+### 11.13.3 Capture Record
+
+Host WDATA应规范化为带完整Payload Identity的Capture Record：
+
+```text
+Payload Slot
+Payload Generation
+Segment ID / Logical Extent
+User Data
+Byte Mask
+Metadata
+Last
+Capture Sequence
+Protection / Error
+```
+
+只有Exact Payload Handle匹配时才允许写Payload Store。
+
+### 11.13.4 Capture Reducer
+
+同周期多个Host WDATA Lane写同一个Payload时，应统一归约：
+
+```text
+Full Handle Match
+        │
+        ▼
+Segment Range Check
+        │
+        ▼
+Overlap Check
+        │
+        ├── Disjoint -> Merge
+        ├── Exact Duplicate -> Fold
+        └── Conflict -> Error / Protected WE=0
+        │
+        ▼
+Data / Mask Write Intent
+        │
+        ▼
+Bitmap / Extent Next State
+```
+
+不能由多个Lane分别对同一个Segment Bitmap执行独立Nonblocking Assignment。
+
+## 11.14 Payload READY及不可变性
+
+### 11.14.1 Payload Complete
+
+Payload Complete不应仅依赖Host `last`。
+
+原则上至少应满足：
+
+```text
+All Required Segments Received
+AND
+All Required Bytes Valid / Defined
+AND
+Required Metadata Present
+AND
+No Structural Capture Error
+```
+
+### 11.14.2 CAPTURING到READY
+
+当Payload Complete成立：
+
+```text
+CAPTURING -> READY
+```
+
+从该沿开始：
+
+```text
+DATA RAM WE = 0
+MASK RAM WE = 0
+Metadata Payload WE = 0
+Segment Bitmap不再增加
+```
+
+直至Payload最终回收。
+
+即：
+
+> READY Payload在生命周期剩余阶段保持不可变。
+
+### 11.14.3 Retry复用
+
+一次Attempt发生Retryable Failure后：
+
+```text
+Payload
+    -> 保持READY
+    -> Generation不变
+    -> Data不变
+```
+
+只通过`retry_hold`阻止在Old Attempt尚未安全隔离之前重新Admission。
+
+Retry过程中不重新向Host索取WDATA。
+
+## 11.15 Write Admission及Attempt Reservation
+
+### 11.15.1 READY Query
+
+Write进入最终GS Admission前，应确认：
+
+```text
+Payload Valid
+AND
+Payload State == READY
+AND
+Payload Complete
+AND
+Retry Hold == 0
+AND
+Payload Handle / Context Exact Match
+```
+
+### 11.15.2 Attempt Reservation
+
+GS完成Write Admission时，应原子建立：
+
+```text
+Write Attempt Identity
+Write Attempt Reservation
+PI Join Credit
+Timing Reservation
+Command Occupancy
+必要下游Credit
+```
+
+任何资源不足，本次Write Admission整体失败。
+
+### 11.15.3 Attempt与Payload
+
+Attempt只引用：
+
+```text
+Payload Handle
+```
+
+而不复制Payload本体。
+
+因此同一个Payload可以依次被：
+
+```text
+Attempt 1
+Attempt 2
+Attempt 3
+```
+
+引用，只要前一Attempt已经按照Retry合同安全隔离。
+
+## 11.16 PI Write Command/Data Join
+
+### 11.16.1 两个输入事实
+
+PI侧Write需要将：
+
+```text
+Command Half
+```
+
+与：
+
+```text
+Data / Payload Half
+```
+
+组合成同一次Physical Write。
+
+二者不能依赖隐式到达顺序关联。
+
+### 11.16.2 Join Identity
+
+Write Join至少依据：
+
+```text
+Command ID
+Admission Sequence
+Attempt ID
+Payload Slot
+Payload Generation
+Join Generation
+ACV / Context
+Reset / Channel Epoch
+```
+
+进行关联。
+
+禁止采用：
+
+```text
+最近一条Write Command
++
+当前Payload
+```
+
+作为Join规则。
+
+### 11.16.3 Join Credit
+
+PI Join为有限资源。
+
+因此每条Write在GS Admission之前就应确认Join Capacity，并在Admission Commit时预留一份Join Credit。
+
+这样可以避免：
+
+```text
+Write已经Admission
+但PI Join Table已满
+```
+
+的死锁或回滚场景。
+
+### 11.16.4 Join完成
+
+只有Command Half与Payload Half的Full Key完全一致时，PI才允许形成完整Write Presentation。
+
+Old Attempt的Command Half不得与Fresh Attempt的Payload Half发生Join。
+
+## 11.17 Write Physical Lifecycle
+
+Write执行过程至少应区分：
+
+```text
+Presented
+Accepted
+Last Accepted
+Drained
+Final Status
+Attempt Result
+```
+
+这些状态不能压缩为一个`write_done`。
+
+### 11.17.1 Presented
+
+Command或Data Presented仅表示对应逻辑记录已经送至下一级接口。
+
+Presented不自动表示：
+
+a) 已经不可取消；
+
+b) PHY已经接受；
+
+c) 数据已经Drained；
+
+d) DRAM一定已经产生副作用；
+
+e) Attempt已经完成。
+
+### 11.17.2 Noncancelable Boundary
+
+Write从Pre-visible Cancelable状态进入Noncancelable状态的准确Physical Boundary必须由正式PHY接口合同定义。
+
+不得使用：
+
+```text
+PI Valid
+Command Presented
+Timeout
+```
+
+推定命令已经执行或未执行。
+
+### 11.17.3 Accept、Drain及Status
+
+Write Manager原则上分别跟踪：
+
+```text
+Accepted Position Bitmap
+Last Accepted
+Drained
+Final Status Valid
+Final Status
+```
+
+最终平台是否提供全部独立Carrier由PHY接口决定，但MC内部控制结构应保留对应逻辑边界。
+
+特别是：
+
+```text
+Last Accepted
+!=
+Payload Free
+```
+
+## 11.18 Write Result
+
+### 11.18.1 Attempt Done
+
+Write Manager从统一PRE_STATE综合：
+
+a) Accepted Bitmap；
+
+b) Last；
+
+c) Drain；
+
+d) Final Status；
+
+e) No-effect Abort；
+
+f) Result Disposition；
+
+g) Retry Policy；
+
+形成：
+
+```text
+Write Attempt Done
+```
+
+Attempt Done属于当前执行尝试的完成，不自动表示Logical Child已经Terminal。
+
+### 11.18.2 Retryable Result
+
+若结果允许Retry：
+
+```text
+Attempt Done = 1
+Result Valid = 1
+Child Terminal = 0
+Retry Pending = 1
+```
+
+HIF可以接收该Attempt Result，但不得因此将对应Write Child标记为最终完成。
+
+### 11.18.3 Terminal Result
+
+若当前Attempt为成功或不可Retry的最终错误：
+
+```text
+Attempt Done = 1
+Result Valid = 1
+Child Terminal = 1
+```
+
+即便如此，Payload仍不得立即释放。
+
+## 11.19 Write Result Hold
+
+Write Result形成后进入稳定Result Hold。
+
+Result Record原则上包含：
+
+```text
+Transaction / Child Identity
+Attempt Identity
+Payload Handle
+Status
+Disposition
+Child Terminal
+Versions / Epoch
+```
+
+当HIF未Ready时，整个Record保持不变。
+
+Result Stall期间不得：
+
+```text
+Release Reservation
+Free Payload
+Start Retry Fence
+```
+
+## 11.20 Result Transfer、Reservation Release及Payload Free
+
+### 11.20.1 三个不同边界
+
+Write路径必须明确区分：
+
+```text
+Result Transfer
+!=
+Attempt Reservation Release
+!=
+Payload Free
+```
+
+### 11.20.2 Result Transfer
+
+当：
+
+```text
+Result Valid && HIF Ready
+```
+
+时产生Result Transfer。
+
+同一沿：
+
+```text
+Result Valid -> 0
+Result Transferred -> 1
+```
+
+但：
+
+```text
+Reservation Release WE = 0
+Payload Free WE = 0
+```
+
+### 11.20.3 为什么Release必须分沿
+
+如果Result Fire同拍直接释放Attempt Reservation，可能产生：
+
+a) Retry读取组合Next State；
+
+b) Old Feedback与Fresh Attempt交叉；
+
+c) HIF Result Identity尚未形成稳定注册边界；
+
+d) PI或Write Manager的旧Reference同拍消失。
+
+因此Reservation Release应只依据已经注册的：
+
+```text
+RESULT_TRANSFERRED
+```
+
+PRE_STATE进行。
+
+### 11.20.4 Reservation Release
+
+后续周期确认：
+
+```text
+Result Transferred
+AND
+Attempt Done
+AND
+All Reservation-authorized Update Path Closed
+AND
+PI / Local Hold Released
+AND
+Final Retry / Cancel / Terminal Disposition Latched
+AND
+Release Identity / Proof Valid
+```
+
+后，方可：
+
+```text
+Reservation Valid = 0
+Reservation Released = 1
+```
+
+### 11.20.5 Retryable Release
+
+若Disposition为Retryable：
+
+```text
+Payload State remains READY
+Payload Data / Mask / Generation unchanged
+Retry Hold = 1
+Attempt Reservation Released
+```
+
+Payload不进入RETIRE_PENDING。
+
+### 11.20.6 Terminal Release
+
+若Logical Child已经Terminal：
+
+```text
+Payload -> RETIRE_PENDING
+```
+
+但Slot仍保持Valid，直至完整Payload Free条件成立。
+
+### 11.20.7 Payload Free
+
+Payload Free至少应确认：
+
+```text
+Reservation Released
+AND
+Retry Will Rearm == 0
+AND
+Retry Pending == 0
+AND
+Retry Hold == 0
+AND
+No Current Attempt Reference
+AND
+No PI Join / Feedback Reference
+AND
+No Recovery Reference
+AND
+Terminal Disposition
+AND
+Safe No-future-use
+AND
+Payload Free Ready
+```
+
+只有正式：
+
+```text
+payload_free_fire
+```
+
+才能清除Payload Valid并允许Slot复用。
+
+### 11.20.8 Host B与Payload Free
+
+Host B Response属于Host事务完成路径。
+
+Payload Free属于MC内部存储安全复用路径。
+
+因此：
+
+```text
+Host B Fire
+!=
+Payload Free
+```
+
+二者可能发生在不同周期。
+
+## 11.21 Write Retry
+
+Write Retry与Read Retry采用同一总体Fence思想，但Write必须额外保证Payload和Physical Side Effect边界安全。
+
+典型流程为：
+
+```text
+Retryable Attempt Result
+      │
+      ▼
+Result Transfer
+      │
+      ▼
+Later Reservation Release
+      │
+      ▼
+Payload READY + Retry Hold
+      │
+      ▼
+Fence Old Attempt
+      │
+      │ Old Accept / Drain / Status仍可合法推进
+      ▼
+No-old-feedback Proof
+      │
+      ▼
+New Attempt Permit
+      │
+      ▼
+Clear Retry Hold
+      │
+      ▼
+Fresh GS Admission
+      │
+      ▼
+Attempt 2
+      │
+      └── Same Payload Handle
+```
+
+Retry过程中：
+
+```text
+不重新抓取Host WDATA
+不复制Payload
+不修改Payload Generation
+```
+
+新的Attempt Reservation仍只能由Fresh GS Admission建立。
+
+## 11.22 Read/Write Backpressure设计
+
+### 11.22.1 Read资源Full
+
+Expected或Assembly资源Full时，只阻止新的Read Admission。
+
+不得阻止：
+
+a) 已存在PHY Return；
+
+b) Assembly Progress；
+
+c) Result Transfer；
+
+d) Old Expected Reclaim；
+
+e) Retry旧Attempt合法Progress。
+
+否则可能形成：
+
+```text
+Buffer Full
+→ Old Return无法处理
+→ Old Entry不能释放
+→ Buffer永远Full
+```
+
+### 11.22.2 Write Payload Full
+
+Payload Store Full只阻止新的Payload Allocation。
+
+不得阻止：
+
+a) 已分配Payload的后续Capture；
+
+b) PI读取READY Payload；
+
+c) 已有Write Attempt Progress；
+
+d) Result Transfer；
+
+e) Reservation Release；
+
+f) Payload Free。
+
+### 11.22.3 不可反压返回
+
+若PHY Read Return或Write Physical Feedback不可反压，应在产生对应不可撤回命令之前预留Worst-case Ingress Capacity。
+
+不能依靠：
+
+> 到时候FIFO应该还有位置。
+
+作为设计保证。
+
+## 11.23 Same-cycle处理
+
+### 11.23.1 Read Same-cycle
+
+典型情况包括：
+
+a) Expected ARM与Return同拍；
+
+b) 多Lane Fragment同时到达；
+
+c) Final Fragment与Final Status同拍；
+
+d) Old Reclaim与Fresh Allocation同拍；
+
+e) Retry Fence与Old Return同拍；
+
+f) Reset与Late Return同拍。
+
+所有状态应基于统一PRE_STATE归约。
+
+如ARM+Return同拍是否允许Return写Assembly，应由明确接口合同和Forwarding策略确定，不得依赖RTL代码顺序。
+
+### 11.23.2 Write Same-cycle
+
+典型情况包括：
+
+a) Payload Free与Fresh Allocation；
+
+b) 多Lane Capture；
+
+c) Result形成与Physical Status；
+
+d) Result Fire与Potential Release；
+
+e) Old Attempt Feedback与Fresh Attempt状态；
+
+f) Retry相关状态转换。
+
+其中明确要求：
+
+```text
+Result Fire同拍
+Reservation Release WE = 0
+```
+
+### 11.23.3 Old Free与Fresh Allocation
+
+Read Expected、Assembly及Write Payload均可以根据后续性能需求支持：
+
+```text
+Old Reclaim
++
+Fresh Allocation
+```
+
+使用同一物理Slot。
+
+但必须：
+
+a) 从PRE_STATE证明Old对象确实可以回收；
+
+b) 先认证Same-cycle Old Progress；
+
+c) 为Fresh对象分配新的安全Generation；
+
+d) 完整覆盖Fresh Control State；
+
+e) Old事件对Fresh Generation Functional WE=0。
+
+若实现复杂，第一版可以采用：
+
+```text
+Cycle N Free
+Cycle N+1 Allocate
+```
+
+的保守方案。
+
+## 11.24 Reset及Late Feedback
+
+联合破坏性Reset后，应使：
+
+```text
+Expected Matchable = 0
+Assembly Functional Valid = 0
+Read Result Hold Valid = 0
+
+Write Attempt Valid = 0
+Write Result Hold Valid = 0
+Payload Functional Matchability按Reset合同处理
+
+PI Return / Join Correlation失效
+```
+
+Payload或Assembly Data RAM物理位不需要全部清零。
+
+真正需要清除的是Valid、Generation及Functionally Matchable Control State。
+
+重新开放前必须满足对应PHY Flush或No-old-return/No-old-feedback证明。
+
+Reset前的Return、Drain或Status即使晚到，新Session中的Functional WE也必须为0。
+
+## 11.25 ALPG与Normal数据通路
+
+ALPG工作模式可以复用PHY侧Read/Write物理数据通路，但不改变Normal MC的数据资源Owner。
+
+Normal Write和ALPG Write可以在统一物理出口前进行MUX：
+
+```text
+Normal WDATA ----┐
+                 ├── WDATA MUX -> Simplified DFI -> PHY
+ALPG WDATA ------┘
+```
+
+ALPG Takeover期间，Normal MC应首先完成规定的Quiesce及Drain。
+
+ALPG数据不应错误写入Normal Payload Store，也不得使用Normal Write Attempt Identity。
+
+Read方向同理，ALPG Checker与Normal Read Return应根据当前模式及Correlation Context明确分流。
+
+## 11.26 主要接口
+
+数据通路主要接口见表16。
+
+**表16 Read/Write数据通路主要接口**
+
+| 序号 | 接口                            | 主要内容                                                    | 接口要求                                   |
+| -- | ----------------------------- | ------------------------------------------------------- | -------------------------------------- |
+| 1  | GS → Read Manager             | Read Identity、Attempt、Admission、Required Extent、Context | Expected/Assembly/Ingress原子Reservation |
+| 2  | PI → Read Expected            | Return Correlation Arm                                  | Exact Identity Match                   |
+| 3  | PHY/PI → Read Manager         | Return Fragment、Position、Data、Status、Correlation        | Full-key匹配后才产生WE                       |
+| 4  | Read Manager → HIF            | Registered Read Result                                  | Stall期间Whole Record稳定                  |
+| 5  | HIF → Payload Store           | Payload Allocation Request                              | 分配Handle，不同拍写Data RAM                  |
+| 6  | Host WDATA → Payload Store    | Handle、Segment、Data、Mask、Metadata                       | Exact Handle Match                     |
+| 7  | Payload Store → GS/PI         | READY、Payload Handle、Data Reference                     | READY后Payload不可变                       |
+| 8  | GS → Write Manager            | Attempt Identity、Payload Handle、Admission Sequence      | Attempt Reservation与Join Credit原子建立    |
+| 9  | PI ↔ Write Manager            | Command/Data Join、Presented/Accepted/Drain/Status       | Full Attempt Key关联                     |
+| 10 | Write Manager → HIF           | Attempt Result、Disposition、Child Terminal               | Result Hold稳定                          |
+| 11 | Retry Controller ↔ Read/Write | Fence、No-old-correlation Proof、New Permit               | 不覆盖合法Old Progress                      |
+| 12 | Resource Owner → GS           | Capacity/Prepare Result                                 | Full只阻新Allocation/Admission            |
+
+## 11.27 主要内部存储对象
+
+主要内部存储对象见表17。
+
+**表17 数据通路主要内部存储对象**
+
+| 序号 | 对象                        | 主要内容                                       | 创建条件               | 回收条件                                |
+| -- | ------------------------- | ------------------------------------------ | ------------------ | ----------------------------------- |
+| 1  | Read Expected             | Full Key、Generation、Matchable、Progress     | Read GS Admission  | No-old-return及引用关闭                  |
+| 2  | Read Assembly             | Data、Required/Received Mask、Status         | Read GS Admission  | Result Snapshot及Write Reference关闭   |
+| 3  | Read Result Hold          | Read Data、Status、Identity                  | Assembly Terminal  | HIF Transfer                        |
+| 4  | PI Return Map             | Physical→Logical Correlation               | Read Admission/Arm | Return Path关闭                       |
+| 5  | WDATA Payload             | Data、Mask、Metadata、Generation              | Payload Allocation | Payload Free                        |
+| 6  | Write Attempt Reservation | Attempt、Payload Ref、Admission、Progress     | Write GS Admission | Registered Result Transfer后的Release |
+| 7  | PI Write Join             | Command Half、Payload Half、Attempt Identity | Write Admission    | Physical Presentation/Reference关闭   |
+| 8  | Write Result Hold         | Status、Disposition、Child Terminal          | Attempt Completion | HIF Result Transfer                 |
+
+## 11.28 Read/Write典型流程
+
+### 11.28.1 Normal Read
+
+```text
+Read Transaction Eligible
+      │
+      ▼
+CC / OS
+      │
+      ▼
+GS检查Expected/Assembly/Ingress Capacity
+      │
+      ▼
+Admission Commit
+      │
+      ├── Expected RESERVED
+      ├── Assembly Clean
+      └── Return Credit Reserved
+      │
+      ▼
+PI建立Return Correlation
+      │
+      ▼
+Expected MATCHABLE
+      │
+      ▼
+RD / PHY Return
+      │
+      ▼
+Full-key Match
+      │
+      ▼
+Assembly
+      │
+      ▼
+Complete / Terminal
+      │
+      ▼
+Result Hold
+      │
+      ▼
+HIF Result Transfer
+      │
+      ▼
+Late-return / Reference Closure
+      │
+      ▼
+Expected / Assembly Reclaim
+```
+
+### 11.28.2 Normal Write
+
+```text
+Host Write Request
+      │
+      ▼
+Payload Allocation
+      │
+      ▼
+Host WDATA Capture
+      │
+      ▼
+Payload READY
+      │
+      ▼
+TE / CC / OS
+      │
+      ▼
+GS Admission
+      │
+      ├── Attempt Reservation
+      └── PI Join Credit
+      │
+      ▼
+PI Command/Data Join
+      │
+      ▼
+Physical Presented / Accepted
+      │
+      ▼
+Drain / Final Status
+      │
+      ▼
+Write Attempt Result
+      │
+      ▼
+HIF Result Transfer
+      │
+      ▼
+Later Reservation Release
+      │
+      ▼
+Terminal?
+   /       \
+ Retry     Yes
+  │         │
+same       RETIRE_PENDING
+Payload     │
+  │         ▼
+  └─>   Payload Free
+```
+
+## 11.29 DDR5 MC继承与修改关系
+
+数据通路在现有DDR5 MC基础上的主要继承和修改关系见表18。
+
+**表18 Read/Write数据通路继承与修改关系**
+
+| DDR5设计内容                   | DDR6处理 | 主要修改内容                                               |
+| -------------------------- | ------ | ---------------------------------------------------- |
+| `rt/rt.sv` Read Tracking   | 保留/修改  | 增加Typed Correlation和完整Identity                       |
+| `rd/rd.sv`数据通路             | 保留/修改  | 保留ECC/CRC/Protection/Data处理                          |
+| 原Read Short Tag            | 修改     | PI恢复Full Logical Key                                 |
+| Return Valid/EOD           | 保留语义   | 转换为Fragment/Final语义                                  |
+| 单一Read Buffer              | 修改     | Expected与Assembly逻辑分离                                |
+| RD后再找Buffer                | 禁止     | GS Admission前原子预留                                    |
+| Tag Valid即可匹配              | 替换     | RESERVED → ARM → MATCHABLE                           |
+| Read Complete立即Free        | 替换     | Result Transfer与Reclaim分离                            |
+| `memc_wu` Payload/Data RAM | 保留/修改  | 继续复用Payload Datapath                                 |
+| `memc_wu_wdata_if`         | 保留/修改  | 增加Handle/Generation及Multi-lane Reducer               |
+| HIF Write Pointer Queue    | 保留思想   | 演进为Payload Handle                                    |
+| Raw Write Pointer          | 修改     | `{slot,generation}`                                  |
+| Allocation与Capture耦合       | 替换     | 分时钟沿处理                                               |
+| Write Command/Data隐式关联     | 替换     | PI Full-key Exact Join                               |
+| Payload与Attempt耦合          | 替换     | Payload固定，Attempt独立                                  |
+| Completion后立即释放            | 替换     | Result Transfer → Reservation Release → Payload Free |
+| Retry重新获取WDATA             | 禁止     | Retry复用同一Immutable Payload                           |
+
+## 11.30 设计原则总结
+
+数据通路应遵循以下原则：
+
+a) Read Admission前必须保证未来Return存在完整接收资源；
+
+b) Expected负责“Return属于谁”，Assembly负责“已经收到了什么”；
+
+c) Expected Allocation不等于Return已经允许匹配；
+
+d) Return只有在MATCHABLE且Full-key Exact Match时才允许写Assembly；
+
+e) Slot Index不能作为Read Return唯一Identity；
+
+f) Read Complete采用Required Mask而不是固定Beat Count；
+
+g) Multi-lane Return必须从统一PRE_STATE归约；
+
+h) Read Result Transfer不等于Expected/Assembly Reclaim；
+
+i) Payload Allocation与First Capture分沿；
+
+j) READY Payload必须保持不可变；
+
+k) Payload Identity与Attempt Identity必须分离；
+
+l) Retry不得重新抓取Host WDATA；
+
+m) Write GS Admission必须原子建立Attempt Reservation及PI Join Credit；
+
+n) PI Write Command/Data必须进行Full-key Exact Join；
+
+o) Presented、Accepted、Drain、Final Status及Attempt Done不得压缩为单一Write Done；
+
+p) Retryable Attempt Done不等于Child Terminal；
+
+q) Result Transfer、Reservation Release和Payload Free必须分离；
+
+r) Write Result Fire同拍不得释放Attempt Reservation；
+
+s) Payload Free不得由Host B Response直接触发；
+
+t) Buffer Full只能阻止新的Allocation或Admission，不能阻止已有事务继续Progress和释放；
+
+u) Reset只清逻辑有效性，不要求清零Data RAM；
+
+v) Old Return或Old Feedback不得通过Slot复用写入Fresh Generation。
+
+## 11.31 待评审事项
+
+当前Read/Write数据通路的主要Identity、Reservation、Correlation、Result及Reclaim边界已经明确，下列内容仍需结合PHY接口、Host协议及FPGA资源进一步确认：
+
+a) PHY Read Return Correlation的Physical Carrier；
+
+b) Earliest Read Return及不可反压Latency Bound；
+
+c) 1:8 Simplified DFI下Read Logical Position与Return Phase映射；
+
+d) Expected及Assembly的最终Depth；
+
+e) Read Return并发Lane数量；
+
+f) Assembly RAM Port数量及Banking策略；
+
+g) Read ECC/CRC/Protection RAM及Datapath实现；
+
+h) Profile及1p12对应的Read Packet Layout；
+
+i) No-old-return的最终PHY证明；
+
+j) WDATA Payload Depth；
+
+k) Host WDATA Capture Lane数量；
+
+l) Payload Data/Mask/Metadata RAM组织；
+
+m) Write PI Join Table深度；
+
+n) PHY Write Noncancelable Boundary；
+
+o) Write Accept、Last、Drain及Final Status的实际Carrier；
+
+p) Write Physical Progress之间的最终顺序约束；
+
+q) Same-session Unknown Visibility恢复策略；
+
+r) Payload No-future-reference证明；
+
+s) Product Host Ordering及B Response具体规则；
+
+t) Partial/Masked/RMW Write在DDR6 Profile下的最终Data Layout；
+
+u) ALPG和Normal Read/Write物理数据MUX的最终接口位置。
+
+上述开放项主要影响物理Return/Write接口、缓存容量及FPGA实现方式，不改变“Admission前预留资源、Physical Feedback精确关联、结果传输与内部回收分离”的总体数据通路架构。
