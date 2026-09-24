@@ -1,0 +1,1600 @@
+# 10 模式配置、频率及电源控制设计
+
+## 10.1 功能范围与设计目标
+
+模式配置、频率及电源控制负责建立DDR6 MC运行所需的有效配置、资源组织、器件模式、工作频点及PHY训练状态，并保证各类运行状态切换过程中不存在新旧配置混用、未生效参数提前使用或器件状态未知情况下恢复普通访问等问题。
+
+本章主要包括：
+
+a) Config Resolver；
+
+b) Geometry Manager；
+
+c) Mode Register（MR）Service；
+
+d) Frequency Set Point（FSP）及工作点切换；
+
+e) Power Down及Self Refresh；
+
+f) Training Orchestrator；
+
+g) 配置、Timing、PHY及运行状态之间的发布和恢复关系。
+
+上述功能虽然均属于Side-plane Control，但其状态Owner保持独立。
+
+Config负责定义“控制器采用什么配置”；Geometry负责定义“该配置对应什么资源组织”；MR负责器件模式寄存器编程；FSP负责工作点切换；Power负责低功耗状态序列；Training负责协调PHY训练过程。
+
+各模块不得通过直接修改其他Owner状态的方式完成状态切换。
+
+## 10.2 总体结构
+
+模式配置、频率及电源控制总体关系如图10所示。
+
+```text
+ Software / APB
+       │
+       ▼
+ ┌───────────────┐
+ │ Config Shadow │
+ └───────┬───────┘
+         │
+         ▼
+ ┌─────────────────┐
+ │ Config Resolver │
+ │ Validate/Prepare│
+ └───────┬─────────┘
+         │
+         ├───────────────┐
+         ▼               ▼
+ ┌──────────────┐   ┌───────────────┐
+ │   Geometry   │   │ Timing/Image  │
+ │   Prepare    │   │   Prepare     │
+ └──────┬───────┘   └──────┬────────┘
+        │                  │
+        └─────────┬────────┘
+                  ▼
+            Safe Commit Point
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+   Active Config       Active Geometry
+        │                   │
+        └─────────┬─────────┘
+                  ▼
+             Normal MC
+
+                  │
+           Side-plane Control
+                  │
+        ┌─────────┼──────────┐
+        ▼         ▼          ▼
+       MR        FSP       Power
+        │         │          │
+        └────┬────┴─────┬────┘
+             │          │
+             ▼          ▼
+          Training     PHY
+             │          │
+             └────┬─────┘
+                  ▼
+            Effective State
+                  │
+                  ▼
+             Traffic Reopen
+```
+
+**图10 配置及运行状态控制总体结构**
+
+该体系应明确区分以下状态：
+
+```text
+Software Written
+        ↓
+Candidate
+        ↓
+Prepared
+        ↓
+Committed / Active
+        ↓
+Programmed
+        ↓
+Physical Operation
+        ↓
+Effective
+```
+
+不同功能不一定经过上述全部阶段，但不得把多个具有不同含义的阶段合并为一个Valid或Done信号。
+
+## 10.3 Config Resolver设计
+
+### 10.3.1 功能职责
+
+Config Resolver负责控制软件配置从Shadow状态转换为MC正式使用的Active Config。
+
+主要职责包括：
+
+a) 接收软件或上层控制接口写入的Candidate Config；
+
+b) 对Candidate进行本地合法性检查；
+
+c) 请求Geometry等相关Owner完成Prepare；
+
+d) 分配安全可使用的Active Configuration Version（ACV）；
+
+e) 等待全局Config Safe Point；
+
+f) 完成Config与Geometry的原子发布；
+
+g) 返回配置Apply结果；
+
+h) 阻止Stale Prepare、Old Token或Old Session结果进入当前Active状态。
+
+Config Resolver不负责计算Geometry内部资源关系，也不负责直接修改Timing、OpenRow、BSM或PHY状态。
+
+### 10.3.2 Shadow与Active分离
+
+软件写入配置时，只更新Shadow或Candidate状态。
+
+不得采用：
+
+```text
+Software Write
+      │
+      ▼
+Next Cycle直接成为Active Config
+```
+
+的实现方式。
+
+正确关系为：
+
+```text
+Software Write
+      │
+      ▼
+Candidate Config
+      │
+      ▼
+Validate
+      │
+      ▼
+Prepare
+      │
+      ▼
+Wait Safe Point
+      │
+      ▼
+Atomic Commit
+      │
+      ▼
+Active Config
+```
+
+Normal MC数据通路只读取Active Config，不直接读取软件正在修改的Shadow字段。
+
+### 10.3.3 Local Validate
+
+Config Resolver首先对Candidate执行不依赖其他Owner状态的本地合法性检查。
+
+检查内容原则上包括：
+
+a) Profile编码是否合法；
+
+b) Density编码是否合法；
+
+c) Device及其他数量配置是否有效；
+
+d) 配置值是否超过Build Maximum；
+
+e) Metadata等模式编码是否合法；
+
+f) Address Map是否完整；
+
+g) Address Map Source Bit是否位于允许范围；
+
+h) 是否存在非法重复Source Bit；
+
+i) 固定Offset是否被错误映射；
+
+j) 当前实现是否支持该Mapping Policy；
+
+k) Address Map输出宽度是否与目标Geometry兼容。
+
+Local Validate失败时：
+
+```text
+Active Config保持不变
+Active Geometry保持不变
+Timing Context不切换
+```
+
+并返回明确Apply Reject。
+
+### 10.3.4 ACV
+
+Active Configuration Version用于标识一组已经正式发布并被数据通路采用的配置。
+
+ACV主要描述：
+
+```text
+Host Address Mapping
+Config Policy
+Feature Configuration
+与事务解释相关的Active配置
+```
+
+ACV不得简单采用有限位宽计数器自然回卷。
+
+一个Version即使当前未被Active Owner直接观察，也不代表已经可以立即复用。
+
+只有能够证明旧版本不存在：
+
+a) Delayed Response；
+
+b) PI/PHY反馈；
+
+c) Retry引用；
+
+d) CDC/FIFO残留；
+
+e) Maintenance引用；
+
+f) 其他Future Reference；
+
+时，方可进入Reusable集合。
+
+因此：
+
+```text
+Not Live
+!=
+Safe to Reuse
+```
+
+### 10.3.5 Config Apply Context
+
+一次Config Apply应具有稳定Context，用于区分多次配置申请。
+
+原则上包括：
+
+```text
+Reset Epoch
+Channel Epoch
+Ownership / Apply Generation
+```
+
+即使两次Candidate内容完全相同，也应作为不同Apply Instance处理。
+
+Old Prepare Response或Old Commit Token不得匹配新的Apply。
+
+## 10.4 Geometry Manager设计
+
+### 10.4.1 功能职责
+
+Geometry负责根据Profile、Density及Topology定义MC内部Canonical Resource的组织方式。
+
+Geometry回答：
+
+> 当前配置下，哪些资源存在，它们如何唯一映射，以及哪些地址和Target Set合法。
+
+Geometry不负责回答：
+
+> 当前资源是不是OPEN、什么时候能发命令、当前有哪些Pending Transaction。
+
+### 10.4.2 Geometry Snapshot
+
+一份Active Geometry原则上包括：
+
+```text
+Topology Selector
+Active Device Count
+Active Logical Bank Count
+Active PSD Count
+Active BG Count
+Active BA Count
+Active Row Count
+Active Column Count
+Row / Column Width
+Resource Mapping Information
+Target Expansion Information
+```
+
+Geometry Snapshot在一个GMV有效周期内应保持不变。
+
+### 10.4.3 ACV与GMV
+
+ACV和Geometry Mapping Version（GMV）表示两个不同维度。
+
+```text
+ACV
+  -> 当前采用什么配置和Host Address Mapping
+
+GMV
+  -> 当前Canonical Resource如何解释
+```
+
+不能将二者合并为一个Version。
+
+IH进行地址处理时使用Active Config及Active Geometry共同完成：
+
+```text
+System Physical Address
+        │
+        ▼
+Logical Address
+        │
+        ▼
+Canonical Resource
+```
+
+### 10.4.4 Geometry Prepare
+
+Config Resolver提交Resolved Candidate后，Geometry首先在Prepare阶段计算并验证候选Geometry。
+
+Prepare只产生：
+
+```text
+Prepared Geometry Snapshot
++
+Opaque Prepare Token
+```
+
+不得立即修改Active Geometry。
+
+Config Resolver只负责保存和返回该Token，不应解析Token内部Row Count、Topology或Mapping信息，否则将形成第二个Geometry Authority。
+
+### 10.4.5 Canonical Resource
+
+Geometry应形成统一Canonical Resource描述。
+
+原则上包括：
+
+```text
+Device
+PSD
+BG
+BA
+Resource Index
+Row Range
+Column Range
+相关Target Expansion关系
+```
+
+OpenRow、BSM、Timing、Refresh及RFM均应使用同一套Canonical Resource Identity。
+
+### 10.4.6 Target Expansion
+
+REF_DIST、RFM_DIST、PRE等作用于多个资源的命令，其Target Expansion应由Geometry统一完成。
+
+不同功能模块不得分别保存另一套：
+
+```text
+Logical Bank -> Physical Resource Set
+```
+
+转换规则。
+
+若当前Profile对应的Target Mapping尚未得到正式定义，则相应Positive Path应保持Gated。
+
+## 10.5 Config与Geometry原子发布
+
+### 10.5.1 Safe Point
+
+Config Commit不得仅依据：
+
+```text
+Command FIFO Empty
+```
+
+或类似单一条件判断。
+
+Config Safe Point至少应确认旧Context的以下状态已经闭合：
+
+a) HIF旧Transaction已经退休；
+
+b) TE旧Entry已经退休；
+
+c) CC、OS及GS旧Hold已经释放；
+
+d) PI不存在旧Presented、Accepted或Launch残留；
+
+e) Read/Write旧引用已经关闭；
+
+f) Retry旧Attempt引用已经关闭；
+
+g) Refresh、RFM、MR及Training旧Service引用已经关闭；
+
+h) OpenRow不存在旧有效Row；
+
+i) BSM不存在OPEN或CLOSED_PENDING资源；
+
+j) 旧Config/Geometry Version不存在功能引用；
+
+k) 旧Timing Reservation已经关闭或按合同处理。
+
+Config Resolver不重新计算这些内部条件，而应接收Integration Owner形成的：
+
+```text
+cfg_commit_safe
+```
+
+### 10.5.2 为什么不能直接更换GMV
+
+Geometry切换可能改变同一个Resource Index所代表的物理资源含义。
+
+若旧OpenRow仍然Valid，则不能通过：
+
+```text
+OpenRow.GMV = New GMV
+```
+
+简单“换标签”继续使用旧状态。
+
+必须首先让旧Context中的资源达到真实安全状态，再进行Geometry切换。
+
+### 10.5.3 Atomic Commit
+
+Config与Geometry应在同一个逻辑Commit Point共同发布。
+
+Commit前：
+
+```text
+Active Config   = OLD
+Active Geometry = OLD
+```
+
+Commit后：
+
+```text
+Active Config   = NEW
+Active Geometry = NEW
+```
+
+任何功能周期都不允许出现：
+
+```text
+NEW Config + OLD Geometry
+```
+
+或：
+
+```text
+OLD Config + NEW Geometry
+```
+
+的半套Active状态。
+
+## 10.6 MR Service设计
+
+### 10.6.1 功能职责
+
+MR Manager负责DDR6 Mode Register相关Service。
+
+主要职责包括：
+
+a) 接收已经验证的MRR或MRW请求；
+
+b) 保存Exact MR Context；
+
+c) 检查Address、Field及Access Legality；
+
+d) 形成MR Command Candidate；
+
+e) 通过GS及PI提交MR命令；
+
+f) 等待MR Command Actual；
+
+g) 管理必要的Pre-wait和Post-wait；
+
+h) 处理MRUPDATE等附加序列；
+
+i) 对MRR完成Readback Assembly；
+
+j) 管理MR Programmed及Effective状态；
+
+k) 返回MR Service结果。
+
+MR Manager不负责普通Host Scheduling，不维护OpenRow或BSM，也不计算Timing Rule本身。
+
+### 10.6.2 MR Service基本结构
+
+现有DDR5 MR控制中的：
+
+```text
+Pre-wait
+→ Command
+→ Post-wait
+```
+
+基本结构可以继续复用。
+
+DDR6设计重点增加：
+
+a) 完整MR Context；
+
+b) Programmed与Effective状态；
+
+c) Readback Correlation；
+
+d) MRUPDATE；
+
+e) FSP相关Mode状态；
+
+f) Timing及PHY后置条件。
+
+### 10.6.3 Programmed与Effective
+
+MR设计必须明确区分：
+
+```text
+Programmed Value
+```
+
+和：
+
+```text
+Effective Value
+```
+
+逻辑过程为：
+
+```text
+Software / Service提供New Value
+             │
+             ▼
+Programmed Mirror = New
+             │
+             ▼
+MRW Command
+             │
+             ▼
+MRW Actual
+             │
+             ▼
+Post-wait / MRUPDATE /
+PHY或Feature-specific Condition
+             │
+             ▼
+Effective Mirror = New
+```
+
+因此：
+
+```text
+MRW Actual
+!=
+所有MR字段立即Effective
+```
+
+对于普通MR字段，可以在规定Post-condition满足后发布Effective状态。
+
+对于影响FSP、Timing、PHY或Training的字段，应等待对应Owner给出明确完成证明。
+
+### 10.6.4 MRUPDATE
+
+需要MRUPDATE处理的参数，应建立独立MRUPDATE Context。
+
+原则上包括：
+
+```text
+Service Identity
+Context Identity
+Shadow Values
+Required Resource Bitmap
+Command / CA Information
+State
+Version
+```
+
+典型流程为：
+
+```text
+MRW
+ │
+ ▼
+Shadow Prepared
+ │
+ ▼
+MRUPDATE Acquire
+ │
+ ▼
+Required Barrier
+ │
+ ▼
+MRUPDATE Sequence
+ │
+ ▼
+Post-condition
+ │
+ ▼
+Effective Publish
+```
+
+### 10.6.5 MRR
+
+MRR需要建立Expected Context，并与PHY返回的Readback数据精确关联。
+
+典型流程为：
+
+```text
+MRR Service
+    │
+    ▼
+GS / PI
+    │
+    ▼
+MRR Actual
+    │
+    ▼
+MRR Expected
+    │
+    ▼
+PHY Return
+    │
+    ▼
+Exact Context Match
+    │
+    ▼
+Readback Assembly
+    │
+    ▼
+Defined / Undefined Mask
+    │
+    ▼
+MR Result
+```
+
+未定义Readback Bit不得被伪造为“有效0”。
+
+Stale MRR Return不得更新当前MR Service。
+
+## 10.7 FSP及工作点切换
+
+### 10.7.1 FSP功能定位
+
+FSP切换不是单一Mode Register Bit修改，而是一项跨越：
+
+```text
+MR
+Timing
+PHY
+Training
+Config Context
+```
+
+的工作点切换过程。
+
+至少应区分：
+
+```text
+FSP_WR
+FSP_OP
+Target FSP
+Programmed FSP
+Effective FSP
+Switch In Progress
+Switch Complete
+```
+
+### 10.7.2 FSP_WR与FSP_OP
+
+FSP_WR用于描述后续相关MR编程所作用的Frequency Set Point。
+
+FSP_OP表示当前器件Operating Set Point。
+
+因此可能存在：
+
+```text
+FSP_WR = Y
+FSP_OP = X
+```
+
+此时表示目标FSP Y正在被预编程，而器件仍运行于FSP X。
+
+不得因为FSP_WR已经切换，就提前将系统解释为工作在新的FSP。
+
+### 10.7.3 FSP Context
+
+FSP Service原则上保存：
+
+```text
+Service ID
+Old Effective FSP
+Target FSP
+FSP_WR
+FSP_OP
+
+Switch Requested
+Switch Actual Seen
+PHY Switch Done
+Required Calibration Done
+Training Done
+Timing Image Ready
+Publication Done
+
+ACV / GMV / TDBV
+Reset Epoch
+Result / Error
+```
+
+### 10.7.4 Quiesce与Drain
+
+FSP切换前，应阻止新的不兼容工作进入目标Scope。
+
+原则上应停止：
+
+a) 新Normal Command；
+
+b) 新Read/Write Admission；
+
+c) 新不兼容Maintenance；
+
+d) 新MRR/MRW；
+
+e) 与切换冲突的ALPG Pattern。
+
+已有工作应排空至明确Safe Point。
+
+典型流程为：
+
+```text
+BLOCK_NEW
+    │
+    ▼
+DRAIN
+    │
+    ▼
+ALL_IDLE / SAFE
+    │
+    ▼
+FSP_SWITCH
+```
+
+### 10.7.5 FSP完整流程
+
+FSP切换原则上按下列顺序推进：
+
+```text
+Prepare Target Workpoint
+        │
+        ▼
+Program Target-FSP MR Fields
+        │
+        ▼
+FSP_WR Ready
+        │
+        ▼
+Quiesce / Drain
+        │
+        ▼
+Issue FSP_OP Switch
+        │
+        ▼
+DRAM Switch Actual
+        │
+        ▼
+PHY Workpoint Change
+        │
+        ├── Required Calibration
+        └── Required Training
+        │
+        ▼
+New Timing Image Ready
+        │
+        ▼
+Common Publication
+        │
+        ▼
+Effective FSP = Target
+        │
+        ▼
+Traffic Resume
+```
+
+只有上述需要的后置条件全部满足后，才能发布新的Effective Workpoint。
+
+### 10.7.6 FSP与Timing
+
+FSP切换可能改变Timing参数及PHY相关Latency。
+
+因此Timing Database/Timing Image应与Effective FSP保持明确版本绑定。
+
+不得出现：
+
+```text
+DRAM仍运行Old FSP
++
+Timing Engine已经使用New FSP参数
+```
+
+或者：
+
+```text
+DRAM已经切换New FSP
++
+MC重新开放Normal Traffic
++
+Timing仍使用Old Image
+```
+
+的状态。
+
+## 10.8 Power控制设计
+
+### 10.8.1 功能职责
+
+Power控制不建立一个保存全部系统状态的中央Power Manager。
+
+其职责由多个Owner共同完成：
+
+```text
+PRSM / Power Service
+    -> Sequence
+
+BSM
+    -> BLOCKED_POWER
+
+Timing
+    -> Entry / Exit Timing
+
+GS
+    -> Barrier及Admission Block
+
+Refresh
+    -> Post-Self-Refresh Catch-up
+
+PHY
+    -> Physical Low-power Handshake
+```
+
+Power Context只保存Sequence和Correlation所需状态，不复制OpenRow、BSM和Timing Truth。
+
+### 10.8.2 Power Entry Barrier
+
+进入Power状态前，应建立明确Entry Barrier。
+
+至少应确认：
+
+a) 新的不兼容Traffic已经阻止；
+
+b) 已有Outstanding工作已经排空；
+
+c) 不存在未闭合的PI Physical Residue；
+
+d) Read/Write Return或Drain处于可控状态；
+
+e) Target Bank达到要求的Closed/Quiet状态；
+
+f) Refresh Deadline不会因此被破坏；
+
+g) 对应Timing Entry Gap满足；
+
+h) PHY具备进入目标低功耗状态的条件。
+
+不能仅依据：
+
+```text
+Queue Empty
+```
+
+决定可以进入低功耗。
+
+### 10.8.3 BSM与Power
+
+需要进入Power Block的Bank原则上先处于已知CLOSED状态。
+
+状态关系为：
+
+```text
+CLOSED
+  │
+  │ Exact Power Enter
+  ▼
+BLOCKED_POWER
+```
+
+退出时：
+
+```text
+BLOCKED_POWER
+  │
+  │ Exact Power Exit
+  │ + Exit Timing Complete
+  │ + Closed Continuity Proof
+  ▼
+CLOSED
+```
+
+如果无法证明Closed Continuity，则不能直接返回CLOSED，应进入：
+
+```text
+INACCESSIBLE
+```
+
+并通过恢复流程重新建立可访问状态。
+
+### 10.8.4 Power Down
+
+Power Down典型过程为：
+
+```text
+Power Request
+     │
+     ▼
+Block New Traffic
+     │
+     ▼
+Drain
+     │
+     ▼
+Bank / Timing / Refresh / PHY Safe
+     │
+     ▼
+Power Entry Command
+     │
+     ▼
+Power Entry Actual
+     │
+     ▼
+LOW_POWER
+     │
+     ▼
+Power Exit
+     │
+     ▼
+Exit Timing
+     │
+     ▼
+PHY Ready
+     │
+     ▼
+Normal Reopen
+```
+
+Power Exit后，不同Command Class可能具有不同Exit Timing要求。
+
+不得用一个通用`tXP done`信号直接放开所有类型Command，具体规则由Timing Engine提供。
+
+### 10.8.5 Self Refresh
+
+Self Refresh典型流程为：
+
+```text
+Self Refresh Request
+       │
+       ▼
+Block New Traffic
+       │
+       ▼
+Drain Outstanding
+       │
+       ▼
+Close / Maintenance Safety Check
+       │
+       ▼
+SRE Actual
+       │
+       ▼
+Self Refresh
+       │
+       ▼
+SRX Actual
+       │
+       ▼
+tXSR
+       │
+       ▼
+Refresh Catch-up
+       │
+       ▼
+PHY Ready
+       │
+       ▼
+Normal Reopen
+```
+
+因此：
+
+```text
+SRX Actual + tXSR Complete
+```
+
+不一定直接等于Normal Traffic可以恢复。
+
+若Refresh Owner仍存在Post-SRX Catch-up义务，则应等待该义务完成。
+
+### 10.8.6 Power与Maintenance Deadline
+
+Power Entry不得导致已经存在的Mandatory Refresh等服务无法满足Deadline。
+
+若Power Entry会破坏Maintenance Future Feasibility：
+
+```text
+Power Entry Blocked
+```
+
+不能简单采用：
+
+> 先进入低功耗，出来后再补维护。
+
+除非对应协议和Accounting明确允许。
+
+## 10.9 Training Orchestrator设计
+
+### 10.9.1 功能边界
+
+Training应严格区分MC Orchestration和PHY Training Algorithm。
+
+MC负责：
+
+a) 接收Training Request；
+
+b) 建立Training Identity；
+
+c) 判断Training Prerequisite；
+
+d) 阻止不兼容Traffic；
+
+e) 选择当前Training Phase；
+
+f) 向PHY发送Training Request；
+
+g) 等待Exact Training Result；
+
+h) 进行Pass/Fail分类；
+
+i) 推进下一Phase；
+
+j) 最终发布Training Completion。
+
+MC不负责：
+
+```text
+Tap Sweep
+Eye Search
+Vref Search
+Per-lane Delay Search
+PHY内部Deskew
+TC内部训练算法
+X5IO Analog Tuning
+```
+
+上述算法属于PHY/TC实现。
+
+### 10.9.2 Training Identity
+
+Training Request及Result必须携带能够区分不同训练实例和重试的完整Identity。
+
+原则上包括：
+
+```text
+Training ID
+Phase ID
+Attempt ID
+Target / Scope
+Workpoint / FSP
+ACV
+GMV
+TDBV
+PHY Context Generation
+Reset Epoch
+```
+
+仅比较Phase ID不足以判断Result是否属于当前Training。
+
+### 10.9.3 Training Context
+
+Training State原则上包含：
+
+```text
+Valid
+Training ID
+Phase ID
+Attempt ID
+
+Dependency Mask
+Completed Phase Bitmap
+
+Target / Scope
+FSP / Workpoint
+
+ACV / GMV / TDBV
+PHY Context Generation
+
+State
+Result
+Error
+Deadline / Watchdog
+Reset Epoch
+```
+
+### 10.9.4 Phase Dependency
+
+不同Training Phase可能依赖：
+
+a) Config/Geometry已经Active；
+
+b) Target FSP已经准备；
+
+c) Timing Image已经准备；
+
+d) DRAM Initialization已经完成；
+
+e) 必要MR已经Programmed或Effective；
+
+f) Power State处于Active；
+
+g) Refresh处于Safe状态；
+
+h) PHY Ready；
+
+i) 前置Training Phase已经成功。
+
+上述依赖宜统一表示为：
+
+```text
+dependency_mask
+dependency_done_mask
+```
+
+只有：
+
+```text
+(dependency_done_mask & dependency_mask)
+==
+dependency_mask
+```
+
+时，当前Phase才允许开始。
+
+不应仅依靠FSM的“上一状态已经完成”推断所有依赖满足。
+
+### 10.9.5 Training流程
+
+Training基本流程为：
+
+```text
+Training Request
+      │
+      ▼
+Allocate Training Identity
+      │
+      ▼
+CHECK_DEPS
+      │
+      ▼
+Phase Ready
+      │
+      ▼
+PHY Request
+      │
+      ▼
+WAIT_RESULT
+      │
+      ├── Exact PASS -> Next Phase
+      │
+      └── Exact FAIL -> Retry / Contain
+      │
+      ▼
+All Required Phase Complete
+      │
+      ▼
+Final Publication
+```
+
+### 10.9.6 PHY Result Match
+
+PHY Training Result原则上应包含：
+
+```text
+Training ID
+Phase ID
+Attempt ID
+Status
+Result Payload / Summary
+PHY Context Generation
+Reset Epoch
+```
+
+MC只有在全部Identity与Current Live Training Phase匹配时，才能接受该Result。
+
+否则：
+
+```text
+Functional WE = 0
+```
+
+并根据策略记录Stale Result或Foreign Result。
+
+### 10.9.7 Retry
+
+Training Retry应分配新的Attempt Identity。
+
+例如：
+
+```text
+Training A
+Phase 2
+Attempt 1
+    │
+ Timeout / Fail
+    ▼
+Attempt 2
+```
+
+若Attempt 1的Late PASS在Attempt 2运行期间返回，不得结束Attempt 2。
+
+因此Phase ID相同不代表Result属于当前Attempt。
+
+### 10.9.8 Training Completion
+
+Training Done不应仅表示PHY返回一个Pass Bit。
+
+最终Completion至少应确认：
+
+a) 所有Required Phase完成；
+
+b) Result属于当前Training Context；
+
+c) PHY Context与当前Workpoint一致；
+
+d) 若Training影响Latency/Timing，则对应Timing Image已经更新；
+
+e) Config/FSP Context保持有效；
+
+f) Traffic Reopen条件已经满足。
+
+## 10.10 有效状态发布与Traffic Reopen
+
+### 10.10.1 Publication原则
+
+Config、MR、FSP、Power及Training涉及的运行状态变化均应具有明确Publication Point。
+
+对于可能影响普通数据通路解释的状态，不能在中间过程提前向Normal MC可见。
+
+例如：
+
+```text
+MR Programmed
+!=
+MR Effective
+
+FSP Switch Requested
+!=
+Effective FSP
+
+Training PHY PASS
+!=
+Normal Traffic Ready
+
+Power Exit Command
+!=
+Normal Traffic Reopen
+```
+
+### 10.10.2 Reopen条件
+
+经历FSP、Power、Training或其他全局状态切换后，重新允许Normal Traffic原则上应确认：
+
+a) Active Config有效；
+
+b) Active Geometry有效；
+
+c) Active Timing Image有效；
+
+d) Effective MR状态已经发布；
+
+e) Effective FSP与PHY Workpoint一致；
+
+f) Required Training完成；
+
+g) PHY Ready；
+
+h) Refresh/Maintenance状态满足重新开放条件；
+
+i) BSM/OpenRow状态已经重新建立或能够证明连续有效；
+
+j) 不存在Old Context反馈能够更新Current State。
+
+只有上述必要条件闭合后，才允许系统恢复正常Admission。
+
+## 10.11 配置与运行状态版本关系
+
+本章涉及的主要Version/Identity职责可归纳如下：
+
+| 标识                     | 主要职责                                         |
+| ---------------------- | -------------------------------------------- |
+| ACV                    | 标识Active Config及Host Address Mapping         |
+| GMV                    | 标识Active Geometry及Canonical Resource Mapping |
+| TDBV                   | 标识有效Timing Database/Image                    |
+| MR Service ID          | 标识具体MR服务                                     |
+| Effective MR Context   | 标识器件当前有效Mode状态                               |
+| FSP Service ID         | 标识一次Workpoint Switch                         |
+| Effective FSP          | 标识当前正式运行工作点                                  |
+| Power Instance ID      | 标识一次低功耗Entry/Exit过程                          |
+| Training ID            | 标识一次Training Instance                        |
+| Training Attempt ID    | 区分同一Phase的不同执行尝试                             |
+| PHY Context Generation | 区分PHY侧不同有效训练/工作点上下文                          |
+| Reset Epoch            | 隔离Reset前后的所有异步反馈                             |
+
+上述标识承担不同职责，不应为减少字段而随意合并。
+
+## 10.12 主要接口
+
+模式配置、频率及电源控制主要接口见表13。
+
+**表13 配置与运行状态控制主要接口**
+
+| 序号 | 接口                         | 主要内容                                       | 接口要求                       |
+| -- | -------------------------- | ------------------------------------------ | -------------------------- |
+| 1  | APB/Software → Config      | Candidate Config、Address Map、Apply Request | 仅修改Shadow/Candidate        |
+| 2  | Config → Geometry          | Resolved Candidate、Apply Context           | Prepare不修改Active           |
+| 3  | Geometry → Config          | Prepare Token、Pass/Reject                  | Token作为Whole Record保持      |
+| 4  | Integration → Config       | cfg_commit_safe                            | 未满足不得Commit                |
+| 5  | Config/Geometry → Datapath | Active Config、ACV、Geometry、GMV             | 同一Commit Point发布           |
+| 6  | MR Service → GS            | MRR/MRW/MRUPDATE Candidate                 | 仍经最终Admission              |
+| 7  | PI → MR                    | MR Actual、MRR Return                       | Full Context Match         |
+| 8  | FSP → MR/PHY/Training      | Target Workpoint及Sequence Context          | 保持同一Service Identity       |
+| 9  | Power → GS/PI/PHY          | Power Entry/Exit Request                   | 必须经过Entry Barrier          |
+| 10 | Refresh → Power            | Maintenance Safety/Catch-up状态              | Self Refresh Exit后参与Reopen |
+| 11 | Training → PHY             | Training ID、Phase、Attempt、Workpoint        | Stall期间Whole Record稳定      |
+| 12 | PHY → Training             | Exact Result、Status、PHY Context            | Identity完整匹配               |
+| 13 | Timing → MR/FSP/Power      | Timing Ready、Wait Complete、Image状态         | Timing为唯一时间Owner           |
+| 14 | Control → Normal MC        | Block/Resume Admission                     | Reopen条件全部成立后解除            |
+
+## 10.13 主要内部存储对象
+
+主要逻辑存储对象见表14。
+
+**表14 配置与运行状态控制主要内部存储对象**
+
+| 序号 | 对象                             | 主要内容                                    | 创建条件             | 发布/释放条件              |
+| -- | ------------------------------ | --------------------------------------- | ---------------- | -------------------- |
+| 1  | Config Candidate               | Shadow Config、Address Map、Apply Context | Software Apply   | Commit或Reject        |
+| 2  | Active Config                  | Active字段、ACV                            | Atomic Commit    | 后续Safe Commit替换      |
+| 3  | Prepared Geometry              | Geometry Snapshot、Opaque Token          | Geometry Prepare | Atomic Commit或Cancel |
+| 4  | Active Geometry                | Resource Mapping、GMV                    | Atomic Commit    | 后续Safe Commit替换      |
+| 5  | MR Service Context             | MRR/MRW、Address、Data、State              | MR Service建立     | Result完成             |
+| 6  | MR Programmed/Effective Mirror | Mode状态                                  | MR编程/后置条件        | 新有效值发布               |
+| 7  | FSP Context                    | Old/Target FSP、Progress、Version         | FSP Request      | Switch Complete      |
+| 8  | Power Context                  | Mode、Scope、Progress、Result              | Power Request    | Safe Exit完成          |
+| 9  | Training Context               | Training/Phase/Attempt/Dependency       | Training Request | Final Publication    |
+
+上述对象为功能Owner关系，不要求全部独立实现为RAM。
+
+## 10.14 Same-cycle、Backpressure与异常处理
+
+### 10.14.1 Config Same-cycle
+
+以下情况应定义明确优先级：
+
+a) Config Commit与Reset同拍；
+
+b) Geometry Prepare Response与Containment Fault同拍；
+
+c) Old Prepare Token与Fresh Apply同拍；
+
+d) Safe Point最后一个条件释放与Fresh Reset同拍。
+
+破坏性Reset原则上优先于Active Publication。
+
+Reset同拍不得产生错误的Config Apply OK。
+
+### 10.14.2 MR/FSP Same-cycle
+
+MR Effective Publication、FSP状态推进及Timing Image切换应通过共同Context鉴权。
+
+不得因某个MRW Actual同拍到达，就在其他Required Post-condition尚未满足时提前发布新的Effective Workpoint。
+
+### 10.14.3 Power Same-cycle
+
+Power Entry/Exit与Refresh Deadline、Maintenance Service或FSP Barrier同拍出现时，应从统一PRE_STATE判断是否允许状态推进。
+
+不得依赖多个FSM的代码执行顺序决定谁获得资源。
+
+### 10.14.4 Training Stale Result
+
+Old Training Attempt Result晚到时，如Attempt、FSP、ACV、TDBV、PHY Context或Reset Epoch任一不匹配：
+
+```text
+Functional WE = 0
+```
+
+不得使用“最近一次Training Phase相同”作为匹配条件。
+
+### 10.14.5 Timeout
+
+Config、MR、FSP、Power及Training中的Timeout均只表示：
+
+> 预期事件未在规定时间内被观察到。
+
+Timeout本身不得伪造：
+
+```text
+Command未执行
+PHY已经完成
+Power已经退出
+Training已经成功
+```
+
+等物理事实。
+
+无法确定Device/PHY状态时，应进入对应Containment或Recovery流程。
+
+## 10.15 Reset及重新建立有效状态
+
+破坏性Reset后，各模块内部Valid可以清除，但不能由此推导器件已经恢复到正常运行状态。
+
+典型重新建立过程为：
+
+```text
+Reset
+  │
+  ▼
+Config / Geometry重新建立
+  │
+  ▼
+DRAM Initialization
+  │
+  ▼
+Required MR Programming
+  │
+  ▼
+PHY / Workpoint Ready
+  │
+  ▼
+Required Training
+  │
+  ▼
+Timing Ready
+  │
+  ▼
+BSM / Resource Accessibility建立
+  │
+  ▼
+Refresh State重新建立
+  │
+  ▼
+MC Ready
+```
+
+因此：
+
+```text
+Reset Deassert
+!=
+MC Ready
+```
+
+Reset/Re-init的完整控制流程在后续异常及恢复设计章节进一步说明。
+
+## 10.16 DDR5 MC继承与修改关系
+
+模式配置、频率及电源控制在现有DDR5 MC基础上的主要继承和修改关系见表15。
+
+**表15 配置与运行状态控制继承与修改关系**
+
+| DDR5设计内容                     | DDR6处理 | 主要修改内容                              |
+| ---------------------------- | ------ | ----------------------------------- |
+| APB Slave FSM                | 保留     | 继续承担软件访问                            |
+| Address Decode               | 保留     | 继续承担CSR地址解析                         |
+| APB/Core CDC                 | 保留     | 保持控制域跨域框架                           |
+| 软件写后立即Active                 | 替换     | Candidate/Prepare/Safe Commit       |
+| Runtime Config Candidate     | 新增     | 保存待发布配置                             |
+| Config Version               | 强化     | 使用Retirement-qualified ACV          |
+| Geometry Mapping             | 重构/集中  | 建立统一Geometry Owner及GMV              |
+| Config/Geometry独立更新          | 禁止     | 必须原子发布                              |
+| DDR5 MR FSM                  | 保留/修改  | 继续Pre-wait/Command/Post-wait骨架      |
+| 单一MR Mirror                  | 修改     | 区分Programmed/Effective              |
+| MRR基本流程                      | 保留/修改  | 增加Exact Return Correlation及Assembly |
+| MRUPDATE                     | 扩展     | 建立独立Sequence Context                |
+| FSP字段更新                      | 强化     | 演进为完整Workpoint Switch               |
+| DDR5 Power Sequence          | 保留/修改  | 保留PRSM/MFSM框架，引入明确Barrier           |
+| Power状态集中复制                  | 不采用    | BSM/Timing/PHY分别保持Truth             |
+| Initialization/Training FSM壳 | 保留     | 继续Phase Sequencing及Request/Ack      |
+| Training Result简单Done        | 修改     | 增加Training/Phase/Attempt Identity   |
+| PHY Training算法进入MC           | 不采用    | PHY负责算法，MC只负责Orchestration          |
+
+## 10.17 设计原则总结
+
+模式配置、频率及电源控制应遵循以下原则：
+
+a) Software Written不等于Active；
+
+b) Candidate Config不等于Active Config；
+
+c) Config Prepare不修改Active状态；
+
+d) Config和Geometry只在Safe Point原子发布；
+
+e) ACV和GMV承担不同职责，不得混用；
+
+f) Geometry只定义资源身份，不维护运行状态；
+
+g) MR Programmed不等于MR Effective；
+
+h) MRW Actual不一定等于对应功能立即Effective；
+
+i) FSP_WR与FSP_OP不得合并；
+
+j) FSP切换属于Workpoint Switch，而不是单一MR写操作；
+
+k) FSP Effective Publication必须等待PHY、Timing及必要Training闭合；
+
+l) Power Entry必须经过Barrier和Drain；
+
+m) OPEN Bank不得直接转换为BLOCKED_POWER绕过Close过程；
+
+n) Power Exit不等于Normal Traffic立即恢复；
+
+o) Self Refresh Exit后应处理规定的Refresh Catch-up；
+
+p) MC只负责Training Orchestration，不实现PHY训练算法；
+
+q) Training Result必须进行Full Identity匹配；
+
+r) Retry必须使用新的Training Attempt Identity；
+
+s) Timeout不产生伪造的Physical Completion；
+
+t) Reset Deassert不等于MC Ready；
+
+u) 所有影响Normal Traffic解释的状态均应具有明确Publication Point。
+
+## 10.18 待评审事项
+
+当前配置、Geometry、MR、FSP、Power及Training的总体职责和主要状态边界已经明确，下列内容仍需结合产品配置及PHY接口进一步确认：
+
+a) Product最终Topology；
+
+b) 1p12 Geometry Mapping；
+
+c) Metadata Mode与Geometry的具体绑定；
+
+d) Config与Timing Image共同发布的最终接口；
+
+e) ACV、GMV及TDBV Version Pool深度；
+
+f) 各版本No-future-reference的最终证明机制；
+
+g) MR Field Database中尚未冻结的Field定义；
+
+h) MRR Readback的PHY Carrier；
+
+i) MRR与MRW之间的部分Timing关系；
+
+j) MRUPDATE的最终Physical Sequence；
+
+k) FSP相关MR字段的最终取值及作用范围；
+
+l) FSP切换的PHY Frequency Switch接口；
+
+m) FSP切换所需Calibration及Training Phase；
+
+n) Workpoint-specific Read/Write Latency；
+
+o) FSP切换失败后的Rollback Policy；
+
+p) Power Down具体模式及Product Policy；
+
+q) PHY Clock/TC/X5IO Low-power控制接口；
+
+r) 不同Command Class对应的Power Exit Timing；
+
+s) Self Refresh Entry/Exit Physical Handshake；
+
+t) Self Refresh Exit后的Refresh Catch-up具体规则；
+
+u) Training Phase最终集合及其Dependency；
+
+v) Training Result Payload及PHY Context Generation定义；
+
+w) Training Retry次数及Failure Policy；
+
+x) Config/FSP/Power/Training之间的全局Barrier Arbitration策略；
+
+y) 各类切换操作的Finite Latency Bound；
+
+z) Reset/Re-init后MC Ready所需的最终完整证明条件。
+
+上述开放项影响Product Policy、PHY接口和具体执行序列，但不改变“配置准备后安全发布、模式状态区分Programmed与Effective、工作点和电源切换完成后再恢复流量”的总体设计原则。
