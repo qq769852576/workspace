@@ -1,0 +1,888 @@
+# 6 前端请求处理设计
+
+## 6.1 功能范围与设计目标
+
+前端请求处理模块负责将Host侧请求转换为可由DDR6 MC内部命令处理模块使用的规范化事务，并在请求进入命令构造及调度阶段之前完成事务身份建立、地址合法性检查、资源映射、事务存储及依赖关系管理。
+
+前端请求处理由HIF、IH和TE组成，其主要数据通路如下：
+
+Host → HIF → IH → TE → CC。
+
+其中：
+
+a) HIF负责Host请求接收、事务身份建立、Parent/Child管理、Write Payload关联、Host Ordering及最终Host响应管理；
+
+b) IH负责System Physical Address解析、Config及Geometry一致性检查、地址合法性验证及canonical descriptor生成；
+
+c) TE负责保存Pending Transaction，建立和解除事务依赖，并将满足执行前提的请求提供给CC；
+
+d) HIF、IH和TE均不直接决定具体ACT、PRE、RD或WR命令，其输出仅形成后续命令构造所需的事务及状态信息；
+
+e) Bank状态、OpenRow及Timing约束分别由对应功能模块管理，前端模块不得建立第二套具有独立更新权限的状态真值。
+
+前端设计应保证Host请求经过长时间反压、事务拆分、重试、配置切换或异步结果返回后，事务身份、地址语义、数据关联和顺序关系仍保持一致。
+
+## 6.2 总体结构
+
+前端请求处理总体结构如图6所示。
+
+```text
+                     Host Request / WDATA
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │       HIF        │
+                    │                  │
+                    │ Port Arbitration │
+                    │ Parent / Child   │
+                    │ Transaction ID   │
+                    │ Host Ordering    │
+                    └────────┬─────────┘
+                             │
+              Whole Request │
+                             ▼
+                    ┌──────────────────┐
+                    │        IH        │
+                    │                  │
+                    │ Config Snapshot  │
+                    │ Address Mapping  │
+                    │ Geometry         │
+                    │ Legality Check   │
+                    └───────┬──────┬───┘
+                            │      │
+                      PASS  │      │ REJECT
+                            ▼      ▼
+                    ┌──────────┐   HIF
+                    │    TE    │
+                    │          │
+                    │ Entry    │
+                    │Dependency│
+                    │ Eligible │
+                    └────┬─────┘
+                         │
+                         ▼
+                         CC
+
+
+ Write Data：
+
+ HIF ── Payload Handle ──> WDATA Store
+  │
+  └──────── descriptor ───> IH → TE
+
+
+ Result：
+
+ Read/Write Manager
+          │
+          ▼
+         HIF
+          │
+   Parent/Child Reducer
+          │
+          ▼
+      Host Response
+```
+
+**图6 前端请求处理总体结构**
+
+Host请求首先由HIF接收并建立稳定的逻辑事务身份。对于Write请求，HIF还应在描述符向IH发布前完成Payload Handle分配，使Write Descriptor与随后到达的WDATA能够通过稳定标识关联。
+
+IH接收完整请求记录后，根据当前活动Config和Geometry完成地址解析和合法性检查。合法请求生成canonical descriptor并提交TE；非法请求形成明确Reject结果返回HIF，不创建TE事务。
+
+TE接收canonical descriptor后，在分配Transaction Entry的同时分析其与当前Older Live Request之间的依赖关系。事务及其全部初始依赖应采用原子方式建立；只有全部所需存储资源同时可用时，IH至TE的请求才能完成接收。
+
+当TE中某请求的相关依赖全部解除后，该请求进入可执行候选状态，并提供给CC进行后续Bank状态、OpenRow和Timing查询及命令构造。
+
+## 6.3 HIF设计
+
+### 6.3.1 功能职责
+
+HIF位于Host接口与MC内部请求处理通路之间，主要负责以下功能：
+
+a) 接收多个Host Port提交的Read及Write请求；
+
+b) 根据现有优先级、QoS、Urgent及Aging等规则完成Port Arbitration；
+
+c) 在请求进入IH之前建立稳定的Transaction Identity；
+
+d) 维护Host Transaction与MC内部Child之间的Parent/Child关系；
+
+e) 为Read Child维护必要的Read Command Identity；
+
+f) 为Write事务分配稳定的Payload Handle，并完成Descriptor与WDATA关联；
+
+g) 接收Read Manager及Write Manager返回的Child Result；
+
+h) 根据Child完成状态及Host Ordering要求形成最终Host响应；
+
+i) 在所有内部引用解除后完成Transaction资源回收。
+
+HIF不负责解释DDR6 Bank、Row或Column，也不负责判断ACT、PRE、RD和WR等命令是否可以执行。
+
+### 6.3.2 Host请求接收与Port Arbitration
+
+现有DDR5 MC中的多Port请求接收、QoS、priority、urgent、aging、Round-Robin及grant hold等机制原则上继续保留。
+
+Port Arbitration产生的grant仅表示当前周期由哪个Host Port的请求进入HIF处理，不表示该请求已经：
+
+a) 完成Host事务；
+
+b) 成功进入TE；
+
+c) 获得GS准入；
+
+d) 执行对应DRAM命令。
+
+Port Arbitration与后续事务生命周期应保持功能解耦。
+
+HIF向IH传递请求时，应将原有分散信号组织为完整请求记录。请求在下游反压期间，记录内的Transaction Identity、地址、请求类型、Ordering、QoS、Payload Handle、配置版本及Session等字段应保持不变。
+
+### 6.3.3 Transaction Identity
+
+Transaction Identity应在HIF建立，IH、TE及后续Retry逻辑不得重新分配第二套逻辑Transaction Identity。
+
+Transaction Handle原则上由以下信息构成：
+
+```text
+Transaction Handle
+    = {Transaction Slot, Transaction Generation}
+```
+
+其中Transaction Slot表示HIF事务表中的物理表项位置，Transaction Generation用于区分该Slot不同使用周期的逻辑记录。
+
+HIF进行新Transaction Allocation时，应同时满足：
+
+```text
+存在可用Transaction Slot
+AND
+存在安全可用的非零Generation
+```
+
+若Slot已经空闲，但候选Generation仍被旧TE、PI、Read/Write结果、Retry或其他记录引用，则该Slot不得重新分配。
+
+Generation不得在未证明旧引用已经全部排除的情况下直接回卷复用。
+
+### 6.3.4 Parent/Child管理
+
+一个Host Transaction可以根据Host Burst、Packet Boundary、内部请求拆分或Read/Write处理需要形成多个Child。
+
+HIF应保存Parent及其所属Child的生命周期状态。Parent至少应包含以下逻辑信息：
+
+| 字段类别          | 主要内容                                                 |
+| ------------- | ---------------------------------------------------- |
+| Transaction状态 | valid、transaction generation                         |
+| Host信息        | source port、host order、ordering domain、request class |
+| 配置上下文         | active configuration version、session                 |
+| Write关联       | payload handle valid、payload handle                  |
+| Child状态       | child valid、child done、child status                  |
+| 完成统计          | outstanding child count                              |
+| 最终状态          | parent error、parent done、response pending            |
+
+Read Parent还应根据后续Read返回及Host重组需要保存Child Ordinal、Read Command Identity等信息。
+
+上述信息表示HIF所需的逻辑状态，不要求建立独立的Parent Manager顶层模块。具体字段可根据资源规模合并至现有HIF控制存储中。
+
+### 6.3.5 Read Child管理
+
+Read Child创建时，应建立稳定的Child Identity，并为其分配Read Command Identity。
+
+Read Command Identity属于逻辑Read Child。发生Retry时，应保持原Read Command Identity不变，仅改变对应Attempt。
+
+Read Child达到terminal状态后，Read Command Identity不得立即重新使用。只有与旧Read Child相关的TE、PI、Expected、Assembly、Retry及其他返回关联全部关闭，且旧返回误匹配风险被排除后，才允许重新分配对应标识。
+
+### 6.3.6 Write Payload Handle
+
+现有DDR5 HIF已经具备通过Write Pointer Queue关联Write Command与后续WDATA的设计基础，该思想在DDR6设计中继续保留。
+
+DDR6目标设计将原Write Pointer进一步定义为稳定Payload Handle：
+
+```text
+Payload Handle
+    = {Payload Slot, Payload Generation}
+```
+
+Write Descriptor向IH发布前，应先完成Payload Handle分配并将该Handle登记到Parent状态中。
+
+Payload Allocation仅表示获得一个稳定的数据存储对象，不直接表示任何WDATA已经写入Payload RAM。
+
+因此：
+
+```text
+Payload Allocation
+!=
+First WDATA Capture
+```
+
+二者应具有明确的状态边界。
+
+Write Descriptor取得稳定Payload Handle后可以继续进入IH和TE。此时Host WDATA可以尚未全部到达；后续WR命令是否可以最终准入，由Write Payload Ready状态及GS相关检查共同决定。
+
+### 6.3.7 Child Result及Parent完成
+
+Read Manager和Write Manager应以带有完整Child Identity的结果记录向HIF报告Child执行结果。
+
+HIF不得依据“某条RD/WR已经发出”或结果到达顺序推断Child完成。
+
+当同一Parent存在多个Child时，HIF应对同拍到达的多个Child Terminal事件统一归约。重复的完全相同Terminal事件只计一次；同一Child在同一周期出现相互冲突的Terminal状态时，不应选择其中一个继续更新，而应阻止受保护状态写入并进入异常处理。
+
+Parent Done至少应满足：
+
+```text
+全部Required Child达到Terminal
+AND
+对应Host Ordering条件已经满足
+```
+
+Parent Done仅表示Host结果已经具备形成条件，不等同于Host已经接收该结果。
+
+### 6.3.8 Host Ordering与资源回收
+
+HIF为Host Ordering的功能Owner。
+
+具体实现可以根据Host协议及产品要求采用per-domain FIFO、Predecessor Link、Head/Tail或Order Sequence等方式。
+
+对于具有严格顺序要求的事务，在Older Parent未达到规定的Host Release Point之前，Younger Parent不得越过。
+
+应明确区分以下状态：
+
+```text
+Parent Done
+Host Response Eligible
+Host Response Transfer
+Parent Reclaim
+```
+
+Host侧R/B长时间反压时，完整响应记录应保持稳定。Host完成接收后，也不能直接认为Parent Slot已经可以重新使用。
+
+Parent Slot回收至少应确认：
+
+a) Parent已经达到terminal；
+
+b) 所需Host Response已经完成传输；
+
+c) 所属Child均达到规定终止状态；
+
+d) Read Command Identity相关引用已经关闭；
+
+e) TE相关引用已经关闭；
+
+f) PI及事件记录相关引用已经关闭；
+
+g) Read Expected及Assembly相关引用已经关闭；
+
+h) Retry旧Attempt引用已经关闭；
+
+i) Write Payload及Write Manager相关引用已经按照对应合同关闭；
+
+j) 旧输入或Late Result不再可能与该Parent发生合法匹配。
+
+只有满足相应Reclaim条件后，Parent Valid方可清除，对应Generation方可进入后续安全复用流程。
+
+## 6.4 IH设计
+
+### 6.4.1 功能职责
+
+IH位于HIF与TE之间，是Normal MC中Host地址转换为内部DDR6资源语义的唯一地址解释入口。
+
+IH主要负责：
+
+a) 接收HIF提供的完整请求记录；
+
+b) 采样并确认当前有效Config及Geometry上下文；
+
+c) 对System Physical Address进行Bit-level Address Mapping；
+
+d) 根据Geometry形成canonical device及resource描述；
+
+e) 对地址、Profile、资源范围及版本一致性进行合法性检查；
+
+f) 对合法请求形成canonical descriptor；
+
+g) 对非法请求形成明确Reject结果并返回HIF。
+
+IH不保存Pending Transaction，不建立RAW、WAR或WAW依赖，也不维护Bank、OpenRow和Timing状态。
+
+### 6.4.2 输入记录与上下文
+
+HIF向IH提供的请求至少包含以下逻辑内容：
+
+```text
+Transaction / Child Identity
+Request Class
+System Physical Address
+Burst Descriptor
+Ordering / QoS
+Payload Handle
+Configuration Version
+Reset / Session Context
+```
+
+IH处理请求时，应使用与该请求一致的Config和Geometry视图。
+
+一旦请求被IH接受并形成输出结果，在输出因下游反压而保持期间，不应再依据实时配置变化重新计算该请求。
+
+Config或Geometry切换后，旧请求不得被静默按照新映射重新解释。
+
+### 6.4.3 地址解析与资源规范化
+
+IH首先按照活动地址映射规则从System Physical Address中提取Channel、Logical Bank、Row、Column及其他必要字段。
+
+随后调用Geometry提供的资源定义，将逻辑地址进一步转换为MC内部统一使用的canonical descriptor，包括：
+
+```text
+Canonical Device
+PSD / BG / BA
+Resource Index
+Resource Identity
+Row Index
+Column Index / Burst Position
+Transaction Identity
+Request Class
+Ordering / QoS
+Payload Reference
+Configuration / Geometry Version
+Session Context
+```
+
+具体字段根据最终Profile、Topology及Packet Layout确定。
+
+资源映射过程中应保持单一地址解释原则。其他模块可以复制映射结果用于流水或性能优化，但不得建立独立、可自行更新的第二套地址映射真值。
+
+### 6.4.4 地址合法性检查
+
+IH应在请求进入TE前完成完整合法性检查。
+
+检查内容原则上包括：
+
+a) Request编码是否合法；
+
+b) 当前Config及Geometry是否有效且相互一致；
+
+c) System Physical Address是否位于允许范围；
+
+d) Device及其他目标Tuple是否有效；
+
+e) Logical Bank及转换后资源是否存在；
+
+f) Row及Column是否小于对应Geometry规定的实际数量；
+
+g) Burst或Packet范围是否越界；
+
+h) 是否存在非法地址Hole、Alias或不支持的Profile组合；
+
+i) Request携带的版本及Session是否仍然有效。
+
+字段位宽足够容纳某个数值不表示该数值在当前Geometry下合法。范围检查应依据有效资源数量执行，不应仅依靠字段位宽判断。
+
+### 6.4.5 Descriptor与Reject输出
+
+IH处理结果分为两类：
+
+```text
+PASS   -> Canonical Descriptor
+FAIL   -> Typed Reject
+```
+
+两类结果应互斥。
+
+合法请求形成完整canonical descriptor并提交TE。
+
+对于Host输入合法但在当前Profile、Geometry或资源范围下不可执行的请求，应形成带原Transaction Identity及明确Reason的Reject结果返回HIF。
+
+不得采用以下方式处理非法请求：
+
+a) 将非法地址字段默认置零后继续执行；
+
+b) 将超出范围的地址静默修正为其他合法地址；
+
+c) 因内部检查失败而生成不完整Descriptor继续进入TE。
+
+若IH检测到内部状态或配置之间存在逻辑矛盾，应进入相应Fault或Containment路径，而不是将其伪装为普通Host地址错误。
+
+### 6.4.6 IH输出保持
+
+IH应设置能够保存完整Descriptor或Reject结果的输出保持结构。
+
+当下游未Ready时，Result Kind、Transaction Identity、Canonical Address、Version及Reject Reason等全部字段保持不变。
+
+IH结果被消费后方可释放对应保持记录；允许在物理实现满足要求时采用同拍Pop/Refill等弹性流水方式，但不得造成新旧记录字段混合。
+
+## 6.5 TE设计
+
+### 6.5.1 功能职责
+
+TE用于保存已经完成地址规范化、但尚未达到逻辑终止条件的Pending Transaction，并维护事务之间的执行依赖关系。
+
+TE主要负责：
+
+a) 为IH提交的合法Descriptor分配Transaction Entry；
+
+b) 在新事务进入时比较Older Live Request并建立必要依赖；
+
+c) 接收来自相关功能Owner的精确Dependency Release；
+
+d) 判断请求是否已经解除全部前序依赖；
+
+e) 向CC提供满足基本事务依赖条件的请求；
+
+f) 在事务达到Terminal且外部引用解除后回收Entry。
+
+TE不负责决定Bank是否需要PRE或ACT，也不负责独立维护OpenRow及Timing History。
+
+### 6.5.2 Transaction Entry分配
+
+现有DDR5 TE中的有界Entry Array、Free Entry检测和One-hot Load结构原则上继续保留。
+
+DDR6设计将TE Entry Identity由简单Entry Index扩展为：
+
+```text
+TE Entry Handle
+    = {Entry Index, Entry Generation}
+```
+
+新请求进入TE前，应同时确认：
+
+a) 存在可用Transaction Entry；
+
+b) 存在安全可使用的Generation；
+
+c) 存在足够的Dependency Storage；
+
+d) 请求及其全部初始Dependency能够在同一个Allocation Transaction中完整建立。
+
+若新请求需要K条Dependency，而当前仅有K-1条可用Dependency存储，则IH至TE的Ready应保持无效。
+
+不得先分配Transaction Entry，再仅记录部分Dependency。
+
+### 6.5.3 Older Request比较
+
+新请求分配时，应与当前所有相关Older Live Request进行比较，以确定该请求是否需要等待某些前序事务达到特定执行点。
+
+比较内容至少包括：
+
+a) Resource Identity；
+
+b) Logical Address或Data Extent；
+
+c) Byte/Block Overlap；
+
+d) Older Request Class；
+
+e) Ordering Domain；
+
+f) Barrier或其他顺序限制；
+
+g) Maintenance或Config相关约束。
+
+数据依赖与Bank Conflict属于不同概念。
+
+两个请求访问同一Bank但不同Row，可能产生Row Conflict，从而影响CC后续PRE/ACT选择，但不一定存在RAW、WAR或WAW数据依赖。
+
+因此不得使用简单的“Same Bank Blocked”状态同时替代资源冲突和数据依赖判断。
+
+### 6.5.4 数据依赖
+
+对于存在数据范围重叠的请求，应根据请求类型建立相应依赖。
+
+#### 6.5.4.1 RAW依赖
+
+当Older Write与Younger Read访问的数据范围重叠时，Younger Read应等待Older Write达到规定的数据可见点。
+
+在当前不采用Write Forwarding的设计前提下，不应因下列事件发生而提前解除RAW：
+
+a) Write被Scheduler选择；
+
+b) Write完成GS Admission；
+
+c) WR Command实际发生；
+
+d) WDATA已经进入Payload Ready状态。
+
+RAW应由Write功能Owner在满足规定的数据可见条件后产生明确Release事件。
+
+#### 6.5.4.2 WAR依赖
+
+当Older Read与Younger Write访问范围重叠时，Younger Write应等待Older Read越过不会再被后续Write破坏其读取语义的执行点。
+
+具体Release Point应根据当前Ordering Policy确定，可以由经认证的Read Device Occurrence或其他正式事件提供。
+
+#### 6.5.4.3 WAW依赖
+
+当Older Write与Younger Write访问范围重叠时，Younger Write应等待Older Write达到规定的数据可见或Ordering Release条件。
+
+不得仅以Older WR Command已经发出作为WAW解除条件。
+
+### 6.5.5 Ordering及其他依赖
+
+即使两个请求访问不同地址，在严格Host Ordering Domain下仍可能形成顺序依赖。
+
+因此TE Dependency应区分不同Release Class。逻辑上可包括：
+
+```text
+COMMAND_ADMITTED
+DEVICE_OCCURRENCE
+WRITE_DATA_VISIBLE
+HOST_COMPLETION
+OWNER_RETIREMENT
+ORDERING_RELEASE
+MAINTENANCE_RELEASE
+CONFIG_RELEASE
+```
+
+具体请求仅使用其中与自身语义相关的Release Class。
+
+如：
+
+```text
+RAW                  -> WRITE_DATA_VISIBLE
+WAR                  -> DEVICE_OCCURRENCE或Policy定义的Read Release
+WAW                  -> WRITE_DATA_VISIBLE
+Strict Host Ordering -> ORDERING_RELEASE
+```
+
+上述枚举表示逻辑分类，具体实现可根据后续详细设计进行裁剪。
+
+### 6.5.6 Dependency存储
+
+Dependency Tracker用于描述“Younger Request当前为什么不能越过某个Predecessor”。
+
+逻辑上，每条Dependency至少需要保存：
+
+```text
+Valid
+Predecessor Entry Handle / Generation
+Predecessor Transaction / Child Identity
+Release Class
+Version / Session Context
+```
+
+Dependency可以采用以下实现方式：
+
+a) 保存在对应TE Entry内部的小数组或Bitmap及关联信息中；
+
+b) 采用独立的小型Dependency Table。
+
+逻辑职责独立不表示必须使用独立物理RAM。最终存储方式根据Entry数量、依赖数量、比较宽度、RAM端口及FPGA Timing要求确定。
+
+### 6.5.7 Dependency Release
+
+Dependency不得通过“Older Entry已经无效”间接推断已经解除。
+
+产生对应可见事实的功能Owner应向TE发送明确的Typed Release Record。
+
+Release Record至少包含：
+
+```text
+Predecessor Handle / Generation
+Transaction / Child Identity
+Release Class
+Required Attempt / Context
+Version / Session
+Release Sequence
+```
+
+TE收到Release后，应首先完成范围及完整Identity验证，再更新对应Dependency。
+
+Generation或其他关键Identity不匹配时：
+
+```text
+Dependency Write Enable = 0
+Transaction Write Enable = 0
+```
+
+Release通路应采用可保持的valid/ready语义。若Release源本身不可反压，则在TE之前应配置能够保证事件不丢失的入口资源。
+
+Dependency Storage已满时，只允许阻塞新的Transaction Allocation；已有事务的Dependency Release必须仍可继续处理，避免产生资源满导致的自锁。
+
+### 6.5.8 Eligible Request
+
+当某一TE Entry满足以下基本条件时，可进入Eligible状态：
+
+a) Entry有效；
+
+b) 全部必须Dependency已经解除；
+
+c) 当前Session及Context仍然有效；
+
+d) 不处于Retry Fence或其他禁止产生新命令的状态；
+
+e) 没有当前功能定义要求的其他事务级阻塞条件。
+
+Eligible仅表示该事务可以交由CC继续处理。
+
+TE不在此阶段判断目标Bank是否处于OPEN或CLOSED，也不最终判断Timing是否满足。
+
+CC取得请求后，应重新获取或验证当前BSM、OpenRow及Timing信息。
+
+TE内部可以缓存Page或Bank相关Query结果作为性能优化，但缓存必须具有对应的Sequence或Context Freshness信息。缓存失效时，应重新查询状态Owner，不得继续使用旧结果构造命令。
+
+### 6.5.9 Transaction Terminal与Entry Reclaim
+
+PRE、ACT等命令仅表示事务取得中间进展，不直接清除TE Entry。
+
+RD或WR被选择、准入、Presentation或Actual同样不直接表示对应逻辑Transaction已经Terminal。
+
+Read事务应依据Read Manager/HIF提供的最终Child Terminal或当前合同规定的Transaction Complete事件结束。
+
+Write事务应依据Write Manager形成的最终Terminal Disposition，并确认当前Logical Child不再Retry后结束。
+
+Transaction达到Terminal后，如仍有HIF、PI、Retry或其他模块引用对应TE Identity，则Entry仍不得立即重新分配。
+
+TE Entry Reclaim应在Terminal及相关引用关闭后执行。
+
+第一版实现宜优先采用保守的跨周期回收策略：
+
+```text
+Cycle N：
+Old Entry Terminal / Free
+
+Cycle N+1或之后：
+Fresh Allocation
+```
+
+若后续性能分析要求支持同周期Free与Reuse，应重新验证旧Release、Query Response、Candidate Feedback及RAM Read/Write Port不会更新Fresh Generation。
+
+## 6.6 前端主要接口
+
+前端主要逻辑接口见表2。
+
+**表2 前端请求处理主要接口**
+
+| 序号 | 接口                           | 主要内容                                                                                                        | 接口要求                |
+| -- | ---------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------- |
+| 1  | Host/CDC → HIF               | Host ID、地址、请求类型、Burst、Ordering及相关属性                                                                         | 完整记录跨域及保持           |
+| 2  | Host WDATA → HIF/WDATA Store | Data、Mask、Last及Payload关联信息                                                                                  | 仅valid与ready同时有效时接收 |
+| 3  | HIF → IH                     | Transaction/Child Identity、System Physical Address、Request Class、Ordering/QoS、Payload Handle、Config/Session | Stall期间整记录稳定        |
+| 4  | IH → TE                      | Canonical Descriptor                                                                                        | 只有合法请求进入TE          |
+| 5  | IH → HIF                     | Reject Identity及Reason                                                                                      | 不创建TE Entry         |
+| 6  | TE → CC                      | Eligible Transaction及必要上下文                                                                                  | CC接收前保持完整           |
+| 7  | Release Owner → TE           | Typed Dependency Release Record                                                                             | 完整Identity匹配后更新     |
+| 8  | Read/Write Manager → HIF     | Typed Child Result                                                                                          | 不依赖结果到达顺序           |
+| 9  | HIF → Host                   | Read/Write Response                                                                                         | Host反压期间完整记录保持      |
+
+## 6.7 主要内部存储对象
+
+前端主要内部存储对象见表3。
+
+**表3 前端主要内部存储对象**
+
+| 序号 | 对象                          | 主要保存内容                                                                | 创建条件                     | 回收条件                                 |
+| -- | --------------------------- | --------------------------------------------------------------------- | ------------------------ | ------------------------------------ |
+| 1  | HIF Parent/Child Table      | Transaction Generation、Host Order、Child Bitmap、Status、Payload Handle等 | Host Request Accept      | Parent Terminal、Host Response及外部引用关闭 |
+| 2  | Read Command Identity State | Read Child与返回关联信息                                                     | Read Child创建             | 所有Return及内部引用关闭                      |
+| 3  | Payload Handle State        | Payload Slot、Generation及Capture状态                                     | Write Payload Allocation | Write相关引用全部关闭                        |
+| 4  | IH Input/Result Hold        | Whole Request或Descriptor/Reject                                       | 输入或处理结果有效                | 对端完成接收                               |
+| 5  | TE Transaction Entry        | Canonical Descriptor、Identity、Context及Progress                        | IH→TE Atomic Allocation  | Transaction Terminal且无外部引用           |
+| 6  | Dependency State            | Predecessor Identity、Release Class等                                   | TE Allocation建立依赖        | Exact Release Match                  |
+| 7  | TE Query/Output Hold        | 请求Identity、Query Result及Freshness                                     | Query/Eligible Output建立  | 消费或失效                                |
+
+具体深度及物理实现形式由后续资源预算、Host并发需求及FPGA实现结果确定。
+
+## 6.8 前端请求处理流程
+
+### 6.8.1 Read请求
+
+一条普通Read请求的前端处理流程如下：
+
+a) Host Read请求进入HIF；
+
+b) HIF完成Port Arbitration并分配Parent Transaction Identity；
+
+c) HIF创建相应Read Child并分配Read Command Identity；
+
+d) HIF将带完整Identity的请求记录提交IH；
+
+e) IH采样对应Config及Geometry上下文；
+
+f) IH解析System Physical Address并执行合法性检查；
+
+g) 合法请求形成canonical descriptor；
+
+h) TE在确认Entry及Dependency资源充足后原子建立Transaction及全部初始Dependency；
+
+i) 请求存在Dependency时保持在TE中等待；
+
+j) TE接收到对应Typed Release后逐项解除Dependency；
+
+k) 全部事务级Dependency解除后，请求成为Eligible并提交CC；
+
+l) 后续PRE、ACT和RD等命令执行过程中，TE中的逻辑Read Request继续保持有效；
+
+m) Read Manager最终形成Child Terminal后，TE及HIF分别按照自身完成和回收条件推进对应状态。
+
+### 6.8.2 Write请求
+
+一条普通Write请求的前端处理流程如下：
+
+a) Host Write请求进入HIF；
+
+b) HIF建立Parent/Child及Transaction Identity；
+
+c) HIF向WDATA Store申请Payload Handle；
+
+d) Payload Handle成功寄存后，Write Descriptor方可向IH发布；
+
+e) Host WDATA根据稳定Payload Handle写入对应Payload存储；
+
+f) IH完成Write地址解析和合法性检查；
+
+g) TE原子建立Write Transaction及全部初始Dependency；
+
+h) WDATA尚未Ready时，事务可以保存在TE中，但后续WR最终准入仍受Payload状态约束；
+
+i) Dependency全部解除后，Write请求进入CC后续处理；
+
+j) WR命令执行仅表示Write Transaction取得进展，不直接释放TE或Payload；
+
+k) Write Manager根据后续物理执行及最终状态形成Attempt Result；
+
+l) Retryable Result不终止原Logical Child；
+
+m) 最终Terminal Result进入HIF后参与Parent完成归约；
+
+n) Host Response、TE Reclaim和Payload Reclaim分别按照对应条件执行。
+
+## 6.9 Backpressure与Same-cycle处理
+
+前端各模块应支持下游反压，并保证Stall期间完整记录稳定。
+
+Backpressure应遵循以下原则：
+
+a) HIF无安全Transaction Slot或Generation时，应停止接收对应新请求；
+
+b) Write Payload资源不足时，应阻止需要新Payload的Write Request继续进入；
+
+c) IH Result Hold已占用且下游不能接收时，应停止接收新的需要处理的请求；
+
+d) TE Transaction Entry不足时，应向IH施加反压；
+
+e) Dependency资源不足时，即使仍有空闲TE Entry，也不得接受需要建立不完整Dependency的新请求；
+
+f) Existing Result、Dependency Release、Terminal Progress等用于释放系统资源的通路，不应因“新请求资源已满”而被同步阻断。
+
+对于同周期出现多个状态更新的情况，各功能Owner应从统一PRE_STATE计算Next State，再产生单一功能写入结果。
+
+典型Same-cycle情况包括：
+
+a) Parent Allocation与Payload Allocation同拍；
+
+b) Child Allocation与同一Child Terminal同拍；
+
+c) 多个不同Child同时Terminal；
+
+d) Old Result与Fresh Generation同拍；
+
+e) Transaction Release与其他Progress同拍；
+
+f) TE旧Entry释放与新事务分配相邻或同拍；
+
+g) Result Pop与新Result Refill同拍。
+
+不得依赖always_ff书写顺序解决同一逻辑对象的竞争更新。
+
+## 6.10 Reset、Retry与异常处理
+
+### 6.10.1 Reset
+
+破坏性Reset后，应清除前端所有功能有效状态，包括Transaction Valid、Child状态、Payload Handle有效状态、Read Identity可匹配状态、IH Result Hold、TE Transaction Valid、Dependency Valid及相关Response Hold状态。
+
+数据RAM本身的旧内容可以作为无效数据保留，但不得在新Session中重新获得功能有效性。
+
+Host侧与MC Core侧存在独立Reset时，不应仅清除某一侧FIFO Pointer后直接恢复数据传输。双方应重新建立一致的Session Boundary，并在此之前关闭相关Transfer Gate。
+
+旧Session返回的Result、Release或Response不得更新新Session状态。
+
+### 6.10.2 Retry
+
+Retry表示同一个Logical Child产生新的执行Attempt。
+
+Retry过程中：
+
+a) Parent Identity保持不变；
+
+b) Child Identity保持不变；
+
+c) Read Command Identity原则上保持不变；
+
+d) Write Payload继续引用原Payload，不重新从Host抓取数据；
+
+e) 旧Attempt仍可能存在合法Late Progress时，应根据对应Fence和Identity规则处理；
+
+f) 新Attempt不得与旧Attempt的返回、状态或Dependency Release发生误匹配。
+
+### 6.10.3 异常处理
+
+当前端发现下列情况时，不应通过选择任意一路状态继续执行：
+
+a) 同一Child出现相互冲突的Terminal结果；
+
+b) 相同资源发生无法归约的并发更新；
+
+c) Identity或Generation与当前记录不匹配；
+
+d) Config与Geometry产生内部矛盾；
+
+e) Dependency状态与Predecessor引用不一致；
+
+f) 非法旧Session事件试图写入当前状态。
+
+普通Host输入非法应通过Typed Reject处理；内部设计状态矛盾则应进入对应Containment或Error流程。
+
+## 6.11 DDR5 MC继承与修改关系
+
+前端请求处理在现有DDR5 MC基础上的主要演进关系见表4。
+
+**表4 前端模块继承与修改关系**
+
+| DDR5设计内容               | DDR6处理      | 主要修改内容                                        |
+| ---------------------- | ----------- | --------------------------------------------- |
+| Port Arbiter           | 保留/修改       | 保留多Port、QoS及Priority机制                        |
+| HIF Command MUX        | 保留/修改       | 输出Whole Record，增加Identity、Version及Payload信息   |
+| 原Token机制               | 修改          | 不作为唯一Transaction Identity，引入Slot+Generation   |
+| WDATA Pointer Queue    | 保留思想/修改     | 升级为稳定Payload Handle                           |
+| Read/Write尾部直接响应       | 修改          | 改为Child Terminal、Parent Reducer及Host Ordering |
+| IH Input FIFO/Pipeline | 保留/修改       | 作为Whole-record Elastic Hold，不将固定Depth写入功能语义   |
+| DDR5 Address Mapping   | 修改          | 由Config/Geometry定义唯一Canonical Mapping         |
+| 非法地址默认修正               | 删除          | 改为Typed Reject/Fail Closed                    |
+| TE Entry Array/CAM     | 保留/修改       | 增加Canonical Resource、Generation及Context       |
+| RD/WR Issue后删除TE Entry | 删除/替换       | 改为Typed Transaction Terminal                  |
+| TE Page-open Shadow    | 删除Authority | 仅允许作为可失效Query Cache                           |
+| 隐式Dependency清除         | 修改          | 改为Typed Exact Release                         |
+| Index-only Identity    | 修改          | 采用Index+Generation                            |
+
+## 6.12 待评审事项
+
+当前前端请求处理方案的主要架构和生命周期边界已经明确，下列内容仍需结合产品规格、Host接口及FPGA资源情况进一步确认：
+
+a) Host协议最终类型及各Host Port并发能力；
+
+b) Parent及Child最大数量；
+
+c) Transaction Slot、Read Command Identity及Generation位宽；
+
+d) Host Ordering Domain及各类事务具体Release Point；
+
+e) HIF R/B CDC FIFO及Result Lane的最终深度；
+
+f) WDATA Payload数量、Capture Lane及RAM组织；
+
+g) IH Input Hold及Pipeline的实际深度；
+
+h) 不同Profile对应的Address Mapping及完整Geometry参数；
+
+i) TE Entry数量及单事务最大Dependency数量；
+
+j) Dependency采用Entry内存储还是独立表结构；
+
+k) Address/Data Extent比较粒度；
+
+l) RAW、WAR、WAW及Ordering的最终Release Policy；
+
+m) 同周期Entry Reclaim与Fresh Allocation是否需要支持；
+
+n) Host/Core Reset Handshake及Session重新建立方式；
+
+o) Protection、ECC及Parity相关RAM实现方式。
+
+上述参数未确定时，不影响HIF、IH及TE的总体职责划分。后续RTL实现应通过参数化或明确设计门禁保留相应配置空间，不应将未经确认的容量或时序假设固化为协议功能语义。
