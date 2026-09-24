@@ -1,0 +1,31 @@
+## 1.1 文档概述
+
+本文档围绕现有DDR5 Memory Controller（MC）向DDR6 MC的架构演进展开，按照“总体架构—差异分析—功能设计—验证实施—风险闭环”的思路组织。各章节内容安排如下。
+
+**第1章 文档说明。** 说明本文档的内容安排、适用范围、引用文件以及主要术语和缩略语，为后续设计建立统一的阅读基础。
+
+**第2章 DDR6 MC总体设计。** 介绍DDR6 MC的总体架构、主命令路径、维护类服务以及MC与PHY的功能边界，明确现有DDR5 MC架构的总体继承思路。
+
+**第3章 DDR5 MC与DDR6 MC差异及影响分析。** 从工程实现角度分析DDR6变化对地址组织、Bank状态、Timing、调度、维护服务、数据通路及配置控制等模块的影响，并明确主要KEEP、MODIFY和NEW内容。
+
+**第4章 前端请求处理设计。** 说明Host请求经过HIF、IH和TE后形成内部Transaction、Canonical Resource及Dependency的过程，为后续命令构造和调度提供输入。
+
+**第5章 命令构造、调度与准入设计。** 说明CC、OS和GS如何完成命令构造、普通请求选择及最终Admission，建立从Pending Transaction到可执行DDR Command的控制路径。
+
+**第6章 DRAM状态及Timing管理。** 说明BSM、OpenRow和Timing Engine的职责及相互关系，并定义ACT、PRE、RD、WR等命令实际执行后对Bank状态和Timing状态的更新机制。
+
+**第7章 维护类服务设计。** 在Bank和Timing公共机制基础上，说明Refresh、PRAC、BAT及RFM等维护类服务的资源准备、计账、调度及完成条件。
+
+**第8章 模式配置、频率及电源控制设计。** 说明Config、Geometry、MR、FSP、Power及Training等控制平面功能，重点解决配置发布、工作点切换和运行状态安全转换问题。
+
+**第9章 数据通路设计。** 说明Read Return、Assembly及Result处理，以及Write Payload、Attempt、Command/Data Join和资源回收过程，形成完整Read/Write数据生命周期。
+
+**第10章 异常、重试及复位设计。** 说明Error、Containment、Retry及Reset/Re-init机制，保证Late Feedback、Timeout及状态异常情况下能够安全隔离旧状态并重新建立可信运行环境。
+
+**第11章 验证方案。** 将前述设计合同转化为模块级、跨模块和系统级验证内容，并覆盖Backpressure、Same-cycle、Retry、Reset、Maintenance及FPGA硬件验证。
+
+**第12章 实施计划。** 按模块依赖关系给出DDR6 MC的RTL开发、集成、综合实现及硬件Bring-up顺序，并明确各阶段的进入和退出条件。
+
+**第13章 风险及待评审事项。** 汇总尚未关闭的规范、PHY/TC接口、Product配置和FPGA物理实现问题，通过Open Gate机制明确其影响、当前处理方式及关闭条件。
+
+通过上述章节安排，本文档形成从**总体架构与差异识别，到具体功能设计，再到验证、实施和风险管理**的完整DDR6 MC设计链路。
