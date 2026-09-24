@@ -1,0 +1,1590 @@
+# 9 维护类服务设计
+
+## 9.1 功能范围与设计目标
+
+维护类服务负责处理DDR6 MC运行过程中不直接来源于普通Host Read/Write事务、但必须按照协议要求在规定范围和时间内完成的维护操作。
+
+本章主要包括：
+
+a) 普通Refresh服务；
+
+b) PRAC/BAT及PRFM相关状态管理；
+
+c) RFM服务；
+
+d) Maintenance Resource Claim；
+
+e) Shared PRE Preparation；
+
+f) Maintenance Arbitration；
+
+g) Maintenance Deadline及Latest-safe-start管理；
+
+h) Maintenance Actual、Accounting、Timing Complete及Service Release。
+
+MR、FSP、Power及Training虽然同样属于Side-plane Control，但其运行条件和生命周期与Refresh/RFM存在明显差异，在后续章节单独说明。
+
+普通Refresh和RFM应继续保持相互独立的Service Owner及Accounting State。
+
+两类服务可以共享：
+
+```text
+Shared PRE
+Maintenance Arbitration
+GS
+PI
+Timing Engine
+Command Domain
+```
+
+但不得共享：
+
+```text
+Refresh Debt
+Refresh Coverage
+Refresh Selector
+PRAC/BAT State
+PRFM Credit
+RFM Obligation
+Service FSM
+```
+
+因此，本章中的“统一维护服务架构”表示统一后端准备、仲裁及命令提交机制，不表示将Refresh和RFM合并为一个Maintenance Controller。
+
+## 9.2 总体结构
+
+维护类服务总体结构如图9所示。
+
+```text
+               Timing Due / Deadline
+                        │
+                        ▼
+              ┌─────────────────┐
+              │ Refresh Manager │
+              │ Debt / Coverage │
+              └────────┬────────┘
+                       │
+                       │ Refresh Service
+                       │
+                       │
+ ACT Actual / Close    │             PRAC / BAT
+        │              │                 │
+        ▼              │                 ▼
+ ┌──────────────┐      │        ┌────────────────┐
+ │ ACT Lifetime │      │        │ PRFM Obligation│
+ └──────┬───────┘      │        └───────┬────────┘
+        │              │                │
+        │              │                ▼
+        │              │        ┌────────────────┐
+        │              │        │  RFM Manager   │
+        │              │        └───────┬────────┘
+        │              │                │
+        └──────────────┼────────────────┘
+                       │
+                       ▼
+              Maintenance Claim
+                       │
+                       ▼
+               Shared PRE Prepare
+                       │
+                       ▼
+                  PREPARED
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+          ▼                         ▼
+    Refresh Candidate          RFM Candidate
+          │                         │
+          └────────────┬────────────┘
+                       ▼
+             Maintenance Arbitration
+                       │
+                       ▼
+                      GS
+                       │
+                       ▼
+                      PI
+                       │
+                 Actual Event
+                  /          \
+                 /            \
+                ▼              ▼
+        Accounting Update   Timing Update
+                │              │
+                └──────┬───────┘
+                       ▼
+                Service Release
+```
+
+**图9 维护类服务总体结构**
+
+维护服务的完整生命周期原则上包括：
+
+```text
+Obligation
+→ Target Planning
+→ Resource Claim
+→ Shared PRE Preparation
+→ Candidate
+→ GS Admission
+→ PI Presentation
+→ Actual
+→ Accounting
+→ Timing Completion
+→ Service Release
+```
+
+其中任何一个中间阶段均不应被直接解释为Service Completion。
+
+## 9.3 维护服务公共设计原则
+
+### 9.3.1 Obligation与Command分离
+
+Refresh Due、Refresh Debt、PRFM Obligation等状态表示：
+
+> 控制器已经存在必须在规定时间内完成的维护义务。
+
+Obligation本身不是DDR Command。
+
+只有完成Target Selection、Resource Preparation及相关Safety检查后，才能形成具体REF或RFM Command Candidate。
+
+因此：
+
+```text
+Maintenance Obligation
+!=
+Command Candidate
+```
+
+### 9.3.2 Preparation与Service Completion分离
+
+维护命令执行前通常要求目标资源达到特定Bank状态。
+
+Shared PRE仅负责使目标资源进入维护命令所需的前置状态。
+
+因此：
+
+```text
+PREPARED
+!=
+Maintenance Command Executed
+!=
+Maintenance Service Complete
+```
+
+Prepared只说明目标集合已经满足维护命令的Bank State前提。
+
+### 9.3.3 Actual与Timing Complete分离
+
+REF或RFM Actual表示对应DDR命令已经达到规定的物理执行边界。
+
+但命令Actual后仍存在tRFC或tRFM等协议不可访问时间。
+
+因此：
+
+```text
+REF Actual != Refresh Service Release
+
+RFM Actual != RFM Service Release
+```
+
+维护资源只能在对应Timing及其他必要Accounting/ACK条件完成后释放。
+
+### 9.3.4 Service Identity
+
+每个正在执行的维护服务应具有稳定Service Identity。
+
+原则上由：
+
+```text
+Service Slot
++
+Service Generation
+```
+
+以及必要的：
+
+```text
+Service Type
+Target Set
+Context
+Session
+```
+
+共同形成。
+
+Maintenance Preparation、GS Admission、PI反馈、Timing Completion及Accounting Update均应能够关联至同一Service。
+
+旧Service反馈不得仅依据Target Bank匹配当前新Service。
+
+## 9.4 Maintenance Resource Claim
+
+### 9.4.1 Claim目的
+
+维护服务作用范围可能包含一个或多个Resource。
+
+在执行Shared PRE及后续REF/RFM过程中，应阻止新的冲突普通访问继续进入目标范围。
+
+因此应为Maintenance Service建立明确的Resource Claim。
+
+Claim至少包含：
+
+```text
+Service Identity
+Service Type
+Target Set
+Context / Version
+Deadline
+Claim State
+```
+
+### 9.4.2 Claim与BSM关系
+
+Maintenance Claim不能直接将OPEN Bank强制转换为BLOCKED_SERVICE。
+
+目标Bank若处于OPEN状态，应首先完成合法Close：
+
+```text
+OPEN
+  │
+Shared PRE
+  ▼
+CLOSED_PENDING
+  │
+Exact tRP Complete
+  ▼
+CLOSED
+```
+
+只有满足对应Service合同后，才能建立相应Maintenance Block。
+
+不得通过：
+
+```text
+OPEN -> BLOCKED_SERVICE
+```
+
+绕过PRE及tRP。
+
+### 9.4.3 Target Set
+
+Maintenance Service应使用精确Target Set。
+
+Target Set可以采用：
+
+a) 小范围Resource Mask；
+
+b) Resource Set Reference；
+
+c) Geometry生成的确定性Set ID及Membership信息。
+
+不得仅使用Hash或无法恢复Exact Membership的简化标识代替功能性Target Set。
+
+Geometry负责根据当前Profile及Topology展开具体Resource Membership。
+
+若Geometry无法确定Target Set，则对应Maintenance Service应Fail Closed。
+
+## 9.5 Shared PRE Preparation
+
+### 9.5.1 功能职责
+
+Refresh、RFM以及其他需要目标Bank先关闭的维护功能，共享统一的PRE Preparation路径。
+
+Shared PRE负责：
+
+> 根据目标Resource Set的当前Bank状态，使所有需要关闭的目标成员达到维护服务要求的CLOSED状态。
+
+Shared PRE不拥有：
+
+a) Refresh Debt；
+
+b) Refresh Coverage；
+
+c) BAT；
+
+d) PRFM Credit；
+
+e) RFM Obligation；
+
+f) Timing History；
+
+g) OpenRow Truth。
+
+### 9.5.2 单Resource处理
+
+对于每个Target Member：
+
+```text
+CLOSED
+    -> 已满足Preparation要求
+
+OPEN
+    -> 形成Maintenance PRE
+    -> 等待PRE Actual
+    -> 等待tRP
+    -> CLOSED
+
+CLOSED_PENDING
+    -> 不重复发送PRE
+    -> 关联现有Close过程
+    -> 等待Exact tRP Complete
+
+BLOCKED / ERROR / INACCESSIBLE
+    -> 按Service合同阻塞或进入异常处理
+```
+
+当且仅当全部Required Target Member达到规定的Prepared状态后，Shared PRE返回：
+
+```text
+PREPARED = 1
+```
+
+### 9.5.3 CLOSED_PENDING不得重复PRE
+
+目标Bank已经处于CLOSED_PENDING时，说明已有Close操作实际发生，只是tRP尚未完成。
+
+此时Shared PRE不得为了当前Maintenance Service再次发出第二条PRE。
+
+否则可能引入：
+
+a) 重复PRE Timing History；
+
+b) 重复Qualified Close记录；
+
+c) ACT Lifetime重复Close；
+
+d) BAT/PRAC重复Accounting；
+
+e) 不一致的tRP Completion关联。
+
+正确处理方式是关联当前Close Context，并等待目标Bank进入Exact CLOSED。
+
+### 9.5.4 Maintenance PRE与普通PRE
+
+Maintenance PRE最终仍通过统一命令下发路径进入GS及PI。
+
+Maintenance PRE实际发生后，仍由第8章定义的：
+
+```text
+BSM
+OpenRow
+Timing
+Qualified Close
+```
+
+机制更新对应状态。
+
+Shared PRE不得建立另一套“维护专用Bank State”。
+
+## 9.6 Qualified Close与维护Accounting
+
+### 9.6.1 PRE相关集合
+
+一条PRE命令可能涉及以下不同集合：
+
+```text
+COMMAND_TARGET_SET
+TIMING_TARGET_SET
+ACTUAL_CLOSE_MEMBER_SET
+BAT_ACCOUNTING_MEMBER_SET
+```
+
+其逻辑关系原则上为：
+
+```text
+BAT_ACCOUNTING_MEMBER_SET
+⊆
+ACTUAL_CLOSE_MEMBER_SET
+⊆
+COMMAND_TARGET_SET
+```
+
+上述集合不能简单合并成一个Bank Mask。
+
+### 9.6.2 Command Target Set
+
+COMMAND_TARGET_SET表示命令编码实际作用的目标Resource集合。
+
+### 9.6.3 Timing Target Set
+
+TIMING_TARGET_SET表示该PRE Actual需要更新PRE相关Timing History的Resource集合。
+
+一个本来已经CLOSED的目标Resource仍可能属于Timing Target Set。
+
+### 9.6.4 Actual Close Member Set
+
+ACTUAL_CLOSE_MEMBER_SET表示PRE实际发生时，真正由OPEN状态被关闭的Resource。
+
+只有该集合中的成员：
+
+a) 清除OpenRow；
+
+b) BSM进入CLOSED_PENDING；
+
+c) 形成ACT Lifetime Close Evidence。
+
+### 9.6.5 BAT Accounting Member Set
+
+BAT_ACCOUNTING_MEMBER_SET表示当前Qualified Close中需要参与PRAC/BAT Accounting的成员。
+
+其每一个Member都必须关联对应的Exact ACT Generation。
+
+不能使用一条PRE命令级Generation替代各Bank自己的Activation Generation。
+
+## 9.7 ACT Lifetime
+
+### 9.7.1 设计目的
+
+ACT Lifetime用于建立一次ACT从Admission到最终安全退休之间的稳定Identity。
+
+ACT Lifetime独立于PRAC/BAT功能开关。
+
+即使产品关闭PRAC/BAT，控制器仍需能够判断：
+
+a) 当前ACT Actual是否对应当前ACT Reservation；
+
+b) PRE/AP关闭的是哪一次Activation；
+
+c) Late Close或Late Feedback是否属于旧Activation；
+
+d) 当前Activation Generation何时可以安全复用。
+
+### 9.7.2 ACT Lifetime状态
+
+每个Canonical Resource维护：
+
+```text
+EMPTY
+RESERVED
+LIVE
+```
+
+基本生命周期为：
+
+```text
+EMPTY
+  │
+  │ ACT GS Admission
+  │ + Safe Generation
+  ▼
+RESERVED
+  │
+  │ Exact ACT Actual
+  ▼
+LIVE
+  │
+  │ Qualified Close
+  │
+  │ tRP / ACK / Reference Closure
+  ▼
+EMPTY
+```
+
+### 9.7.3 RESERVED
+
+ACT完成GS Admission后，为该ACT分配并冻结Activation Generation：
+
+```text
+EMPTY -> RESERVED
+```
+
+此时表示：
+
+> Controller已经承诺未来执行该ACT。
+
+但此时：
+
+```text
+BSM仍未因该ACT变OPEN
+OpenRow仍未写入新Row
+Committed ACT Timing History仍未更新
+```
+
+因此RESERVED不得作为实际Activation使用。
+
+### 9.7.4 LIVE
+
+只有Exact ACT Actual满足：
+
+```text
+Resource Match
+Generation Match
+Command Identity Match
+Admission Sequence Match
+Context / Session Match
+```
+
+后，方可执行：
+
+```text
+RESERVED -> LIVE
+```
+
+同一个ACT Actual分别由BSM、OpenRow、Timing及ACT Lifetime Owner消费，各模块更新自身状态。
+
+### 9.7.5 Qualified Close
+
+Qualified PRE/AP Close必须携带对应Resource的Activation Generation。
+
+只有：
+
+```text
+Current ACT Lifetime = LIVE
+AND
+Generation Exact Match
+```
+
+时，该Close才可以登记：
+
+```text
+Close Seen = 1
+```
+
+Qualified Close不直接使ACT Lifetime变回EMPTY。
+
+### 9.7.6 ACT Lifetime退休
+
+LIVE状态至少在以下条件闭合后方可进入EMPTY：
+
+```text
+Close Seen
+AND
+Exact tRP Complete
+AND
+Required Close Consumer ACK
+AND
+PI/QCF Reference Closed
+AND
+PRAC/BAT Close Accounting Consumed
+AND
+No Internal Reference
+AND
+No Possible Old Future Feedback
+AND
+Same-session Retirement Legal
+```
+
+Generation只有在Lifetime完成退休后方可进入安全复用集合。
+
+## 9.8 Refresh设计
+
+### 9.8.1 Refresh职责
+
+普通Refresh继续由独立Refresh Manager负责。
+
+其主要职责为：
+
+a) 接收Timing提供的Refresh Due及Deadline；
+
+b) 维护Refresh Obligation及Debt；
+
+c) 选择Refresh Form；
+
+d) 维护Distributed Refresh Selector及Coverage；
+
+e) 建立Refresh Service；
+
+f) 请求Shared PRE；
+
+g) 形成Refresh Candidate；
+
+h) 在Exact REF Actual后更新Refresh Accounting；
+
+i) 在tRFC及必要Service条件完成后释放Service。
+
+Timing Engine负责Refresh Calendar、Deadline、tRFC及相关Timing History，不保存Refresh Debt及Coverage。
+
+### 9.8.2 Refresh Form
+
+当前控制模型将普通Refresh归纳为：
+
+```text
+REF_AB
+REF_DIST
+```
+
+REF_DIST的具体Physical/Protocol Variant由Profile及Geometry决定。
+
+当前设计材料中：
+
+```text
+2p3 / 2p6
+    -> REF_DIST对应双Bank目标形式
+
+1p6
+    -> REF_DIST对应四Bank目标形式
+```
+
+具体Target Membership由Geometry展开。
+
+主Refresh Control不需要为不同Distributed Variant复制多套功能相同的Service FSM。
+
+### 9.8.3 Refresh Timing与Debt
+
+Refresh Timing Owner负责产生：
+
+```text
+Due
+Deadline
+Latest-safe-start
+Timing Context
+```
+
+Refresh Manager根据Due形成对应Obligation及Debt。
+
+应明确区分：
+
+```text
+Due
+Debt
+Deadline
+Latest-safe-start
+Urgency
+```
+
+这些字段表示不同含义，不应合并为单一Refresh Request Valid。
+
+### 9.8.4 Distributed Refresh Selector与Coverage
+
+REF_DIST需要维护对目标集合的选择和覆盖进度。
+
+Selector只表示：
+
+> 当前一次Distributed Refresh准备作用于哪个Logical Selection。
+
+具体Resource Pair或Quad由Geometry完成。
+
+Coverage/Visited状态用于证明规定Refresh Sweep是否完整，不等同于Refresh Debt。
+
+因此：
+
+```text
+Debt
+!=
+Selector
+!=
+Coverage
+```
+
+### 9.8.5 Refresh Service流程
+
+普通Refresh Service基本流程如下：
+
+```text
+Timing Due
+   │
+   ▼
+Refresh Obligation / Debt
+   │
+   ▼
+Select REF_AB / REF_DIST
+   │
+   ▼
+Build Exact Target Set
+   │
+   ▼
+Maintenance Claim
+   │
+   ▼
+Shared PRE
+   │
+   ▼
+PREPARED
+   │
+   ▼
+Refresh Candidate
+   │
+   ▼
+Maintenance Arbitration
+   │
+   ▼
+GS Admission
+   │
+   ▼
+PI
+   │
+   ▼
+REF Actual
+   │
+   ├── Refresh Credit / Coverage
+   └── Timing tRFC
+   │
+   ▼
+Exact tRFC Complete
+   │
+   ▼
+Release Service
+```
+
+### 9.8.6 Refresh Service状态
+
+Refresh Service可以采用紧凑状态机，例如：
+
+```text
+IDLE
+ -> PLAN
+ -> PREP_WAIT
+ -> REF_HOLD
+ -> WAIT_ACTUAL
+ -> WAIT_TRFC
+ -> RELEASE
+ -> IDLE
+```
+
+Claim、Proof、Accounting及ACK等条件可由独立状态位记录，而不需要为每种组合扩展大量FSM State。
+
+### 9.8.7 REF Actual与Credit
+
+Refresh Accounting应以Exact REF Actual为主要Credit Point。
+
+即：
+
+```text
+REF Actual
+ -> Refresh Credit / Coverage Update
+ -> Timing启动tRFC
+```
+
+不得在GS Admission时提前抵消Refresh Debt。
+
+同样，也不应等待tRFC完成后才确认该REF已经实际发生。
+
+### 9.8.8 tRFC与Service Release
+
+REF Actual后，目标Resource仍处于tRFC约束范围内。
+
+因此：
+
+```text
+REF Actual
+    │
+    ├── Accounting Credit
+    │
+    └── Timing tRFC Start
+             │
+             ▼
+       Exact tRFC Complete
+             │
+             ▼
+       Resource可重新使用
+```
+
+Maintenance Claim及BSM Service Block应在对应Service Completion条件闭合后解除。
+
+## 9.9 Refresh Deadline管理
+
+### 9.9.1 Deadline
+
+维护设计目标应保证：
+
+```text
+Qualified REF Actual <= Deadline
+```
+
+而不是：
+
+> Deadline错过后补一条Refresh即可恢复成“从未违规”。
+
+如果实际REF发生时间超过规定Deadline，应形成Sticky Violation，并根据系统策略进入Error、Containment或Recovery。
+
+后续Refresh不得自动清除该历史Violation。
+
+### 9.9.2 Latest-safe-start
+
+为了保证维护服务能在Deadline前完成，应根据目标资源状态、Shared PRE、tRP、Arbitration及Command Latency计算或提供Latest-safe-start。
+
+基本关系为：
+
+```text
+Current Time
+     │
+     │ Normal traffic still feasible
+     │
+Latest-safe-start
+     │
+     │ Required maintenance budget
+     │
+Deadline
+```
+
+达到Latest-safe-start后，GS不得继续接受会导致该Mandatory Service无法按期完成的Normal Candidate。
+
+### 9.9.3 Distributed Refresh Deadline
+
+对于REF_DIST，不能只证明“下一条Distributed REF”来得及。
+
+还应确保当前Distributed Sweep中后续必须完成的Selector具有足够时间预算。
+
+Coverage、Selector及Deadline应形成一致的Service Progress判断。
+
+## 9.10 PRAC、BAT及PRFM设计
+
+### 9.10.1 功能定位
+
+PRAC/BAT属于Activation Lifetime上的Accounting Sidecar。
+
+PRAC/BAT：
+
+a) 不决定Bank是否OPEN；
+
+b) 不拥有OpenRow；
+
+c) 不拥有ACT Generation；
+
+d) 不替代ACT Lifetime；
+
+e) 不替代Timing History。
+
+其主要作用是在规定Activation及Close事件基础上维护对应Accounting State，并在达到条件后形成PRFM Obligation。
+
+### 9.10.2 BAT State
+
+每个受PRAC/BAT管理的Resource保存Authoritative BAT State。
+
+逻辑字段可以包括：
+
+```text
+Valid / Context
+BAT Value或等效Bounded Representation
+PRFM Obligation State
+Overflow / Error
+```
+
+具体BAT Contribution及Threshold公式应由正式DDR6规范及Product配置确定，本文件不对当前设计材料未冻结的常数进行推定。
+
+### 9.10.3 Feature Disable
+
+PRAC/BAT为可配置功能时，关闭该功能不应破坏基础ACT Identity机制。
+
+即：
+
+```text
+ACT Lifetime继续正常工作
+Qualified Close仍携带ACT Generation
+BAT Arithmetic WE = 0
+PRFM Obligation不产生
+对应RFM触发不产生
+```
+
+### 9.10.4 Qualified Close Accounting
+
+ACT从LIVE状态被Qualified Close时，根据有效PRAC/BAT规则形成相应Close Contribution。
+
+Conceptually：
+
+```text
+ACT Actual
+    │
+    ▼
+Activation Lifetime
+    │
+Qualified Close
+    │
+    ▼
+PRAC/BAT Contribution
+```
+
+具体Contribution数值由当前有效规则定义。
+
+### 9.10.5 PRFM Obligation
+
+PRAC/BAT状态达到规定条件后，可以形成PRFM Obligation。
+
+PRFM Obligation至少描述：
+
+```text
+Valid
+Target Resource / Set
+Due / Deadline
+Coverage / Credit
+Service Reference
+Context
+```
+
+PRFM Obligation独立于普通Refresh Debt。
+
+## 9.11 RFM设计
+
+### 9.11.1 RFM职责
+
+RFM继续由独立RFM Manager负责。
+
+其主要职责包括：
+
+a) 接收PRFM/BAT触发的RFM Obligation；
+
+b) 选择RFM Form；
+
+c) 建立Exact Target Set；
+
+d) 请求Shared PRE；
+
+e) 形成RFM Candidate；
+
+f) 通过Maintenance Arbitration进入GS；
+
+g) 根据Exact RFM Actual更新对应BAT/PRFM Accounting；
+
+h) 等待tRFM及其他Completion条件；
+
+i) 最终释放RFM Service。
+
+### 9.11.2 RFM Form
+
+当前方案在主控制层可统一表示为：
+
+```text
+RFM_AB
+RFM_DIST
+RFM_PB
+```
+
+RFM_DIST在不同Profile下可以对应不同Distributed Variant。
+
+如需要在Command Encoding或Status层区分具体Variant，可以保留相应Command Type，但不需要复制多套基本相同的Service FSM。
+
+### 9.11.3 RFM Target Set
+
+RFM Target必须具有Exact Membership。
+
+原则上包括：
+
+```text
+RFM_AB
+    -> All-bank Resource Set
+
+RFM_DIST
+    -> Profile-defined Distributed Set
+
+RFM_PB
+    -> Single Resource
+```
+
+具体Member由Geometry产生。
+
+Geometry Mapping未知时，不应自行猜测目标Bank组合。
+
+### 9.11.4 RFM Service流程
+
+RFM完整处理链如下：
+
+```text
+BAT / PRFM Trigger
+        │
+        ▼
+RFM Obligation
+        │
+        ▼
+Target / Form Build
+        │
+        ▼
+Maintenance Claim
+        │
+        ▼
+Shared PRE Preparation
+        │
+        ▼
+RFM Candidate
+        │
+        ▼
+Maintenance Arbitration
+        │
+        ▼
+GS Admission
+        │
+        ▼
+PI
+        │
+        ▼
+RFM Actual
+   ┌────┼──────────────┐
+   │    │              │
+   ▼    ▼              ▼
+BAT   PRFM           Timing
+Update Credit         tRFM
+   │    │              │
+   └────┴───────┬──────┘
+                ▼
+          Service Release
+```
+
+### 9.11.5 RFM Admission
+
+RFM在GS完成Admission时，可以建立：
+
+```text
+GS Admitted Hold
+Timing Reservation
+Command Occupancy
+RFM Command Correlation
+Required Downstream Credit
+```
+
+但此时不得提前执行：
+
+```text
+BAT Subtraction
+PRFM Credit
+Committed tRFM History
+```
+
+这些状态必须等待Exact RFM Actual。
+
+### 9.11.6 RFM Actual
+
+Exact RFM Actual发生后：
+
+```text
+Actual Seen = 1
+Timing记录RFM Occurrence
+Timing启动tRFM
+BAT Owner接收Subtraction Intent
+PRFM Owner接收Credit Intent
+```
+
+同一个Physical/Semantic RFM Occurrence可以被多个Owner消费，但每个Owner必须保证同一Occurrence最多Account一次。
+
+PI Journal Replay或重复反馈不得造成BAT重复扣减或PRFM重复Credit。
+
+### 9.11.7 BAT Subtraction与PRFM Credit
+
+BAT Subtraction与PRFM Credit虽然来源于同一个RFM Actual，但属于两个不同Accounting Owner的状态更新。
+
+因此建议分别保留：
+
+```text
+BAT Subtraction Consumed
+PRFM Credit Consumed
+```
+
+而不是使用单一：
+
+```text
+RFM Accounted
+```
+
+标志隐藏两个独立更新过程。
+
+### 9.11.8 RFM Service Release
+
+RFM Service至少应在以下条件完成后才允许释放：
+
+```text
+RFM Actual Seen
+AND
+BAT Subtraction Consumed
+AND
+PRFM Credit Consumed
+AND
+Exact tRFM Complete
+AND
+Shared PRE / Claim Reference Closed
+AND
+GS / PI Reference Closed
+AND
+Required Consumer ACK Complete
+```
+
+不得采用：
+
+```text
+RFM Actual -> Service Free
+```
+
+的简化语义。
+
+## 9.12 Refresh与RFM Accounting隔离
+
+普通Refresh和RFM虽然均属于DRAM维护类操作，但二者的Accounting语义必须严格分离。
+
+普通REF Actual：
+
+```text
+Refresh Debt / Coverage      -> 更新
+Timing tRFC                  -> 更新
+
+BAT Subtraction              -> 不更新
+PRFM Credit                  -> 不更新
+```
+
+RFM Actual：
+
+```text
+BAT Subtraction              -> 更新
+PRFM Credit                  -> 更新
+Timing tRFM                  -> 更新
+
+Ordinary Refresh Debt Credit -> 不更新
+```
+
+因此禁止：
+
+```text
+Ordinary REF Actual -> BAT Subtraction
+
+Ordinary REF Actual -> PRFM Credit
+
+RFM Actual -> Refresh Debt Credit
+```
+
+两类服务共享的是Command Execution Infrastructure，而不是Accounting Truth。
+
+## 9.13 Maintenance Arbitration
+
+### 9.13.1 功能职责
+
+Maintenance Arbitration负责在已经完成必要Preparation的不同维护服务之间选择当前提交GS的Maintenance Candidate。
+
+候选可以包括：
+
+```text
+Refresh Candidate
+RFM Candidate
+其他已定义Maintenance Candidate
+```
+
+Maintenance Arbitration只负责Source Selection，不修改各Service Owner的Accounting状态。
+
+### 9.13.2 Candidate Record
+
+Maintenance Candidate原则上包括：
+
+```text
+Service Identity
+Service Type
+Command Type
+Exact Target Set
+Urgency
+Deadline
+Latest-safe-start
+Preparation Proof
+Timing Context
+Config / Geometry / Session
+```
+
+### 9.13.3 Arbitration与GS关系
+
+Maintenance Arbitration选择某一Service后，该Candidate仍需进入GS完成Final Admission。
+
+因此：
+
+```text
+Maintenance Arbitration Winner
+!=
+Maintenance Command Admitted
+```
+
+GS仍需检查：
+
+a) Timing；
+
+b) Command Occupancy；
+
+c) PI Capacity；
+
+d) Proof Freshness；
+
+e) Resource Claim；
+
+f) Context；
+
+g) 其他Mandatory Service Feasibility。
+
+### 9.13.4 Normal Traffic与Maintenance
+
+Normal Candidate和Maintenance Candidate最终在GS汇合。
+
+维护服务进入Urgent或Latest-safe-start区域后，GS应限制会破坏Mandatory Service Feasibility的Normal Admission。
+
+这不等价于：
+
+```text
+Maintenance一旦Urgent
+-> 无条件绕过Timing和Safety直接执行
+```
+
+Maintenance仍必须满足对应协议安全条件。
+
+## 9.14 Same-cycle与Accounting Reducer
+
+### 9.14.1 Refresh Same-cycle
+
+典型Same-cycle情况包括：
+
+```text
+Refresh Due + REF Actual
+
+REF Actual + ACT Query inside Target Set
+
+Old tRFC Complete + Fresh REF same Target
+
+Config Change + Live Refresh Interval
+```
+
+Due与Credit应通过统一Next-state Reducer处理，不能由于同拍REF Actual而错误吞掉新产生的Due。
+
+### 9.14.2 BAT Same-cycle
+
+同一Resource可能同时出现：
+
+```text
+Qualified Close Contribution
++
+RFM BAT Subtraction
++
+Reset / Recovery
+```
+
+必须首先判断这些Mutation在当前合同下是否允许组合。
+
+只有允许的组合才能从统一PRE_STATE计算BAT Next State。
+
+### 9.14.3 Same-resource冲突
+
+若同一Resource同周期出现当前合同不允许同时发生的：
+
+```text
+Qualified Close BAT Mutation
++
+RFM BAT Subtraction
+```
+
+则应：
+
+```text
+Normal BAT WE = 0
+Error / Containment = 1
+```
+
+不得简单使用：
+
+```text
+BAT <= BAT + Add - Sub
+```
+
+依赖RTL运算顺序掩盖非法竞态。
+
+### 9.14.4 Different-resource并行
+
+不同Resource上的合法Accounting Update可以并行执行，前提是：
+
+a) Identity及Context均合法；
+
+b) 物理存储具备足够Write Lane；
+
+c) Destination Address不同。
+
+如果物理RAM写端口不足，应在GS Admission或Service调度阶段进行限流，不能等Actual发生后丢弃Accounting Update。
+
+## 9.15 Reset、Retry与异常处理
+
+### 9.15.1 Reset
+
+联合破坏性Reset后：
+
+a) 当前Session的Refresh Service状态按照Reset合同清除或失效；
+
+b) RFM Service及PRFM功能状态按Reset合同处理；
+
+c) ACT Lifetime当前功能Matchability失效；
+
+d) BAT/PRFM功能状态根据规定重新初始化；
+
+e) Maintenance Claim及Shared PRE Progress失效；
+
+f) 旧Session的REF/RFM/PRE反馈对新Session功能写使能为0。
+
+Reset不能将Device-visible但尚未完成闭环的旧Maintenance Command静默视为“已取消”。
+
+### 9.15.2 Device-visible Maintenance
+
+若REF、RFM或Maintenance PRE已经达到不可取消物理边界，则局部Reset或Context切换不能仅清除内部Valid继续运行。
+
+该状态应进入Recovery或规定的Destructive Reset Boundary处理，直到能够重新证明DRAM状态。
+
+### 9.15.3 Late Feedback
+
+所有Maintenance Actual、Timing Completion及Accounting反馈均应包含能够区分Old Service和Current Service的完整Identity。
+
+Generation、Service Identity或Session不匹配时：
+
+```text
+Functional WE = 0
+```
+
+并根据错误策略记录Telemetry或进入Containment。
+
+### 9.15.4 Deadline Violation
+
+当实际Maintenance Actual发生时间已经超过对应Mandatory Deadline时，应记录Sticky Violation。
+
+不能因为该维护命令最终还是执行完成，就自动消除Deadline违规事实。
+
+## 9.16 主要接口
+
+维护类服务主要接口见表10。
+
+**表10 维护类服务主要接口**
+
+| 序号 | 接口                        | 主要内容                                          | 接口要求                        |
+| -- | ------------------------- | --------------------------------------------- | --------------------------- |
+| 1  | Timing → Refresh          | Due、Deadline、Latest-safe-start、Timing Context | Due按Occurrence处理            |
+| 2  | PRAC/BAT → RFM            | PRFM Obligation、Resource/Set、Deadline、Context | 与普通Refresh Debt独立           |
+| 3  | Service → Claim           | Service Identity、Exact Target Set、Deadline    | Claim与Service绑定             |
+| 4  | Service → Shared PRE      | Service Key、Target Set、Context                | Result可Hold                 |
+| 5  | Shared PRE → Service      | Prepared、Block/Error、Target Progress          | Prepared不表示Service Complete |
+| 6  | Service → Maintenance Arb | Typed Candidate、Urgency、Deadline、Proof        | Service Owner保持Candidate    |
+| 7  | Maintenance Arb → GS      | Selected Maintenance Candidate                | GS仍执行Final Admission        |
+| 8  | PI → Service              | Exact REF/RFM/PRE Actual                      | Full-key匹配                  |
+| 9  | Actual → Accounting       | Service Identity、Target、Sequence、Reason       | First Exact Occurrence只计一次  |
+| 10 | Timing → Service          | tRFC/tRFM等Exact Completion                    | 与当前Service精确匹配              |
+| 11 | Service → BSM/Claim       | Exact Service Completion/Release              | 完成后解除Block                  |
+
+## 9.17 主要内部存储对象
+
+主要内部存储对象见表11。
+
+**表11 维护类服务主要内部存储对象**
+
+| 序号 | 对象                            | 主要内容                                          | 创建条件                | 释放条件                         |
+| -- | ----------------------------- | --------------------------------------------- | ------------------- | ---------------------------- |
+| 1  | Refresh Obligation/Debt State | Due、Debt、Deadline等                            | Timing Due          | Exact REF Actual及Accounting  |
+| 2  | Refresh Coverage/Selector     | Selector、Visited、Coverage                     | Refresh Plan        | Sweep/Coverage规则满足           |
+| 3  | Refresh Service Record        | Service ID、Form、Target、Prep、Actual、tRFC等      | Refresh Service建立   | Service Completion           |
+| 4  | Maintenance Claim             | Service Key、Exact Target Set                  | Service Preparation | Exact Service Release        |
+| 5  | Shared PRE Progress           | Member State、PRE Progress、tRP等待               | Prep Request        | All Required Member Prepared |
+| 6  | ACT Lifetime                  | State、Generation、Actual/Close及Reference       | ACT Admission       | Full Lifetime Retirement     |
+| 7  | BAT State                     | BAT Value、PRFM状态、Context                      | 功能初始化               | Reset/Recovery规则             |
+| 8  | PRFM Obligation               | Resource/Set、Deadline、Coverage/Credit         | BAT/PRAC触发          | RFM Coverage完成               |
+| 9  | RFM Service Record            | Service ID、Form、Target、Actual、Accounting、tRFM | RFM Obligation      | Full Service Release         |
+
+上述对象表示逻辑Owner关系，不要求对应为九个独立RTL RAM。
+
+## 9.18 典型处理流程
+
+### 9.18.1 REF_DIST示例
+
+```text
+Refresh Due
+   │
+   ▼
+Refresh Debt建立
+   │
+   ▼
+选择REF_DIST Selector
+   │
+   ▼
+Geometry展开Target Set
+   │
+   ▼
+部分Bank OPEN
+   │
+   ▼
+Shared PRE
+   │
+   ├── CLOSED Member直接Ready
+   ├── OPEN Member执行PRE
+   └── CLOSED_PENDING Member等待已有tRP
+   │
+   ▼
+全部Prepared
+   │
+   ▼
+REF_DIST Candidate
+   │
+   ▼
+Maintenance Arb
+   │
+   ▼
+GS Admission
+   │
+   ▼
+REF Actual
+   │
+   ├── Refresh Debt/Coverage Credit
+   └── Timing tRFC
+   │
+   ▼
+tRFC Complete
+   │
+   ▼
+Service Release
+```
+
+### 9.18.2 RFM示例
+
+```text
+BAT达到触发条件
+   │
+   ▼
+PRFM Obligation
+   │
+   ▼
+RFM Service建立
+   │
+   ▼
+Geometry展开RFM Target
+   │
+   ▼
+Shared PRE
+   │
+   ▼
+PREPARED
+   │
+   ▼
+RFM Candidate
+   │
+   ▼
+GS Admission
+   │
+   ▼
+RFM Actual
+   │
+   ├── BAT Subtraction
+   ├── PRFM Credit
+   └── Timing tRFM
+   │
+   ▼
+所有Accounting + tRFM + ACK完成
+   │
+   ▼
+RFM Service Release
+```
+
+### 9.18.3 Refresh与RFM交错
+
+```text
+REF_DIST Actual
+   │
+   ├── Refresh Accounting
+   ├── Timing tRFC
+   ├── BAT WE = 0
+   └── PRFM Credit WE = 0
+
+          ...
+
+RFM_DIST Actual
+   │
+   ├── BAT Subtraction
+   ├── PRFM Credit
+   ├── Timing tRFM
+   └── Refresh Debt WE = 0
+```
+
+该示例说明，两类服务可以使用相同Shared PRE、GS和PI通路，但其Accounting状态始终相互独立。
+
+## 9.19 DDR5 MC继承与修改关系
+
+维护类服务在现有DDR5 MC基础上的主要演进关系见表12。
+
+**表12 维护类服务继承与修改关系**
+
+| DDR5设计内容                 | DDR6处理        | 主要修改内容                                       |
+| ------------------------ | ------------- | -------------------------------------------- |
+| PAS_RC周期Refresh结构        | 保留/修改         | 继续作为Ordinary Refresh Owner                   |
+| tREFI Timer              | 保留思想/修改       | Timing Engine统一Calendar及Deadline             |
+| PAS_RC Postpone/Debt     | 保留Reducer思想   | Refresh Manager继续拥有Debt                      |
+| REFsb相关Bank Selection    | 替换            | 演进为REF_AB/REF_DIST控制                         |
+| Bank Refresh Done        | 修改            | 演进为DIST Selector/Coverage                    |
+| Local tRFC Counter       | 修改            | Timing统一Timestamp/Expiry                     |
+| Raw REF Grant作为Credit    | 替换            | Exact REF Actual作为Accounting Point           |
+| PAS_RFMC独立结构             | 保留            | RFM继续作为独立Owner                               |
+| DDR5 RAA Counter         | 修改            | 演进为PRAC/BAT/PRFM Accounting                  |
+| RFMC PRE输出               | 修改            | 接入Shared PRE Preparation                     |
+| RFMC RFM Request/FSM     | 保留/修改         | 增加Typed Form、Exact Target及Service Identity   |
+| Refresh/RFM各自PRE路径       | 合并Preparation | 统一Shared PRE Owner                           |
+| PRE Target≈Close Target  | 替换            | 区分Command/Timing/Actual Close/BAT集合          |
+| 隐式ACT生命周期                | 强化            | 增加EMPTY/RESERVED/LIVE及Generation             |
+| PRE Close无ACT Generation | 新增关联          | Qualified Close携带Exact Activation Generation |
+| RFM后端Mux                 | 保留思想          | 在Maintenance Arb/GS/PI统一汇合                   |
+| Refresh/RFM共用Accounting  | 禁止            | 两类Accounting完全独立                             |
+
+## 9.20 设计原则总结
+
+维护类服务应遵循以下原则：
+
+a) Refresh与RFM保持独立Service Owner；
+
+b) Refresh Debt与PRFM Obligation不得混合；
+
+c) Ordinary Refresh Credit与RFM Credit不得互换；
+
+d) Shared PRE只负责Preparation，不拥有Maintenance Accounting；
+
+e) OPEN Bank必须经过合法PRE/tRP后才能进入需要Closed状态的维护服务；
+
+f) CLOSED_PENDING不得重复发PRE；
+
+g) PREPARED不等于Service Complete；
+
+h) Maintenance Arbitration Winner不等于GS Admission；
+
+i) GS Admission不等于Maintenance Actual；
+
+j) Maintenance Actual不等于Service Release；
+
+k) Refresh Accounting以Exact REF Actual为主要Credit Point；
+
+l) RFM Accounting以Exact RFM Actual为触发点；
+
+m) ACT Lifetime必须独立于PRAC/BAT Feature Enable；
+
+n) Qualified Close必须关联Exact ACT Generation；
+
+o) Refresh/RFM的Timing由Timing Engine统一维护；
+
+p) Resource Set必须保持Exact Membership；
+
+q) Maintenance Deadline通过Latest-safe-start和Future Feasibility保证，而不单纯依赖高优先级；
+
+r) Device-visible Maintenance状态不得被局部Reset或Timeout静默清除；
+
+s) Same-cycle Accounting必须基于统一PRE_STATE归约。
+
+## 9.21 待评审事项
+
+当前维护类服务的总体职责、Refresh/RFM分工、Shared PRE及Service Lifecycle已经明确，下列内容仍需后续规格、产品配置及PHY接口进一步确认：
+
+a) Refresh Debt的最终计量单位及Postpone规则；
+
+b) REF_AB及REF_DIST各Profile对应的最终Command Variant；
+
+c) Distributed Refresh Selector数量及Coverage规则；
+
+d) 1p12等Topology下REF_DIST Target Expansion；
+
+e) 各类Refresh的tREFI、tRFC及相关Spacing参数；
+
+f) High-temperature或其他Refresh Rate切换策略；
+
+g) PRAC/BAT具体Product Enable条件；
+
+h) BAT Contribution、Threshold及Subtraction具体数值规则；
+
+i) PRFM Window、Due、Deadline及Credit规则；
+
+j) RFM_AB、RFM_DIST及RFM_PB的最终Command Encoding；
+
+k) RFM各Variant的Exact Target Expansion；
+
+l) tRFM及相关Timing参数；
+
+m) Shared PRE支持的最大Target Set规模；
+
+n) Maintenance Claim的最大并发Service数量；
+
+o) QCF及Maintenance PRE Progress的物理存储深度；
+
+p) Multi-bank BAT更新所需Write Lane数量；
+
+q) Maintenance Arbitration中Refresh与RFM的最终Precedence Policy；
+
+r) Mandatory Service的Worst-case Preparation及Execution Latency Bound；
+
+s) Qualified REF/RFM Actual的PHY Carrier；
+
+t) No-future-feedback及Service安全回收所需物理证明；
+
+u) Device-visible Maintenance在Reset/Recovery场景下的具体恢复策略。
+
+上述开放项主要影响协议参数、Product Policy及物理实现，不改变Refresh与RFM前端Accounting独立、Shared PRE后端共享以及Maintenance Service分阶段完成的总体架构。
