@@ -1,0 +1,1156 @@
+# 7 命令构造、调度与准入设计
+
+## 7.1 功能范围与设计目标
+
+命令构造、调度与准入模块负责将TE提供的可执行Host事务逐步转换为可以提交至PI的已准入DDR6命令。
+
+该过程由CC、OS和GS三个功能阶段组成，其主要处理关系如下：
+
+```text
+TE Eligible Transaction
+          │
+          ▼
+         CC
+   Command Construction
+          │
+     Normal Candidate
+          │
+          ▼
+         OS
+    Normal Selection
+          │
+    Selected Candidate
+          │
+          ├──────── Maintenance / MR / Training /
+          │         Recovery / Power等服务请求
+          │
+          ▼
+         GS
+     Final Admission
+          │
+     Admitted Command
+          │
+          ▼
+         PI
+```
+
+CC、OS和GS采用分层设计，以分别解决以下问题：
+
+a) CC确定当前事务下一步需要执行哪一类DRAM命令；
+
+b) OS在多个普通Host命令候选之间选择一个候选；
+
+c) GS在普通Host候选与维护类服务请求之间进行最终协调，并判断当前是否具备完整执行条件；
+
+d) GS完成命令所需资源的原子预留，并形成控制器对该命令的执行承诺；
+
+e) PI负责后续命令提交及物理执行边界管理。
+
+命令被CC构造、被OS选择以及被GS准入属于三个不同阶段，不得使用单一grant或valid信号替代上述生命周期。
+
+## 7.2 总体结构
+
+命令构造、调度及准入总体结构如图7所示。
+
+```text
+          TE Eligible Request
+                  │
+                  │
+      ┌───────────┼─────────────┐
+      │           │             │
+      ▼           ▼             ▼
+     BSM       OpenRow        Timing
+     View        View          Query
+      │           │             │
+      └───────────┼─────────────┘
+                  │
+                  ▼
+             ┌────────┐
+             │   CC   │
+             │Command │
+             │Construct
+             └───┬────┘
+                 │
+           Normal Candidates
+                 │
+                 ▼
+             ┌────────┐
+             │   OS   │
+             │Normal  │
+             │ Arbiter│
+             └───┬────┘
+                 │
+           Selected Hold
+                 │
+                 │        Refresh / RFM
+                 │        MR / Training
+                 │        Recovery / Power
+                 │             │
+                 └──────┬──────┘
+                        ▼
+                   ┌────────┐
+                   │   GS   │
+                   │ Final  │
+                   │Admission
+                   └───┬────┘
+                       │
+                Admitted Hold
+                       │
+                       ▼
+                      PI
+```
+
+**图7 命令构造、选择及最终准入总体结构**
+
+CC、OS及GS均不直接维护DRAM实际状态。
+
+BSM、OpenRow及Timing等模块仍为对应状态的功能Owner。CC读取这些状态形成命令候选，OS对普通候选进行选择，GS依据最新状态及资源条件建立Reservation。
+
+只有经过后续确认的actual event，方可更新OpenRow、BSM、Timing History及其他表示器件实际状态的记录。
+
+## 7.3 CC设计
+
+### 7.3.1 功能职责
+
+CC用于将一条TE中的普通Host事务转换为当前状态下所需的下一条DRAM命令。
+
+CC主要负责：
+
+a) 接收TE提供的Eligible Transaction；
+
+b) 查询目标资源的BSM状态；
+
+c) 查询目标资源当前OpenRow状态；
+
+d) 根据请求目标Row判断Row Hit或Row Miss；
+
+e) 请求Timing模块判断候选命令是否满足当前Timing条件；
+
+f) 查询Read或Write相关Prerequisite；
+
+g) 形成完整Normal Command Candidate；
+
+h) 在候选被OS接收或明确失效前保持Candidate及对应Proof稳定。
+
+CC不负责：
+
+a) 多候选之间的全局仲裁；
+
+b) 普通Host请求与Maintenance请求之间的优先级仲裁；
+
+c) 最终资源准入；
+
+d) Timing Reservation写入；
+
+e) OpenRow或BSM状态更新；
+
+f) Transaction Terminal判断。
+
+### 7.3.2 Structural Command生成
+
+对于普通Read或Write事务，CC首先根据BSM及OpenRow状态确定下一条结构命令。
+
+基本关系如下：
+
+| BSM状态               | OpenRow关系   | 下一步结构命令 |
+| ------------------- | ----------- | ------- |
+| CLOSED              | 无有效Open Row | ACT     |
+| OPEN                | Row Hit     | RD或WR   |
+| OPEN                | Row Miss    | PRE     |
+| CLOSED_PENDING      | —           | 等待      |
+| Service/Power Block | —           | 不生成普通候选 |
+
+当目标Bank处于CLOSED状态时，应首先生成ACT候选。
+
+当目标Bank处于OPEN状态且当前OpenRow与请求目标Row一致时，Read请求生成RD候选，Write请求生成WR候选。
+
+当目标Bank处于OPEN状态但当前Row与请求目标Row不一致时，应首先生成PRE候选。
+
+当Bank处于CLOSED_PENDING等需要等待协议状态完成的状态时，不应为了继续推进事务而改变结构命令类型。
+
+因此：
+
+```text
+Timing Fail
+!=
+选择另一种结构命令规避Timing
+```
+
+结构命令由当前事务需求和DRAM状态决定，Timing只决定当前结构命令是否可以进入后续选择。
+
+### 7.3.3 状态一致性检查
+
+CC在形成Candidate前，应确认来自不同状态Owner的查询结果在Identity及上下文上保持一致。
+
+典型查询包括：
+
+```text
+TE：
+Transaction / Child Identity
+TE Entry / Generation
+Resource Identity
+Target Row / Column
+Request Class
+Attempt
+Config / Geometry / Session
+
+BSM：
+Resource Identity
+State
+State Sequence
+
+OpenRow：
+Resource Identity
+Open Valid
+Open Row
+Geometry Version
+State / Query Sequence
+
+Timing：
+Candidate Identity
+Timing Pass
+Legal Phase Information
+Reservation Plan
+Touched History Version / Epoch
+```
+
+若BSM显示Bank为CLOSED，但OpenRow仍表示存在有效打开Row，或者不同查询结果对应的Resource Identity、Generation、Version及Sequence无法一致匹配，则CC不得构造正常Candidate，应进入重新查询或异常处理流程。
+
+### 7.3.4 Candidate Selectable
+
+CC应显式区分“已经确定结构命令”与“当前可以参加OS选择”。
+
+Candidate Selectable原则上由以下条件共同决定：
+
+```text
+Structural Command Valid
+AND
+TE Dependency Pass
+AND
+BSM State Pass
+AND
+OpenRow Relation Pass
+AND
+Timing Pass
+AND
+Current Attempt Pass
+AND
+Read/Write Prerequisite Pass
+AND
+Context / Version Pass
+AND
+External Gate Pass
+```
+
+上述条件中任一项不满足时，该Candidate不得参与OS选择。
+
+Candidate Selectable可以在实现中采用组合逻辑或寄存结果，但其逻辑含义应等价于完整准入前置条件的组合，不得由单一模糊的“command_ok”信号替代多个状态Owner的独立判断结果。
+
+### 7.3.5 Candidate与Proof保持
+
+CC输出不仅应保存Command Descriptor，还应保存形成该Candidate所依据的状态Proof。
+
+Candidate Record原则上包括：
+
+```text
+Command Identity
+Command Type
+Transaction / Child / Attempt Identity
+TE Source Reference
+Resource / Row / Column
+Request Class
+Priority / QoS
+Config / Geometry / Session
+
+BSM Proof
+OpenRow Proof
+Timing Proof / Reservation Plan
+Read / Write Prerequisite Reference
+Candidate Selectable
+```
+
+Candidate在CC或OS中等待期间，外部Bank状态或Timing History可能发生变化。
+
+因此，不应仅保持Command字段并在后续实时读取其他Proof。否则在Candidate Stall期间，其逻辑含义可能发生变化。
+
+当对应Proof失效时，应使该Candidate失效并重新查询相关状态：
+
+```text
+Candidate Proof Stale
+        │
+        ▼
+Exact Invalidate / Replay
+        │
+        ▼
+TE Transaction仍保持有效
+        │
+        ▼
+重新查询BSM / OpenRow / Timing
+        │
+        ▼
+重新构造Candidate
+```
+
+不得通过局部修改已Hold Candidate中的Bank State、Row或Timing字段使旧Candidate继续有效。
+
+### 7.3.6 Normal Command与Maintenance分离
+
+CC仅处理HOST_NORMAL类型请求。
+
+Refresh、RFM、MR、Training、Recovery及其他维护类功能由各自Owner形成独立Service Candidate，不应先转换成伪Host Transaction后注入Normal CC。
+
+Maintenance请求与普通Host候选可以在GS阶段统一进行最终准入，但二者的请求来源和生命周期应保持独立。
+
+## 7.4 OS设计
+
+### 7.4.1 功能职责
+
+OS负责在多个有效的HOST_NORMAL Command Candidate之间选择一个普通候选。
+
+OS主要负责：
+
+a) 过滤不可参与本轮选择的Candidate；
+
+b) 根据Normal Priority Class进行优先级选择；
+
+c) 根据Quota控制连续服务同一Priority Class的次数；
+
+d) 根据ACT、PRE、RD及WR等Command Class进行公平选择；
+
+e) 根据Age及Source Round-Robin处理长期等待和Tie-break；
+
+f) 将最终Winner保存为稳定Selected Candidate；
+
+g) 在GS完成Normal Admission后更新对应Fairness状态。
+
+OS不负责：
+
+a) Refresh、RFM、MR或Training等Maintenance仲裁；
+
+b) Timing规则计算；
+
+c) Timing Reservation；
+
+d) Read/Write资源Reservation；
+
+e) Bank状态更新；
+
+f) 最终命令准入。
+
+### 7.4.2 Candidate过滤
+
+只有满足以下条件的Candidate方可进入OS仲裁：
+
+```text
+candidate_valid
+AND
+candidate_selectable
+AND
+current_source_context_match
+```
+
+处于以下状态的Candidate不得成为Winner：
+
+a) Timing不满足；
+
+b) TE Dependency未解除；
+
+c) BSM状态不允许；
+
+d) Read/Write Prerequisite未满足；
+
+e) External Gate关闭；
+
+f) Candidate Proof已经失效；
+
+g) Attempt或Context不再有效。
+
+当全部Candidate均不可选择时，OS保持无Winner状态，不应人为生成Dummy Command或选择“最接近合法”的Candidate。
+
+### 7.4.3 Priority Class与Quota
+
+OS可以根据产品需求定义多个Normal Priority Class。
+
+对于同一Priority Class连续获得服务的情况，应通过Bounded Quota避免其他持续Eligible的Priority Class长期得不到服务。
+
+Quota计数所对应的“Grant”应定义为：
+
+```text
+Normal Candidate最终完成GS Admission
+```
+
+而不是：
+
+```text
+CC Candidate Valid
+或
+OS Selection
+```
+
+只有满足Normal GS Admission时，才更新Normal Priority Quota。
+
+当当前Priority Class达到Quota且存在其他Eligible Priority Class时，应根据Next Class Pointer切换服务类别。
+
+若系统中仅当前Priority Class存在合法请求，则允许继续服务该Class，Quota计数保持饱和，不应因达到Quota而人为阻塞唯一可执行请求。
+
+### 7.4.4 Command Class公平性
+
+在同一Normal Priority范围内，可进一步对ACT、PRE、RD及WR等Command Class执行循环或其他确定性仲裁策略。
+
+该机制的目的在于避免大量Row-hit RD/WR长期占据调度机会，使必要的ACT或PRE无法获得执行机会。
+
+Command Class Round-Robin等状态同样应以实际完成Normal GS Admission作为更新点。
+
+### 7.4.5 Age与Tie-break
+
+对于持续处于Selectable状态但未获得服务的Candidate，可维护饱和Age值。
+
+Age应采用饱和增长方式，不得发生回卷。
+
+当Candidate Identity发生变化，如同一物理Source Slot切换至新的Generation，应重新初始化对应Age，避免将旧事务等待时间继承给新事务。
+
+当Priority、Command Class和Age均无法区分多个Candidate时，应采用确定性的Source Round-Robin或最终Tie-break规则，确保每个周期最多形成一个Normal Winner。
+
+### 7.4.6 Selected Hold
+
+OS完成选择后，应将完整Winner Candidate保存至Selected Hold。
+
+Selected Hold建立后，在以下条件发生前不得重新仲裁并替换当前Winner：
+
+```text
+Normal GS Admission
+或
+Exact Candidate Invalidation
+```
+
+当GS因资源不足、Maintenance Service、Barrier或其他条件暂时无法接收Normal Candidate时，Selected Hold应保持bit-stable。
+
+新Candidate在此期间到达，不得覆盖当前Selected Candidate。
+
+其主要状态关系如下：
+
+```text
+Cycle N：
+OS选择Candidate A
+      │
+      ▼
+Selected Hold = A
+
+Cycle N+1 ... N+k：
+GS暂时不能Admission
+      │
+      ▼
+A保持不变
+Fairness状态不推进
+
+Cycle N+k+1：
+GS完成A的Normal Admission
+      │
+      ▼
+Selected Hold释放
+Fairness更新一次
+```
+
+### 7.4.7 Selection与Admission边界
+
+OS Selection只表示：
+
+> 当前多个Normal Candidate中，Candidate A被选为下一条提交GS考虑的普通候选。
+
+Selection不表示：
+
+a) Timing Reservation已经建立；
+
+b) Read Expected资源已经分配；
+
+c) Write Join或Payload资源已经锁定；
+
+d) Command Domain已经占用；
+
+e) DRAM状态发生变化；
+
+f) 命令已经提交PHY。
+
+因此，OS Selection与GS Admission必须保持明确的逻辑边界。
+
+### 7.4.8 Selected Candidate失效
+
+GS在重新检查Candidate时可能发现原Proof已经失效。
+
+此时GS应发起针对具体Selected Identity的Invalidate或Replay请求。
+
+OS收到精确Invalidate确认后：
+
+a) 清除对应Selected Hold；
+
+b) 不更新Normal Fairness；
+
+c) 不认为该Candidate已经获得一次服务；
+
+d) 原TE Transaction继续保持有效；
+
+e) CC重新查询当前状态并构造新的Candidate。
+
+不得同时将同一Selected Candidate既作为成功Admission处理，又作为Replay处理。
+
+## 7.5 GS设计
+
+### 7.5.1 功能职责
+
+GS为普通Host命令及各类Side-plane Service的最终准入点。
+
+GS输入可以包括：
+
+```text
+OS Normal Selected Candidate
+Refresh Service
+RFM Service
+MR Service
+Training Service
+Recovery / Retry Service
+Power / Other Typed Service
+```
+
+GS主要负责：
+
+a) 确定不同Source之间的最终处理顺序；
+
+b) 重新确认Candidate Proof Freshness；
+
+c) 检查Global Barrier及当前Context；
+
+d) 请求Timing Reservation Prepare；
+
+e) 请求Read或Write资源Prepare；
+
+f) 请求Command Domain Occupancy；
+
+g) 为ACT等需要独立Generation的命令准备对应资源；
+
+h) 确认PI所需Ingress或Join Capacity；
+
+i) 检查Mandatory Service Deadline是否仍可满足；
+
+j) 在全部条件成立时完成原子Admission Commit；
+
+k) 将结果保存为Admitted Command并提交PI。
+
+GS不负责重新计算Timing规则，也不在Admission时修改OpenRow、BSM或Timing History等Committed DRAM状态。
+
+### 7.5.2 Normal与Service汇合
+
+普通Host流量首先经过OS形成稳定Normal Selected Candidate。
+
+Refresh、RFM、MR、Training、Recovery和Power等请求则由各自Service Owner直接向GS提供Typed Service Head。
+
+这些不同Source在GS完成最终汇合。
+
+Maintenance Source不应进入OS，以避免普通Host公平策略与协议强制服务义务相互混淆。
+
+GS的Source Arbitration可以考虑Service Urgency、Mandatory Deadline及Normal Traffic策略，但任何性能或优先级策略均不得绕过状态合法性、Timing及资源Capacity检查。
+
+### 7.5.3 Proof Freshness
+
+Candidate从CC构造到GS执行最终Admission之间可能经历多个周期。
+
+因此GS不能假设Candidate生成时的Proof仍然有效。
+
+GS在Admission前应重新确认至少以下信息：
+
+a) BSM State Sequence仍与Candidate记录一致；
+
+b) OpenRow状态及对应Version未发生破坏性变化；
+
+c) Timing查询涉及的History/Epoch仍保持有效；
+
+d) Config、Geometry及Session仍匹配；
+
+e) 当前Attempt或Service Identity仍然有效；
+
+f) Barrier状态未发生变化；
+
+g) 相关Owner Capacity仍然可用。
+
+如Proof失效，应拒绝本次Admission，并触发对应Candidate Replay，不应利用已过期Proof继续执行。
+
+### 7.5.4 Resource Prepare
+
+GS在正式Admission之前，对该命令所需的所有有限资源执行Prepare。
+
+根据Command类型，Prepare可以包括：
+
+```text
+Timing Reservation Prepare
+Read Expected / Assembly Prepare
+Write Reservation / Join Credit Prepare
+Command Domain Occupancy Prepare
+ACT Generation Prepare
+Retry Context Prepare
+PI Ingress Capacity Prepare
+Selected Phase / Span Prepare
+```
+
+Prepare只形成临时Token、Credit或可提交结果，不直接产生最终资源写入。
+
+任一Prepare失败时，本次Admission整体失败。
+
+不得使用以下实现方式：
+
+```text
+先分配Timing资源
+再尝试Read资源
+若失败则回滚Timing资源
+```
+
+目标设计采用All-or-none Commit。
+
+## 7.6 原子准入
+
+### 7.6.1 Admission条件
+
+只有在下列主要条件同时成立时，GS方可产生Admission：
+
+```text
+Source Valid
+AND
+Proof Fresh
+AND
+Global Condition Pass
+AND
+All Required Prepare Pass
+AND
+Admitted Hold Available
+```
+
+对于普通Host Candidate，还应确认OS Selected Identity与当前GS处理对象完全一致。
+
+### 7.6.2 Admission Commit
+
+本文件将GS完成最终原子准入的事件定义为Admission Commit。
+
+在原方案事件体系中，对应EV011。
+
+Admission Commit发生时，根据具体Command类型，应在同一个逻辑提交沿建立全部必须资源，包括：
+
+a) GS Admitted Command Record；
+
+b) Timing Reservation；
+
+c) Read或Write Reservation；
+
+d) 必要的PI Join/Ingress Credit；
+
+e) Command Domain Occupancy；
+
+f) ACT Generation Reservation，如命令为ACT；
+
+g) Retry新Attempt相关资源，如适用；
+
+h) Selected Phase、Selected Tick及Command Span；
+
+i) Admission Sequence；
+
+j) 普通Host请求对应的OS Fairness Commit。
+
+若任一必需资源无法成功建立，则上述功能写入均不得发生。
+
+### 7.6.3 Reservation与Committed State
+
+Admission Commit建立的是“未来命令已经获得资源保证”的Provisional State，而不是器件实际状态。
+
+因此Admission Commit不得直接：
+
+a) 写OpenRow；
+
+b) 修改BSM Committed State；
+
+c) 写Timing History中的actual event；
+
+d) 更新BAT等依赖实际ACT/PRE/RFM发生的协议状态；
+
+e) 将Read或Write事务直接标记为完成。
+
+这些状态只在后续对应actual event或正式结果事件发生后更新。
+
+## 7.7 Command Phase与Occupancy
+
+DDR6目标设计中，Timing模块可向GS提供当前命令允许使用的Legal Phase Mask。
+
+GS结合当前Command Domain Occupancy及命令Span要求，从合法Phase中选择实际Start Phase。
+
+逻辑关系如下：
+
+```text
+Timing Legal Phase Mask
+          │
+          ▼
+   Command Occupancy
+          │
+          ▼
+      Span Check
+          │
+          ▼
+  Selected Start Phase
+          │
+          ▼
+    Admission Commit
+```
+
+Selected Phase、Selected Tick及Span应在Admission Commit时固定。
+
+PI后续负责按照该承诺完成Command Encoding及1:8 Phase Placement，不应在PI侧因为暂时Backpressure重新选择另一Start Phase。
+
+Command Domain Occupancy用于表示已准入但尚未完全释放的Command Phase资源，与Timing Reservation以及PI Command Record属于不同逻辑对象，不得合并为单一Busy状态。
+
+## 7.8 Mandatory Service与Deadline
+
+### 7.8.1 Mandatory Service
+
+Refresh、RFM及其他具有协议Deadline的操作不能仅依赖“设置更高优先级”保证按时完成。
+
+GS在接受普通Host命令前，应判断该命令对已经存在的Mandatory Service是否会造成不可恢复的Deadline风险。
+
+可能涉及的约束包括：
+
+a) Refresh Latest-safe-start；
+
+b) RFM或相关维护操作Deadline；
+
+c) 需要在限定时间内完成的PRE或其他前置操作；
+
+d) 协议定义的最大时间窗口约束。
+
+### 7.8.2 Future Feasibility
+
+Maintenance或Timing Owner应向GS提供足够的Deadline或Worst-case Remaining Latency信息。
+
+对于会影响对应Maintenance Service的Normal Candidate，GS应判断：
+
+```text
+Admission当前Normal Candidate之后
+Mandatory Service仍能在Deadline前完成？
+```
+
+只有结果为肯定时，Normal Candidate方可继续Admission。
+
+如果缺少完成该证明所必需的参数或Latency Bound，则对应受影响的Normal Path应保持阻塞或作为设计门禁处理，不应简单假设Maintenance高优先级即可满足协议。
+
+### 7.8.3 Service Safety Gate
+
+即使某Maintenance Service已经达到最高Urgency，也不能绕过基本Safety条件。
+
+如目标Bank状态不允许、所需Timing未满足、Required PRE尚未完成或PI资源不足时，该Service仍需等待相应条件满足。
+
+GS应能够区分“因优先级未被选择”和“因协议安全条件暂时不能执行”两类情况。
+
+## 7.9 Admitted Hold及PI边界
+
+### 7.9.1 Admitted Hold
+
+GS完成Admission Commit后，将命令保存至Admitted Hold。
+
+Admitted Hold原则上保存：
+
+```text
+Valid
+Command Identity
+Command Descriptor
+Transaction / Attempt或Service Key
+Admission Sequence
+Selected Phase / Tick
+Command Span
+Reservation References
+Occupancy Reference
+Config / Geometry / Session
+相关Prepare Token
+```
+
+当前方案采用一个逻辑Admitted Hold。
+
+当Admitted Hold已占用且尚未向PI完成交接时，不继续接收新的Admission。
+
+### 7.9.2 PI Ready与Admission解耦
+
+PI Ready不应作为GS执行Admission Commit的必要条件。
+
+当GS内部所有资源均已准备完成且Admitted Hold为空时，可以完成一次Admission并保存到Admitted Hold。
+
+即使此时PI暂时Backpressure，已准入命令仍保持稳定等待。
+
+这样可以避免PI瞬时Ready直接反馈至整个OS及GS全局仲裁路径，并使Timing Reservation及Read/Write Reservation具有明确Commit Point。
+
+因此：
+
+```text
+Admission
+!=
+PI Presentation
+```
+
+### 7.9.3 PI提交前Revalidation
+
+已准入命令在PI中等待实际Adapter Offer期间，相关外部环境仍可能发生变化。
+
+在正式进入物理接口前，可以根据接口合同执行Revalidation，用于判断原有Admission承诺是否仍然可以安全兑现。
+
+Revalidation仅回答：
+
+> 已经建立的Admission是否仍然有效。
+
+Revalidation不得：
+
+a) 再次分配Timing Reservation；
+
+b) 再次分配Read Expected或Write资源；
+
+c) 再次更新OS Fairness；
+
+d) 任意修改已经确定的Selected Phase；
+
+e) 将原Command替换为另一种Command。
+
+如果原Admission已经无法安全兑现，应进入规定的Stall、Exact Pre-visible Cancel或Recovery流程。
+
+## 7.10 Normal命令执行示例
+
+### 7.10.1 Row Hit Read
+
+目标Bank已经OPEN且目标Row与当前OpenRow一致时：
+
+```text
+TE Read Eligible
+      │
+      ▼
+CC查询BSM = OPEN
+OpenRow = Same Row
+      │
+      ▼
+构造RD Candidate
+      │
+ Timing Pass
+      │
+      ▼
+OS选择RD
+      │
+      ▼
+Selected Hold
+      │
+      ▼
+GS检查Freshness及资源
+      │
+      ▼
+Read Expected等资源Prepare
+      │
+      ▼
+Admission Commit
+      │
+      ▼
+Admitted RD
+      │
+      ▼
+PI
+```
+
+CC构造RD并不分配Read Expected；OS选择RD也不分配Read Expected。只有GS完成Admission Commit后，所需Read返回资源才正式建立。
+
+### 7.10.2 Row Miss Read
+
+目标Bank当前打开其他Row时：
+
+```text
+TE Read RowB
+      │
+BSM = OPEN
+OpenRow = RowA
+      │
+      ▼
+CC构造PRE
+      │
+OS选择
+      │
+GS Admission
+      │
+PI / PRE Actual
+      │
+等待tRP
+      │
+      ▼
+同一TE Read仍有效
+      │
+CC重新查询
+      │
+构造ACT RowB
+      │
+OS / GS / PI
+      │
+ACT Actual
+      │
+等待tRCD
+      │
+      ▼
+同一TE Read再次进入CC
+      │
+构造RD
+```
+
+PRE和ACT均只是原Read Transaction的中间命令，不终止对应TE Transaction。
+
+### 7.10.3 Maintenance插入
+
+当OS已经保存Normal Candidate A，而Refresh Service达到更高Urgency时：
+
+```text
+OS Selected Hold A ──────────────┐
+                                 │
+Refresh Service Head ──────┐     │
+                           ▼     ▼
+                              GS
+                           /      \
+                    Refresh      Normal
+```
+
+若GS优先完成Refresh Admission：
+
+a) Normal Candidate A保持在Selected Hold中；
+
+b) A不重新参与OS仲裁；
+
+c) Normal Fairness和Quota不更新；
+
+d) Refresh完成相应准入后，GS重新考虑A；
+
+e) 若A的Proof已经失效，则执行Replay而不是直接Admission。
+
+## 7.11 主要接口
+
+命令构造、调度及准入主要接口见表5。
+
+**表5 CC、OS及GS主要接口**
+
+| 序号 | 接口                       | 主要内容                                                     | 接口要求                         |
+| -- | ------------------------ | -------------------------------------------------------- | ---------------------------- |
+| 1  | TE → CC                  | Transaction Identity、Resource、Row、Request Class、QoS等     | Transaction保持有效至后续明确Progress |
+| 2  | BSM → CC                 | State、State Sequence、Resource Identity                   | 与当前请求精确匹配                    |
+| 3  | OpenRow → CC             | Open Valid、Row、Version/Freshness                         | 不作为CC本地Truth                 |
+| 4  | Timing → CC              | Timing Pass、Block Reason、Reservation Plan、Phase Mask相关信息 | Query结果与Candidate Identity关联 |
+| 5  | Read/Write Owner → CC/GS | Data Ready、Capacity及Prepare结果                            | 不由CC直接分配资源                   |
+| 6  | CC → OS                  | Whole Candidate及Proof                                    | Stall期间完整保持                  |
+| 7  | OS → GS                  | Selected Normal Candidate                                | Admission或Invalidate前保持稳定    |
+| 8  | Service Owner → GS       | Typed Service Head、Urgency、Deadline及Context              | 不经过Normal OS                 |
+| 9  | Resource Owner ↔ GS      | Prepare Token、Capacity、Freshness                         | All-or-none Commit           |
+| 10 | GS → PI                  | Admitted Command及Reservation Reference                   | PI反压期间保持稳定                   |
+| 11 | PI → GS                  | Presentation、Cancel、Occupancy及相关反馈                       | Full-key匹配后更新                |
+
+## 7.12 主要内部存储对象
+
+主要内部状态见表6。
+
+**表6 CC、OS及GS主要内部存储对象**
+
+| 序号 | 对象                       | 主要内容                                                      | 创建条件                 | 释放条件                              |
+| -- | ------------------------ | --------------------------------------------------------- | -------------------- | --------------------------------- |
+| 1  | CC Request/Query Hold    | Transaction及Query关联信息                                     | TE Request进入CC       | Candidate形成或Replay                |
+| 2  | CC Candidate Hold        | Command Descriptor、Proof、Identity                         | Query完整Join          | OS接收或明确失效                         |
+| 3  | OS Selected Hold         | 完整Normal Candidate及Source Identity                        | Arbitration Winner产生 | Normal Admission或Exact Invalidate |
+| 4  | OS Fairness State        | Priority、Quota、Class RR、Source RR、Age                     | 运行期间维护               | Reset重新初始化                        |
+| 5  | GS Admitted Hold         | Admitted Command、Admission Sequence、Reservation Reference | Admission Commit     | PI交接或Exact Cancel                 |
+| 6  | Command Occupancy State  | Domain、Generation、Start、Span等                             | Admission Commit     | 对应Command释放条件满足                   |
+| 7  | Admission Sequence State | Admission关联标识                                             | 每次有效Admission推进      | 按安全Generation规则复用                 |
+
+上述对象为逻辑功能对象，不代表必须分别实现为独立RAM。
+
+## 7.13 Backpressure与Same-cycle处理
+
+### 7.13.1 Backpressure
+
+CC、OS及GS均应支持下游反压。
+
+CC Candidate Hold占用时，应保持Candidate及Proof稳定。
+
+OS Selected Hold占用时，不重新执行Winner替换。
+
+GS Admitted Hold占用时，不继续产生新的Admission Commit。
+
+下游Backpressure不得导致上游已经Hold的Command Identity发生变化。
+
+### 7.13.2 Same-cycle状态更新
+
+同一周期可能同时出现：
+
+a) Old Timing Reservation释放；
+
+b) Old Command Occupancy释放；
+
+c) 新Admission Prepare；
+
+d) Candidate Invalidate；
+
+e) PI Cancel；
+
+f) Actual Promotion；
+
+g) Normal Fairness更新。
+
+各资源Owner应基于统一PRE_STATE计算自身Next State。
+
+若设计允许同周期Old Resource Release为Fresh Admission提供Capacity，应通过明确的Prospective Count或等价逻辑进行计算，不应依赖RTL语句执行顺序形成隐式旁路。
+
+## 7.14 Reset、Retry与异常处理
+
+### 7.14.1 Reset
+
+接受联合破坏性Reset后，应停止产生新的CC/OS/GS功能事务，并按照Reset合同清除当前Session下的Candidate Hold、Selected Hold及允许清除的Admitted/Occupancy状态。
+
+旧Session的Candidate、Admission或Physical Feedback在新Session中均不得产生功能写入。
+
+对于可能已经达到物理可见边界的Reservation或Command，不得仅因局部Reset请求而直接假定其已经取消。其后续处理应根据PI/PHY可见性及Recovery合同确定。
+
+### 7.14.2 Retry
+
+Retry Permit本身不等同于GS Admission。
+
+新Attempt仍应重新经过：
+
+```text
+TE / CC
+→ Normal Selection
+→ GS Prepare
+→ Admission Commit
+```
+
+或对应Service路径。
+
+旧Attempt的Candidate、Selected或反馈必须通过完整Attempt Identity与新Attempt隔离。
+
+### 7.14.3 Pre-visible Cancel
+
+只有在能够证明以下条件时，才允许对已准入但尚未产生物理影响的Command执行Exact Cancel：
+
+a) Command尚未达到规定的不可取消物理边界；
+
+b) 不存在未来合法反馈继续引用该Command；
+
+c) Cancel对象Identity完整匹配；
+
+d) 对应Reservation及Occupancy仍属于该Command。
+
+Timeout本身不能作为“Command一定未执行”的证明。
+
+### 7.14.4 异常条件
+
+出现下列情况时，应阻止正常功能写入并进入规定的异常处理：
+
+a) CC收到相互矛盾的BSM和OpenRow状态；
+
+b) Candidate Selectable与组成条件不一致；
+
+c) OS同周期形成多个Winner；
+
+d) Selected Hold在Stall期间发生内容变化；
+
+e) GS Consume对象与OS Selected Identity不一致；
+
+f) Admission Commit仅成功写入部分资源；
+
+g) Maintenance Candidate错误进入Normal OS；
+
+h) Old Generation或Old Session事件试图更新Current Candidate；
+
+i) 已经不可确认Physical Visibility的命令被直接当作可取消命令处理。
+
+## 7.15 DDR5 MC继承与修改关系
+
+CC、OS及GS在现有DDR5 MC基础上的主要继承和修改关系见表7。
+
+**表7 命令构造、选择及准入模块继承与修改关系**
+
+| DDR5设计内容                                    | DDR6处理  | 主要修改内容                                    |
+| ------------------------------------------- | ------- | ----------------------------------------- |
+| Per-Bank ACT/PRE/RD/WR Candidate Generation | 保留      | 保留局部Command Construction思想                |
+| TE Page Relation输入                          | 修改      | 使用Canonical TE Request及OpenRow唯一Truth     |
+| DS act/pre/rd/wr ok                         | 替换      | 拆分为BSM State及Timing独立结果                   |
+| Low/High Command Candidate                  | 保留方法/修改 | 使用Typed Whole Candidate                   |
+| RC/CI Maintenance PRE注入CC                   | 删除      | Maintenance采用独立Service Path并在GS汇合         |
+| Fixed Phase字段                               | 删除原功能语义 | Phase由DDR6 Timing及GS统一确定                  |
+| Page/Tag/Entry Table                        | 修改      | 升级为Whole Candidate及Proof                  |
+| Low/High Priority Tree                      | 修改      | 演进为可配置Normal Priority Class               |
+| Global Normal Arbitration                   | 保留      | 继续作为OS主要功能                                |
+| Maintenance与Normal混合仲裁                      | 删除      | OS仅处理HOST_NORMAL                          |
+| Selected Winner                             | 强化      | 增加显式Selected Hold及Exact Invalidate        |
+| Fairness Update                             | 修改      | 仅在Normal GS Admission时Commit              |
+| Final Scheduling Boundary                   | 保留      | 演进为GS Final Admission                     |
+| DDR5固定Phase Scheduling                      | 替换      | 使用1:8 Logical Phase及Command Occupancy     |
+| 单一Grant驱动多类状态                               | 替换      | Selection、Admission、Presentation及Actual分离 |
+| Admission后直接状态更新                            | 删除      | GS仅写Reservation，Committed State由Actual更新  |
+
+## 7.16 设计原则总结
+
+CC、OS及GS设计应遵循以下基本原则：
+
+a) CC只决定当前事务下一步需要什么命令，不决定全局Winner；
+
+b) OS只从普通Host Candidate中选择Winner，不完成最终资源承诺；
+
+c) GS是Normal Traffic和Side-plane Service的统一最终准入点；
+
+d) Selection不等于Admission；
+
+e) Admission不等于Presentation；
+
+f) Presentation不等于Actual；
+
+g) Candidate必须与其Proof共同保持；
+
+h) Proof失效后采用Exact Replay，不局部修改旧Candidate；
+
+i) Fairness只对真正完成Normal Admission的请求计数；
+
+j) 所有Admission所需资源采用All-or-none方式提交；
+
+k) GS Reservation不更新任何表示DRAM已经实际执行的Committed Truth；
+
+l) Mandatory Service Deadline通过Future Feasibility证明保证，而不单纯依赖Priority；
+
+m) 已准入命令的Phase和资源承诺在进入PI后不得任意重新选择。
+
+## 7.17 待评审事项
+
+当前CC、OS及GS的职责划分和主要生命周期已经明确，下列实现参数和接口仍需后续确认：
+
+a) CC并行Candidate Lane数量；
+
+b) CC Query及Candidate Pipeline深度；
+
+c) BSM、OpenRow及Timing Query的最终Latency；
+
+d) Product Normal Priority Class数量；
+
+e) Normal Grant Quota；
+
+f) Command Class Round-Robin具体策略；
+
+g) Age字段宽度及Age参与仲裁的具体优先级；
+
+h) OS最大Candidate数量及Comparator Tree流水级数；
+
+i) Product QoS到Normal Priority Class的映射关系；
+
+j) GS各类Service Source之间的具体Precedence Policy；
+
+k) Command Domain的定义及数量；
+
+l) Command Occupancy的深度及物理实现；
+
+m) 1:8 Simplified DFI下不同DDR6 Command Span及跨周期Placement规则；
+
+n) Mandatory Service的Worst-case Remaining Latency及Latest-safe-start计算方式；
+
+o) Read、Write及PI各类Reservation资源的最终Capacity；
+
+p) 是否需要独立GS Admission Correlation Table；
+
+q) Pre-visible Cancel及Physical Visibility所需PHY反馈定义；
+
+r) 1p12等尚未冻结Topology对Command Target及Phase使用方式的影响。
+
+上述待确认事项影响具体参数、仲裁策略及物理实现，但不改变CC、OS和GS的三层职责划分以及“构造—选择—准入”的总体设计框架。
