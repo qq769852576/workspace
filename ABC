@@ -1,3 +1,1132 @@
+# 附录A MC/PHY标准DFI接口检查表
+
+## A.1 目的
+
+本附录用于DDR6 MC与PHY接口设计、RTL Review、DV及集成阶段的统一检查。
+
+其核心原则为：
+
+```text
+MC ↔ PHY External Interface
+        =
+Standard DFI Signal Subset
+```
+
+即：
+
+> 所采用DFI版本已经定义的信号可以根据Product和PHY需求保留或裁剪，但不得为了实现MC内部状态、Identity或Proof重新定义一套私有“DFI协议”。
+
+以下对象原则上属于MC/PI内部：
+
+```text
+Phase Placement
+Legal Phase Mask
+Timing Reservation
+Logical Transaction ID
+Attempt Context
+Read Correlation Journal
+Payload Reference
+Registered-equivalent Event
+Reset/Session Context
+No-old-feedback Proof
+```
+
+除非所采用标准DFI版本本身已有对应标准Carrier，否则不得直接映射为新的MC↔PHY端口。
+
+---
+
+## A.2 标准DFI信号分类
+
+**表A-1 DFI信号分类原则**
+
+| 类别 | 处理 | 设计原则 |
+|---|---|---|
+| Command/Address | RETAIN | DDR6 Command通过标准DFI Command/Address成员输出 |
+| Write Data | RETAIN | 使用标准`dfi_wrdata`、`dfi_wrdata_en`、Mask等 |
+| Read Data | RETAIN | 使用标准`dfi_rddata`、`dfi_rddata_valid`、`dfi_rddata_en`等 |
+| `dfi_alert_n` | MANDATORY RETAIN | 独立PHY→MC ALERT通路 |
+| Initialization | RETAIN | 保留当前Build需要的标准初始化生命周期 |
+| Update | FEATURE-GATED | `ctrlupd/phyupd`等按PHY需求启用 |
+| Frequency | FEATURE-GATED | FSP/频率切换实际使用时保留 |
+| Low Power | FEATURE-GATED | Power方案实际需要时保留 |
+| PHY Master | FEATURE-GATED | 仅在目标PHY流程要求时保留 |
+| Training相关标准机制 | FEATURE-GATED | 根据DFI版本及PHY ICD确定 |
+| 自定义Command Ready/Accept | DELETE AS DFI PORT | 如需Resource Ready，仅留在MC内部 |
+| 自定义`cmd_actual` | DELETE AS DFI PORT | 仅保留内部Registered-equivalent Event |
+| 自定义Read Tag | DELETE AS DFI PORT | Read Correlation留PI内部 |
+| 自定义Flush/Session/Epoch | DELETE AS DFI PORT | Reset隔离属于内部状态或正式PHY合同 |
+| 自定义`phy_fatal/op_done` | DELETE AS DFI PORT | 不替代标准DFI已有能力 |
+
+---
+
+## A.3 1:8 Command接口检查
+
+MC内部采用：
+
+```text
+P0 P1 P2 P3 P4 P5 P6 P7
+```
+
+作为逻辑Phase Placement空间。
+
+内部Command可以描述为：
+
+```text
+Command Type
+Target
+Start Phase
+Span
+Continuation
+Context
+```
+
+其中：
+
+```text
+Start Phase
+Span
+Continuation
+Legal Phase Mask
+```
+
+均属于MC内部调度字段。
+
+PI负责将已经Commit的Command按照正式DFI定义转换为标准Command/Address信号。
+
+检查项：
+
+```text
+[ ] GS确定的Start Phase属于Timing Legal Phase Mask
+[ ] 同一Issue Word不存在Phase/Span冲突
+[ ] Cross-word Continuation完整
+[ ] GS Commit以后PI不重新选择Phase
+[ ] PI不重新进行OS/GS Arbitration
+[ ] P0～P7最终编码来自正式DFI/PHY Mapping
+```
+
+---
+
+## A.4 MC Internal Commit检查
+
+MC Internal Commit定义为：
+
+> Command已经完成Timing、Phase Occupancy、数据资源及PI/DFI输出条件检查，并被不可逆地插入标准DFI输出流水线。
+
+逻辑关系为：
+
+```text
+Candidate
+   │
+   ▼
+OS Class Head
+   │
+   ▼
+GS Bundle
+   │
+   ▼
+Resource Prepare
+   │
+   ▼
+MC Internal Commit
+   │
+   ▼
+Standard DFI Presentation
+```
+
+Commit之后：
+
+a) Command Type不得因普通Backpressure改变；
+
+b) Start Phase不得重新选择；
+
+c) Bundle内部顺序不得重新调度；
+
+d) 正式Timing Reservation已经生效。
+
+内部可以存在：
+
+```text
+Output Hold
+Credit
+Reservation
+Occupancy
+```
+
+等实现。
+
+但不得因此增加外部：
+
+```text
+cmd_ready
+cmd_accept
+cmd_launch
+reserve_token
+```
+
+私有DFI握手。
+
+---
+
+## A.5 Registered-equivalent Event检查
+
+标准DFI Presentation不直接等价于DRAM Committed Truth更新。
+
+统一采用：
+
+```text
+Standard DFI Presentation
+          │
+          ▼
+Signed PI / PHY Mapping
+          │
+          ▼
+Registered-equivalent Event
+```
+
+Registered-equivalent Event可在MC内部称为：
+
+```text
+cmd_actual_internal
+```
+
+但不得成为外部DFI端口。
+
+其主要Consumer包括：
+
+```text
+BSM
+OpenRow
+Timing History
+Refresh / RFM Accounting
+PRAC / BAT
+Read / Write Physical Progress
+```
+
+检查项：
+
+```text
+[ ] Presentation→Event关系有正式PHY ICD依据
+[ ] BSM不在Presentation时提前更新
+[ ] OpenRow不在Presentation时提前更新
+[ ] Committed Timing History不在Presentation时提前更新
+[ ] 外部不存在cmd_actual私有端口
+```
+
+---
+
+## A.6 Read接口及Correlation检查
+
+外部Read Path使用标准DFI成员，例如：
+
+```text
+MC -> PHY:
+dfi_rddata_en
+
+PHY -> MC:
+dfi_rddata_valid
+dfi_rddata
+
+Optional:
+dfi_rddata_dbi
+dfi_rddata_cs
+```
+
+具体成员及Width以最终DFI版本和PHY ICD为准。
+
+以下对象留在PI/Read内部：
+
+```text
+Logical Read Identity
+Execution Attempt
+Expected Reference
+Assembly Reference
+Issue Journal
+Correlation Context
+```
+
+如果标准DFI Read Return没有Tag，则必须证明：
+
+```text
+Issue Order
++
+Ordered / Fixed-route Return
++
+Known Return Layout
+```
+
+能够唯一恢复Logical Read。
+
+检查项：
+
+```text
+[ ] Logical Read ID没有出现在DFI端口
+[ ] Attempt ID没有出现在DFI端口
+[ ] 不存在rd_token
+[ ] 不存在physical_return_tag
+[ ] Return Ordering合同已签署或Positive Path保持Gated
+[ ] Earliest Return已定义
+[ ] Old Return不会写Fresh Attempt
+```
+
+---
+
+## A.7 Write接口检查
+
+外部Write Path使用标准成员：
+
+```text
+dfi_wrdata
+dfi_wrdata_en
+dfi_wrdata_mask
+```
+
+以及最终Build要求的其他标准Write成员。
+
+PI内部负责：
+
+```text
+WR Command
++
+Write Attempt
++
+Payload Reference
+```
+
+的正确Join。
+
+检查项：
+
+```text
+[ ] Payload Reference不暴露至PHY
+[ ] Attempt ID不暴露至PHY
+[ ] Command/Data Join在PI内部明确建立
+[ ] Write Data Timing符合DFI合同
+[ ] 不存在write_accept私有DFI端口
+[ ] 不存在write_drain私有DFI端口
+[ ] 不存在write_done私有DFI端口
+```
+
+如果PHY没有独立Accept/Drain/Status Carrier，则MC内部Write Completion必须根据实际可证明的标准DFI/PHY边界重新定义，不能虚构反馈。
+
+---
+
+## A.8 Reset及Reopen检查
+
+外部优先采用正式DFI生命周期，例如：
+
+```text
+dfi_reset_n
+dfi_init_start
+dfi_init_complete
+```
+
+以及Build实际保留的：
+
+```text
+ctrlupd
+phyupd
+lp
+phymstr
+frequency
+```
+
+等标准Feature。
+
+MC内部可以维护：
+
+```text
+Reset/Re-init State
+Local Matchability
+CDC/RDC Barrier
+Retry Context
+Optional Reset Epoch
+```
+
+但不得将以下内部概念作为DFI外部信号：
+
+```text
+flush_req
+flush_done
+no_old_return_done
+session_epoch
+```
+
+Traffic Reopen至少需要证明：
+
+```text
+Host/HIF Boundary Complete
+AND MC Local Clear Complete
+AND CDC/RDC Safe
+AND DFI/PHY Initialization Complete
+AND Old Feedback Cannot Pollute Fresh State
+AND DRAM Initialization Complete
+AND Required MR Effective
+AND Required Training Complete
+AND Config/Geometry/Timing Ready
+AND Bank State Known
+AND Maintenance Ready
+AND !Fatal
+```
+
+因此：
+
+```text
+Reset Deassert
+!=
+mc_ready
+```
+
+并且：
+
+```text
+dfi_init_complete
+!=
+mc_ready
+```
+
+---
+
+## A.9 ALERT检查
+
+必须保留：
+
+```text
+PHY -> MC : dfi_alert_n
+```
+
+内部路径为：
+
+```text
+dfi_alert_n
+     │
+     ▼
+Capture
+     │
+     ├── Timing / Deadline
+     ├── PRAC / RFM / Recovery
+     ├── GS Maintenance Gate
+     └── Trace / Error
+```
+
+检查项：
+
+```text
+[ ] ALERT不会被普通Command/Data路径吞掉
+[ ] ALERT与REF/RFM Command Event相互独立
+[ ] Old ALERT不得修改Fresh Recovery State
+[ ] Reset过程中不会Silent Lose尚未处理的ALERT
+[ ] 不使用phy_fatal替代dfi_alert_n
+```
+
+---
+
+## A.10 External Port Lint
+
+每次MC↔PHY接口修改后，应自动或人工执行：
+
+```text
+RTL External Port List
+          │
+          ▼
+Compare
+          │
+          ▼
+Signed DFI Signal Master List
+```
+
+允许结果：
+
+```text
+STANDARD_DFI_RETAIN
+STANDARD_DFI_FEATURE_GATED
+APPROVED_NON_DFI_SIDEBAND
+```
+
+禁止存在未经批准的：
+
+```text
+cmd_ready
+cmd_accept
+cmd_actual
+reserve_token
+rd_token
+physical_return_tag
+flush_done
+session_epoch
+write_done
+training_done
+phy_fatal
+```
+
+等“DFI”信号。
+
+---
+
+## A.11 PHY Integration前检查表
+
+真实PHY Positive Path接入前至少确认：
+
+```text
+[ ] 最终DFI版本已确定
+[ ] Standard DFI Signal Master List已签署
+[ ] Command/Address Width已关闭
+[ ] P0～P7 Physical Mapping已关闭
+[ ] Presentation→Registered-equivalent Mapping已关闭
+[ ] DFI Output Timing具有Finite/Deterministic合同
+[ ] Read Return Ordering已关闭
+[ ] Earliest Read Return已关闭
+[ ] Write Command/Data关系已关闭
+[ ] Write Visibility/Completion合同已关闭
+[ ] dfi_alert_n行为已关闭
+[ ] Reset/Init生命周期已关闭
+[ ] FSP/Power/Update标准Feature已确定
+[ ] Training Carrier已确定
+[ ] CDC/RDC已Review
+[ ] 外部Interface Lint通过
+```
+
+未关闭项目继续由第13章Open Gate管理。
+
+本附录仅作为接口检查和集成准入依据，不建立第二套MC/PHY协议定义。
+
+# 附录B 1:8 Phase Packer与吞吐评估
+
+## B.1 目的
+
+本附录用于关闭DDR6 MC 1:8 Command Issue在功能和性能上的两个问题：
+
+a) 一条Command在P0～P7中如何合法Placement；
+
+b) 当前Bundle Builder是否能够满足Production Command Bandwidth。
+
+需要特别说明：
+
+```text
+1:8
+!=
+每个Issue Word固定8条Command
+```
+
+同时：
+
+```text
+1:8
+!=
+每个Issue Word固定只能1条Command
+```
+
+实际能力由：
+
+```text
+Command Encoding
+Span
+Legal Start Phase
+Cross-word规则
+Timing
+Target Conflict
+Data Coupling
+Maintenance
+GS Bundle能力
+```
+
+共同决定。
+
+---
+
+## B.2 逻辑模型
+
+一个1:8 Issue Word表示为：
+
+```text
+P0 P1 P2 P3 P4 P5 P6 P7
+```
+
+每个Command至少具有：
+
+```text
+Command Type
+Target
+Start Phase
+Span Shape
+Continuation
+Domain
+```
+
+GS负责：
+
+```text
+Multi-Class Heads
+        │
+        ▼
+Bundle Candidate
+        │
+        ▼
+Timing / Phase / Span
+        │
+        ▼
+Target / Domain Conflict
+        │
+        ▼
+Resource Prepare
+        │
+        ▼
+Accepted Subset
+        │
+        ▼
+MC Internal Commit
+```
+
+PI只负责将已经Commit的Bundle编码至标准DFI。
+
+---
+
+# B.3 Command Span/Placement Matrix
+
+Production前必须建立唯一的Command Span/Placement Matrix。
+
+**表B-1 Command Span/Placement Matrix字段**
+
+| 字段 | 含义 |
+|---|---|
+| Command Type/Subtype | ACT/PRE/RD/WR/REF/RFM/MR等 |
+| Legal Start Phase | 允许的P0～P7起始集合 |
+| Span Shape | 实际占用的Phase集合 |
+| Cross-word | 是否跨Issue Word |
+| Continuation | 下一Word占用方式 |
+| Command Domain | CA/Command共享资源 |
+| Target Conflict | 同Word不能并存的Target关系 |
+| Data Coupling | RD/WR与Data Schedule约束 |
+| Timing Rule | 对应Timing限制 |
+| Special Barrier | MR/Maintenance/Training等附加要求 |
+| Source Evidence | DDR6 Spec/PHY ICD/Product |
+| Gate | 尚未关闭的Open Gate |
+
+在Matrix关闭前，不得把：
+
+```text
+Span = 1
+```
+
+或：
+
+```text
+One Command / Word
+```
+
+写成Production事实。
+
+---
+
+# B.4 Bundle Builder
+
+GS保持Multi-Class输入，例如：
+
+```text
+RW Heads
+ACT Heads
+PRE Heads
++
+Maintenance Heads
+```
+
+Bundle Builder从同一Pre-state观察所有候选。
+
+逻辑过程：
+
+```text
+Candidate Heads
+      │
+      ▼
+Freshness Check
+      │
+      ▼
+Timing Legal Mask
+      │
+      ▼
+Phase / Span Compatibility
+      │
+      ▼
+Target / Domain Compatibility
+      │
+      ▼
+Read / Write / Service Resource Prepare
+      │
+      ▼
+PI / DFI Output Capacity
+      │
+      ▼
+Accepted Subset
+      │
+      ▼
+Atomic Commit
+```
+
+---
+
+## B.4.1 单Command原子性
+
+每一条被Commit的Command所需资源必须All-or-none。
+
+禁止：
+
+```text
+Timing Reservation Success
++
+Read Resource Failure
+```
+
+后仍提交Command。
+
+同样禁止：
+
+```text
+PI Occupancy Success
++
+Write Join Failure
+```
+
+后产生Partial Commit。
+
+---
+
+## B.4.2 Bundle共享资源
+
+多个Command可同时进入一个Bundle时，共享资源必须从统一Pre-state归约，例如：
+
+```text
+Phase Occupancy
+Domain Credit
+Shared Read/Write Resource
+Maintenance Feasibility
+```
+
+不能由多个Lane分别独立判断，然后依赖RTL赋值顺序解决冲突。
+
+---
+
+# B.5 Bundle兼容条件
+
+多条Command进入同一Issue Word至少满足：
+
+```text
+Phase / Span不冲突
+AND
+Command Domain兼容
+AND
+Target关系合法
+AND
+Timing相互兼容
+AND
+Read/Write资源充足
+AND
+Maintenance Deadline不被破坏
+AND
+PI/DFI支持该组合
+```
+
+最终Compatibility Matrix由正式Command Span/Placement Matrix派生。
+
+---
+
+# B.6 Cross-word处理
+
+若某Command可以或必须跨Word：
+
+```text
+Word N
+   └── Command Start
+
+Word N+1
+   └── Continuation
+```
+
+则Continuation属于已经Commit Command的一部分。
+
+不得在下一Word重新：
+
+```text
+Arbitrate
+Select
+Change Target
+Change Phase
+```
+
+对应Phase必须在Commit时一并纳入Occupancy和Reservation。
+
+如果最终PHY不支持Cross-word，则Matrix直接限制对应Start Phase。
+
+---
+
+# B.7 Bring-up单Lane
+
+早期Bring-up允许：
+
+```text
+ISSUE_LANES = 1
+```
+
+此时：
+
+```text
+Multi-Class Heads
+      │
+      ▼
+Bundle Builder
+      │
+      ▼
+Accepted Subset <= 1 Command
+```
+
+这样可以降低：
+
+```text
+Phase Conflict
+Multi-command Resource Prepare
+DFI Debug
+```
+
+复杂度。
+
+但OS仍然保持Multi-Class Heads。
+
+GS仍然保持Bundle Builder边界。
+
+因此以后增加Lane不需要重新设计：
+
+```text
+CC
+OS
+GS职责
+```
+
+---
+
+# B.8 Production Multi-lane
+
+如果吞吐证明需要多Command并发：
+
+```text
+ISSUE_LANES > 1
+```
+
+则GS需要满足：
+
+a) 同一Source不能重复进入多个Lane；
+
+b) 同一Logical Command不能重复Commit；
+
+c) 各Command独立完成All-or-none Resource Prepare；
+
+d) Bundle共享Occupancy从统一Pre-state计算；
+
+e) Timing Reservation彼此可见；
+
+f) Maintenance Mandatory Service仍满足Latest-safe-start；
+
+g) Fairness只对最终Commit的Head更新；
+
+h) Lane失败不能给其他Command留下孤立Reservation。
+
+`ISSUE_LANES`和`BUNDLE_SLOTS`属于实现参数，不属于DDR6协议常数。
+
+---
+
+# B.9 吞吐计算模型
+
+DDR6 DQ Data Rate不能直接等于Command Issue Rate。
+
+定义：
+
+```text
+R_DQ       = 每DQ目标Transfer Rate
+
+D_cmd      = 一条有效RD/WR对应的DQ Transfer数量
+
+R_data_cmd = R_DQ / D_cmd
+
+f_issue    = 1:8 Issue Word Frequency
+
+N_word     = 平均每Issue Word实际Commit的有效Command数量
+
+R_cmd_cap  = f_issue × N_word
+```
+
+对于连续Row-hit Data Traffic，至少需要：
+
+```text
+R_cmd_cap >= R_data_cmd
+```
+
+但Production分析还必须考虑：
+
+```text
+ACT/PRE Overhead
+Refresh/RFM Overhead
+Placement Loss
+Timing Bubble
+Read/Write Turnaround
+MR/Power/Training影响
+```
+
+因此代表性需求为：
+
+```text
+R_required
+  =
+Data Command Rate
++
+Row-management Overhead
++
+Mandatory Service Overhead
++
+Protocol / Placement Loss
+```
+
+Production要求：
+
+```text
+R_cmd_cap >= R_required
+```
+
+---
+
+# B.10 建议评估Workload
+
+至少评估：
+
+### a) Ideal Row-hit Read
+
+用于测量纯RD Command Bandwidth。
+
+### b) Ideal Row-hit Write
+
+用于测量纯WR Command Bandwidth。
+
+### c) Read/Write Mix
+
+用于覆盖Turnaround限制。
+
+### d) Row-miss Traffic
+
+包含：
+
+```text
+PRE -> ACT -> RD/WR
+```
+
+开销。
+
+### e) Bank Parallel Traffic
+
+验证多Bank能否真正产生Bundle并发收益。
+
+### f) Refresh/RFM压力
+
+验证Mandatory Service插入后：
+
+```text
+Deadline
++
+Normal Data Throughput
+```
+
+是否同时满足。
+
+### g) Worst Placement
+
+构造Span和Start Phase最差组合，评估Phase Fragmentation。
+
+---
+
+# B.11 性能指标
+
+建议至少输出：
+
+```text
+Average Commands / Issue Word
+Peak Commands / Issue Word
+Phase Utilization
+Placement Failure Rate
+Bundle Acceptance Rate
+OS Head Stall Rate
+GS Resource Reject Rate
+Timing Reject Rate
+Maintenance Block Ratio
+Read/Write Turnaround Loss
+```
+
+以及：
+
+```text
+Data Throughput
+Command Throughput
+Average Latency
+P99 Latency
+```
+
+如果`ISSUE_LANES=1`已经满足所有目标，则没有必要为了“8 Phase”强行增加Multi-lane复杂度。
+
+如果单Lane无法达到目标，再根据Profile和Workload结果逐步增加。
+
+---
+
+# B.12 FPGA实现评估
+
+需要关注的Critical Path包括：
+
+```text
+Class Head Selection
+        │
+        ▼
+Compatibility Compare
+        │
+        ▼
+Phase Occupancy
+        │
+        ▼
+Resource Prepare
+        │
+        ▼
+Accepted Subset
+        │
+        ▼
+DFI Encode
+```
+
+FPGA重点检查：
+
+a) Comparator数量；
+
+b) Arbitration Tree；
+
+c) Phase Mask逻辑；
+
+d) Target Conflict Compare；
+
+e) High Fanout；
+
+f) Bundle Lane数量；
+
+g) Pipeline Stage；
+
+h) WNS/TNS；
+
+i) Resource Utilization。
+
+增加Pipeline是允许的，但必须同步检查：
+
+```text
+Commit Boundary
+Reservation Lifetime
+PI Latency
+Registered-equivalent Mapping
+```
+
+不能只在RTL中插寄存器而不更新系统时序合同。
+
+---
+
+# B.13 当前高速物理风险
+
+当前设计目标记录为：
+
+```text
+DDR6 Data Rate = 19.2 Gb/s per DQ
+```
+
+如果实际TC路径固定采用：
+
+```text
+Ratio = 1:4
+```
+
+则对应速率需求为：
+
+```text
+19.2 / 4
+=
+4.8 Gb/s
+```
+
+当前材料记录的X5IO已确认能力上限为：
+
+```text
+4.5 Gb/s
+```
+
+如果实际物理架构确实采用上述直接映射，则存在：
+
+```text
+Required 4.8 Gb/s
+>
+Available 4.5 Gb/s
+```
+
+的Physical Feasibility Risk。
+
+该问题属于：
+
+```text
+PHY / TC / Platform
+```
+
+而不是MC Phase Packer问题。
+
+不能通过：
+
+```text
+修改Timing Rule
+限制GS
+改变ALPG
+```
+
+解决。
+
+需要：
+
+```text
+Clocking Design
+Device Capability
+P&R
+IO Analysis
+Hardware Margin
+```
+
+共同关闭。
+
+---
+
+# B.14 Production吞吐关闭清单
+
+Production前至少完成：
+
+```text
+[ ] Command Span/Placement Matrix已签署
+[ ] 所有支持Command的Legal Start Phase已确定
+[ ] Cross-word规则已关闭
+[ ] 支持Profile的D_cmd已确定
+[ ] Row-hit Read Throughput通过
+[ ] Row-hit Write Throughput通过
+[ ] Read/Write Mix通过
+[ ] Row-miss Workload通过
+[ ] Maintenance压力下Deadline通过
+[ ] Maintenance压力下数据吞吐满足目标
+[ ] Multi-command Bundle正确性验证通过（若启用）
+[ ] ISSUE_LANES已由性能数据决定
+[ ] GS/OS无结构性Command瓶颈
+[ ] Synthesis/P&R满足f_issue目标
+[ ] PHY/TC物理路径能够支持目标速率
+[ ] Hardware Stress/Margin通过
+```
+
+在上述条件完成前：
+
+```text
+ISSUE_LANES = 1
+```
+
+只能描述为Bring-up/Debug配置，不能描述为Production Command Bandwidth已经完成签核。
+
 # 附录C DDR5 Donor到DDR6 RTL Delta矩阵
 
 ## C.1 目的
