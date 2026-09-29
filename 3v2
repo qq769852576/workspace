@@ -1,0 +1,846 @@
+# 3 DDR5 MC与DDR6 MC差异及影响分析
+
+## 3.1 分析目的与范围
+
+本章基于现有DDR5 MC架构、已完成的DDR5 donor RTL实读结果以及当前DDR6 MC设计方案，从工程实现角度分析DDR5向DDR6演进对MC模块职责、状态组织、Timing、命令调度、数据通路及PHY接口产生的影响，并确定后续设计中的KEEP、MODIFY、REPLACE和NEW范围。
+
+本章不进行DDR5与DDR6协议条款的完整对比，而是重点回答以下问题：
+
+a) DDR5现有模块哪些职责可以继续继承；
+
+b) 哪些现有实现由于状态Owner、Timing或DDR6功能变化需要修改；
+
+c) 哪些DDR5实现方式不适合作为DDR6设计基础，需要重构或替换；
+
+d) 哪些功能需要新增设计对象；
+
+e) 哪些结论已经获得donor RTL证据支持；
+
+f) 哪些内容仍需DDR6规范、DFI规范、PHY接口控制文件或Product配置进一步关闭。
+
+当前已完成直接RTL实读并能够形成文件级证据的模块包括BSM、OpenRow相关逻辑、Timing、CC、OS和GS。HIF、IH、TE、PI、Read、Write、Refresh、RFM、Config、MR、Power、Training、Retry及Reset等模块尚未全部完成同等级donor审计，因此本章对这些模块不将设计推演描述为既有DDR5 RTL事实。
+
+---
+
+## 3.2 总体演进思路
+
+DDR5 MC已经具备Host请求接收、地址处理、Transaction存储、Command Construction、Scheduling、Bank管理、Timing控制、Read/Write Data Path以及Maintenance Service等较完整的控制器骨架。
+
+DDR6 MC总体上继续采用现有功能分层：
+
+```text
+HIF
+ -> IH
+ -> TE
+ -> CC
+ -> OS
+ -> GS
+ -> PI
+ -> DFI
+ -> PHY
+```
+
+设计工作的重点不是重新建立MC，而是解决现有DDR5实现中以下几类与DDR6目标设计不完全匹配的问题：
+
+a) 地址及资源组织需要适配DDR6目标Topology；
+
+b) Bank State、OpenRow和Timing存在职责耦合或状态副本；
+
+c) Transaction和Physical Attempt之间的身份边界需要更加明确；
+
+d) DDR6 Maintenance机制增加了新的服务和Accounting要求；
+
+e) Read/Write在Retry、Late Feedback和资源复用场景下需要更严格的生命周期管理；
+
+f) MC与PHY之间统一采用1:8 Simplified DFI，其中Simplified表示对标准DFI信号和Feature进行项目级裁剪，而不是重新定义私有MC/PHY协议；
+
+g) DDR5中依靠隐式顺序、局部Counter或提前释放建立的功能关系，需要转换为更明确的Owner、Event和Completion边界。
+
+---
+
+## 3.3 DDR5至DDR6主要设计影响
+
+**表3-1 DDR5 MC向DDR6 MC演进的总体影响**
+
+| 序号 | 设计领域 | DDR5设计基础 | DDR6目标处理 | 处理类型 |
+|---|---|---|---|---|
+| 1 | 总体模块层次 | 已有HIF/IH/TE/CC/OS/GS/PI等主路径 | 保持总体分层，在现有职责基础上演进 | KEEP |
+| 2 | Host事务身份 | 现有Token、Entry及局部关联机制 | 建立Logical Transaction与Attempt边界；Parent/Child仅在真实拆分需求下启用 | MODIFY |
+| 3 | 地址处理 | 已有地址字段提取及Bank/Page表示 | 形成System Physical Address到Canonical Resource的统一解释 | MODIFY |
+| 4 | Geometry | 资源解释可能分散于多个模块 | 使用统一Geometry定义合法资源关系和映射 | MODIFY/NEW |
+| 5 | Bank State | Bank Lifecycle与Timing判断存在耦合 | BSM只保存Bank Truth | REPLACE |
+| 6 | OpenRow | Page-open信息存在于TE Entry等多个位置 | 建立唯一per-resource OpenRow Owner | REPLACE/NEW |
+| 7 | Timing | Timing分散于BSM、Rank及Window控制 | 建立统一Timing History、Query和Reservation机制 | MAJOR REFACTOR |
+| 8 | CC | 已有per-bank/per-resource命令构造 | 保留Candidate Construction，移出Timing、Row Truth和Service Policy所有权 | MODIFY |
+| 9 | OS | DDR5 donor已采用多Class和Phase-aware选择 | 保留Multi-Class Head，不压缩为单Global Winner | MODIFY |
+| 10 | GS | DDR5 donor已具有Phase-aware Dynamic Scheduling | 面向1:8演进为Bundle/Phase Packing及统一Admission | MAJOR REFACTOR |
+| 11 | MC/PHY接口 | DDR5已有DFI接口基础 | 采用DDR6目标1:8标准DFI子集，不新增私有伪DFI信号 | MODIFY |
+| 12 | Refresh | 已有周期、Debt及Scheduler机制 | 演进为DDR6 Refresh Target、Deadline和Accounting | MODIFY |
+| 13 | RFM/PRAC/BAT | 已有RFM及激活管理基础 | 增加ACT Lifetime及DDR6相关Accounting语义 | MODIFY |
+| 14 | Read | 已有Tracking和Data Path | 增加明确的Expected、Assembly、Attempt及内部Return Correlation | MODIFY |
+| 15 | Write | 已有WDATA Store和Write路径 | Payload与Attempt解耦，Result、Release、Reclaim分离 | MODIFY |
+| 16 | Config/Geometry | 软件配置可直接作用于部分运行逻辑 | 区分Candidate、Prepared和Active状态并安全发布 | MODIFY |
+| 17 | MR/FSP/Power/Training | 已有部分控制序列基础 | 增加Programmed/Effective及Physical Completion边界 | MODIFY |
+
+总体上，DDR6设计不是增加大量新的顶层模块，而是通过重新划分状态Owner、明确生命周期和适配DDR6协议接口完成现有DDR5骨架的演进。
+
+---
+
+## 3.4 地址及资源组织变化
+
+### 3.4.1 System Physical Address保持上游接口
+
+Normal MC继续使用System Physical Address作为Host侧地址输入。
+
+地址转换分为：
+
+```text
+System Physical Address
+        │
+        ▼
+Direct Bit-level Mapping
+        │
+        ▼
+Logical Address Fields
+        │
+        ▼
+Geometry Mapping
+        │
+        ▼
+Canonical DDR6 Resource
+```
+
+其中IH负责原始地址解释和合法性检查，Geometry负责提供当前配置下统一的资源组织定义。
+
+### 3.4.2 Canonical Resource
+
+DDR6目标设计要求TE、BSM、OpenRow、Timing、Refresh及其他Maintenance模块对同一DRAM资源采用统一Canonical Identity。
+
+Geometry应统一提供：
+
+a) Channel及Logical Resource关系；
+
+b) PSD、BG、BA等资源展开；
+
+c) Row及Column有效范围；
+
+d) 当前Profile和Density下的合法组合；
+
+e) Maintenance Target Set展开所需要的资源关系。
+
+各下游模块不得自行重新解释同一地址字段。
+
+### 3.4.3 Geometry不是运行状态Owner
+
+Geometry只回答：
+
+```text
+这个地址对应什么DDR资源
+```
+
+以及：
+
+```text
+这个资源是否合法
+```
+
+不保存：
+
+```text
+当前Bank是否OPEN
+当前打开哪一行
+当前Timing是否满足
+```
+
+这些状态仍分别由BSM、OpenRow和Timing维护。
+
+Product Topology、部分Density组合及1p12精确Mapping仍依赖正式Product和协议输入关闭。
+
+---
+
+## 3.5 Transaction及Identity变化
+
+### 3.5.1 Logical Transaction与Physical Attempt分离
+
+DDR6目标设计明确区分：
+
+```text
+Logical Transaction
+        !=
+Physical Attempt
+```
+
+Logical Transaction描述Host侧逻辑操作，Attempt描述该逻辑操作的一次实际执行尝试。
+
+发生Retry时：
+
+```text
+Logical Transaction保持
+Attempt重新建立
+```
+
+以避免Old Attempt反馈与Fresh Attempt发生混淆。
+
+### 3.5.2 Parent/Child条件启用
+
+Parent/Child不作为DDR6 MC默认层级。
+
+默认采用：
+
+```text
+1 Host Request
+    ->
+1 Logical Transaction
+```
+
+只有真实Host接口、Burst拆分、跨资源访问或其他产品行为证明一条Host Request必须被拆成多个独立内部执行单元时，才增加Parent/Child层。
+
+在该需求未被donor及Host接口证据证明前，不因为“架构通用性”增加：
+
+```text
+Child Table
+Child Bitmap
+Child Generation
+Completion Reducer
+额外Reclaim State
+```
+
+### 3.5.3 Generation使用原则
+
+Generation只用于存在实际Slot Reuse及Late Feedback风险的对象。
+
+典型形式为：
+
+```text
+{slot, generation}
+```
+
+新增Generation前必须明确其防止的具体ABA场景，不采用所有对象统一增加Generation的方式扩大RTL复杂度。
+
+---
+
+## 3.6 BSM、OpenRow及Timing变化
+
+### 3.6.1 DDR5 donor现状
+
+DDR5 donor实读表明，PAS BSM不仅保存Bank生命周期状态，同时包含大量与tRCD、tRC、tRAS、tRP、tRTP、tWTP及tCCD等相关的Counter和Command Eligibility逻辑。
+
+因此DDR5 BSM中的“Bank能否执行某命令”实际上同时混合了：
+
+```text
+Bank State Truth
++
+Timing Eligibility
+```
+
+DDR6不继续在这一状态机中叠加新的Timing语义。
+
+### 3.6.2 BSM变化
+
+DDR6 BSM收敛为：
+
+```text
+INACCESSIBLE
+CLOSED
+OPEN
+ERROR_CONTAIN
+```
+
+只维护Bank事实。
+
+以下内容不再属于BSM：
+
+```text
+tRP
+tRCD
+tRAS
+tRC
+Open Row Address
+Maintenance Claim
+Power State
+Refresh/RFM Accounting
+```
+
+例如PRE达到Registered-equivalent执行边界后：
+
+```text
+BSM -> CLOSED
+```
+
+无需等待tRP结束再进入CLOSED。
+
+tRP只影响下一次ACT什么时候合法，由Timing Engine统一判断。
+
+因此DDR5中类似：
+
+```text
+PRECHARGING
+```
+
+或当前设计早期使用过的：
+
+```text
+CLOSED_PENDING
+```
+
+不再作为DDR6 BSM的Timing过渡状态。
+
+### 3.6.3 OpenRow变化
+
+DDR5 donor中未形成独立OpenRow Owner。Read和Write TE Entry分别维护本地`page_open`类Shadow，验证逻辑中还存在额外Page Table用于一致性检查。
+
+DDR6不延续这种多处可演化的Row Truth。
+
+OpenRow统一保存：
+
+```text
+valid
+row
+geometry/context
+update sequence
+```
+
+并仅由实际ACT和Qualified Close更新。
+
+TE、CC可以读取或缓存OpenRow Query，但缓存不能继续独立接收ACT/PRE并成为第二Row Truth。
+
+### 3.6.4 Timing变化
+
+DDR5 donor中的Timing并非一个统一模块，而是分布在：
+
+```text
+per-bank BSM
+logical-rank logic
+physical-rank logic
+tFAW/window control
+其他局部Timing logic
+```
+
+DDR6将Timing Authoritative State统一到Timing Engine。
+
+Timing Engine负责：
+
+a) Committed Event History；
+
+b) Rule及Scope；
+
+c) Legal Phase判断；
+
+d) Future Reservation；
+
+e) Deadline及Window；
+
+f) Same-cycle Event Reduction。
+
+BSM和OpenRow不再复制Timing完成状态。
+
+---
+
+## 3.7 CC、OS和GS变化
+
+### 3.7.1 CC
+
+DDR5 donor已经存在按Bank状态和TE请求构造ACT、PRE、RD及WR Candidate的结构，因此DDR6继续保留Command Construction这一职责。
+
+DDR6主要变化是将CC中混合存在的其他Owner职责移出：
+
+```text
+Timing Truth
+    -> Timing Engine
+
+Row Truth
+    -> OpenRow
+
+Maintenance Service Ownership
+    -> Maintenance Owner
+
+Final Phase Packing
+    -> GS / PI
+```
+
+CC最终只回答：
+
+> 对于当前Pending Transaction，根据当前只读状态，下一条结构性Command应该是什么。
+
+### 3.7.2 OS
+
+DDR5 donor实读确认OS并不是一个单Global Winner。
+
+现有结构对：
+
+```text
+ACT
+PRE
+RD/WR
+Priority Class
+Phase
+```
+
+分别进行选择，并同时向后级保留多个类别的候选结果。
+
+因此DDR6继续采用Multi-Class Head结构，不再采用：
+
+```text
+所有Candidate
+    ->
+一个Global Selected Hold
+```
+
+的Production设计。
+
+OS只完成普通Host Candidate Selection，不拥有最终资源Admission权。
+
+### 3.7.3 GS
+
+DDR5 donor GS已经属于Phase-aware Arbitration和Dynamic Scheduling结构，能够对不同Command Class进行组合，并具有跨Word Extension处理。
+
+因此DDR6 GS不能简单退化为：
+
+```text
+一个Selected Command
+    ->
+一个Admitted Hold
+```
+
+目标结构采用：
+
+```text
+Multi-Class Heads
+        │
+        ▼
+Bundle Construction
+        │
+        ▼
+Phase / Span / Conflict Check
+        │
+        ▼
+Resource Prepare
+        │
+        ▼
+DFI Output Condition Check
+        │
+        ▼
+Commit
+```
+
+GS一次最终能够Commit多少条Command不在本章提前固定。
+
+Bring-up阶段可以配置为单Lane，但Production Lane数量应由Command Span、合法Phase组合、最坏工作负载及FPGA实现结果确定。
+
+---
+
+## 3.8 MC与PHY接口变化
+
+### 3.8.1 从DDR5 DFI基础向DDR6标准DFI子集演进
+
+DDR6 MC与PHY之间继续采用DFI体系，不新增一套独立私有Command/Feedback协议。
+
+目标接口定义为：
+
+```text
+1:8 Simplified DFI
+```
+
+其中“Simplified”表示：
+
+> 从项目采用的标准DFI接口中保留本项目需要的信号和Feature，裁剪未使用的可选能力。
+
+而不是：
+
+> 使用自定义命令、Ready、Actual、Tag和Flush信号重新实现一套类DFI接口。
+
+### 3.8.2 DFI接口处理原则
+
+标准DFI功能按照项目需求分为：
+
+```text
+Command / Address          RETAIN
+Write Data                 RETAIN
+Read Data                  RETAIN
+Initialization             RETAIN
+dfi_alert_n                RETAIN
+Update / Power / Frequency FEATURE-GATED
+Unused Optional Feature    REMOVE
+```
+
+DDR6目标Build中具体保留哪些标准DFI成员、信号宽度以及1:8展开方式，由正式采用的DFI版本和PHY接口控制文件共同冻结。
+
+DDR5 donor只能证明现有设计具备DFI接口工程基础，不能直接作为DDR6信号宽度或编码的规范依据。
+
+### 3.8.3 不新增私有DFI握手
+
+以下概念可以存在于MC内部：
+
+```text
+Command Commit
+Issue Reservation
+Registered-equivalent Event
+Physical Correlation
+Session Epoch
+No-old-return State
+```
+
+但不因此在MC和PHY之间新增：
+
+```text
+cmd_ready
+cmd_accept
+cmd_actual
+reserve_token
+physical_return_tag
+rd_token
+flush_done
+session_epoch
+```
+
+等私有DFI端口。
+
+如果未来确需标准DFI之外的接口，应独立定义为Non-DFI Sideband并重新进行接口评审。
+
+### 3.8.4 Commit边界变化
+
+DDR6设计中的Commit重新定义为：
+
+> MC内部已经完成Timing、Phase Occupancy、Data Resource及PI/DFI输出条件检查，并将对应Command不可逆地提交到标准DFI输出流水线。
+
+因此：
+
+```text
+Selection
+    !=
+Admission
+    !=
+DFI Commit
+```
+
+Commit后的Command不能因MC内部普通拥塞重新选择Phase或重新调度。
+
+### 3.8.5 Registered-equivalent Event
+
+DDR6 MC仍然需要区分：
+
+```text
+DFI Presentation
+        !=
+Registered-equivalent Event
+```
+
+后者是BSM、OpenRow和Timing更新Committed Truth所使用的MC内部事件。
+
+它由：
+
+```text
+Standard DFI Presentation
++
+Signed PHY Timing Mapping
+```
+
+恢复得到，而不是通过新增一个`cmd_actual` DFI输入获得。
+
+### 3.8.6 Read Return Correlation
+
+Read接口保持标准DFI Read Path。
+
+Logical Read ID、Attempt和Correlation Context保留在PI/Read内部，不作为自定义Tag送入PHY。
+
+Read Return关联需要通过：
+
+a) 已签署的DFI Ordered/Fixed-route关系恢复；
+
+或：
+
+b) 所采用DFI版本提供的标准相关机制恢复。
+
+若两者均无法提供充分证明，则对应Read Positive Path保持Gate状态，而不是增加私有Tag接口。
+
+### 3.8.7 ALERT
+
+DDR6设计保留标准：
+
+```text
+PHY -> MC : dfi_alert_n
+```
+
+作为独立异常和维护反馈入口。
+
+该信号后续进入Timing、PRAC/RFM/ABO、Maintenance及Error处理流程，不能用MC自定义`phy_fatal`替代。
+
+---
+
+## 3.9 Refresh、RFM及Maintenance变化
+
+### 3.9.1 Refresh
+
+DDR5已有周期计时、Debt、Selector和Maintenance Arbitration等设计基础可以继续利用。
+
+DDR6目标设计需要进一步支持：
+
+```text
+REF_AB
+REF_DIST
+```
+
+及其相应Target Set、Timing、Coverage和Deadline。
+
+Refresh Controller负责：
+
+```text
+Obligation
+Debt
+Coverage
+Selector
+Service Progress
+```
+
+Timing Engine负责：
+
+```text
+Timing Rule
+Earliest Legal Time
+Deadline相关Timing条件
+```
+
+二者不重复维护同一Truth。
+
+REF_DIST的最终Accounting模型以及部分Selector/Credit语义仍需正式协议输入关闭。
+
+### 3.9.2 RFM、PRAC和BAT
+
+Refresh与RFM继续保持两个独立Owner。
+
+DDR6在现有激活管理基础上引入更明确的：
+
+```text
+ACT Lifetime
+PRAC
+BAT
+PRFM
+RFM Service
+```
+
+关系。
+
+普通Refresh和RFM可以共享：
+
+```text
+PRE Preparation
+GS
+PI
+DFI
+Timing
+```
+
+但不共享：
+
+```text
+Refresh Debt
+BAT
+PRFM Obligation
+RFM Accounting
+```
+
+等前端状态。
+
+---
+
+## 3.10 Read及Write数据通路变化
+
+### 3.10.1 Read
+
+DDR5已有Read Tracking和Data Processing结构原则上继续复用，但DDR6目标设计加强以下生命周期边界：
+
+```text
+Logical Read
+Attempt
+Expected
+Return Correlation
+Assembly
+Result
+Reclaim
+```
+
+Logical Read Identity可以跨Retry保持稳定。
+
+不同Attempt必须具有能够隔离Old Return的MC内部Correlation Context。
+
+DFI外部不增加Physical Return Tag，PI根据标准DFI返回行为及内部Issue Journal完成关联。
+
+Read Result已经形成或已经传输给HIF，不等价于Expected、Assembly或Correlation Resource已经可以回收。
+
+### 3.10.2 Write
+
+现有WDATA Storage和Capture通路原则上保留。
+
+DDR6目标设计明确：
+
+```text
+Payload
+    !=
+Attempt
+```
+
+Payload捕获完成后保持Immutable，Retry建立Fresh Attempt时继续引用同一Payload，而不是重新从Host获取Write Data。
+
+Write生命周期区分：
+
+```text
+Payload Ready
+Command Commit
+DFI Write Presentation
+Physical Progress
+Attempt Result
+Logical Terminal
+Reservation Release
+Payload Reclaim
+```
+
+这些事件不得合并为单一Write Done。
+
+Write Physical Completion具体通过哪些标准DFI行为和PHY证明形成，仍需正式PHY接口合同关闭。
+
+---
+
+## 3.11 Config、MR、FSP、Power及Training变化
+
+### 3.11.1 Config及Geometry
+
+DDR6设计继续复用现有软件寄存器及配置访问框架，但增加：
+
+```text
+Candidate
+Prepare
+Safe Commit
+Active
+```
+
+等状态边界。
+
+Software Write不能直接等同于Active Config。
+
+Config和Geometry应在统一安全点发布，避免：
+
+```text
+New Config
++
+Old Geometry
+```
+
+或相反组合用于同一Transaction。
+
+### 3.11.2 MR
+
+MR设计区分：
+
+```text
+Software Requested
+Programmed
+Effective
+```
+
+MC完成DFI命令发送不意味着对应Mode已经立即Effective。
+
+具体Effective条件由DDR6规范及PHY行为确定。
+
+### 3.11.3 FSP及Frequency
+
+FSP切换应优先使用所采用DFI版本中的标准Frequency/Update机制。
+
+目标PHY不需要的标准DFI Feature可以裁剪；需要的Feature则必须按照DFI标准接口实现，不重新增加私有Frequency Switch握手。
+
+### 3.11.4 Power
+
+Power Entry和Exit使用标准DFI Power相关Feature以及MC内部Barrier进行控制。
+
+MC负责：
+
+```text
+停止Fresh Admission
+排空相关工作
+维护Protocol State
+```
+
+PHY负责其物理进入和退出行为。
+
+### 3.11.5 Training
+
+Training由MC负责流程编排，具体算法和Physical Measurement仍由PHY承担。
+
+Training Result如何通过标准DFI或PHY现有接口体现，需要由目标PHY接口定义确认。
+
+---
+
+## 3.12 模块演进矩阵
+
+**表3-2 DDR5 donor至DDR6 MC模块演进关系**
+
+| 模块/功能 | DDR6处理 | 当前证据状态 | 主要变化 |
+|---|---|---|---|
+| HIF | MODIFY | 待进一步donor实读 | Logical Transaction、Host完成边界；Parent/Child条件启用 |
+| IH | MODIFY | 待进一步donor实读 | DDR6 Mapping、Geometry、合法性 |
+| TE | MODIFY | 部分证据，待继续实读 | Transaction Lifetime、Dependency、Eligibility |
+| BSM | REPLACE/MAJOR REFACTOR | **E2已关闭** | 四态Bank Truth，移出Timing |
+| OpenRow | NEW OWNER/REPLACE | **E2已关闭** | 唯一per-resource Row Truth |
+| Timing | MAJOR REFACTOR | **E2 donor结构已关闭** | 统一History/Query/Reservation |
+| CC | MODIFY/DECOUPLE | **E2已关闭** | 保留Candidate Construction，拆Owner |
+| OS | MODIFY | **E2已关闭** | Multi-Class Heads |
+| GS | MAJOR REFACTOR | **E2已关闭** | 1:8 Bundle/Phase Packing及统一Admission |
+| PI/DFI | MODIFY | 待进一步donor/PHY关闭 | 标准DFI子集、1:8、内部Correlation |
+| Refresh | MODIFY | 待进一步donor实读 | REF_AB/REF_DIST及Accounting |
+| RFM | MODIFY | 待进一步donor实读 | ACT Lifetime、PRAC/BAT/PRFM |
+| Read | MODIFY | 待进一步donor实读 | Attempt-scoped内部Correlation |
+| Write | MODIFY | 待进一步donor实读 | Payload/Attempt分离 |
+| Config/Geometry | MODIFY | 待进一步donor实读 | Candidate/Active及安全发布 |
+| MR | MODIFY | 待进一步donor/Spec关闭 | Programmed/Effective |
+| FSP/Power | MODIFY | 待进一步donor/DFI关闭 | 标准DFI Feature适配 |
+| Training | MODIFY | 待PHY接口关闭 | MC Orchestration、PHY Algorithm |
+
+其中E2表示已经直接实读DDR5 RTL并形成模块级证据链，不代表对应DDR6规范、DFI Physical Mapping或Product参数均已关闭。
+
+---
+
+## 3.13 本章收敛结论及外部待闭合项
+
+经过内部预评审和DDR5 donor实读，以下结论不再作为专家开放问题：
+
+a) DDR6 MC继续沿用现有DDR5总体模块骨架；
+
+b) BSM不继续承担Timing Truth，收敛为Bank State Owner；
+
+c) OpenRow建立唯一Row Truth；
+
+d) Timing由分散状态演进为统一Owner；
+
+e) CC继续承担结构性Command Construction；
+
+f) OS保持Multi-Class Head，不采用单Global Winner；
+
+g) GS不固定为Single Admitted Hold，而面向1:8 DFI保持Bundle/Phase Packing能力；
+
+h) MC与PHY之间采用1:8 Simplified DFI；
+
+i) Simplified DFI表示标准DFI子集，而不是自定义私有协议；
+
+j) Commit、Registered-equivalent Event、Read Correlation及Session等概念保留为MC内部语义，不扩展成私有DFI端口；
+
+k) `dfi_alert_n`作为标准PHY至MC异常/维护反馈保留；
+
+l) Parent/Child不作为默认DDR6硬件层级。
+
+本章仍保留以下真正依赖外部输入或后续实读的事项：
+
+**表3-3 本章待闭合项**
+
+| 类别 | 待闭合内容 | 关闭来源 |
+|---|---|---|
+| DDR6资源组织 | Product Topology、Density及1p12精确Mapping | Product/DDR6 Spec |
+| Timing | DDR6 Canonical Rule、Scope及数值 | DDR6 Spec |
+| DFI | 最终DFI版本、Signal Subset、位宽及1:8 Physical Mapping | DFI/PHY ICD |
+| Command Packing | 各Command Span、Continuation及合法组合 | DDR6 Spec/PHY ICD |
+| Read Return | Ordered/Fixed-route关系、Latency及Correlation证明 | DFI/PHY ICD |
+| Write Completion | Physical Drain/Completion证据 | DFI/PHY ICD |
+| Refresh | REF_DIST Accounting及Selector/Credit规则 | DDR6 Spec |
+| PRAC/BAT/RFM | Threshold、Window及部分Accounting规则 | DDR6 Spec/Product |
+| MR/FSP/Training | Effective状态及Physical Completion条件 | DDR6 Spec/PHY |
+| Donor Audit | HIF/IH/TE/PI/Read/Write等尚未完成的RTL证据链 | DDR5 donor实读 |
+
+上述事项不重新打开已经闭合的模块Owner关系，而只作为后续详细设计、接口定义和实现授权的输入条件管理。
