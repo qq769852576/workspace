@@ -1,0 +1,1003 @@
+# 1 文档说明
+
+## 1.1 范围
+
+本文件规定DDR6 Memory Controller（以下简称DDR6 MC）的总体设计目标、架构演进原则、功能模块划分、主要控制及数据通路、MC与PHY之间的功能边界，以及后续RTL实现、验证、FPGA集成和风险关闭应遵循的基本原则。
+
+本文件适用于：
+
+a) 基于现有DDR5 Memory Controller开展DDR6 MC架构演进；
+
+b) DDR5 donor RTL实读及DDR6 Delta分析；
+
+c) DDR6 MC模块级详细设计；
+
+d) RTL开发及模块集成；
+
+e) MC与PHY/TC接口定义及集成；
+
+f) FPGA综合、布局布线及硬件Bring-up；
+
+g) DV、技术评审及后续Production Signoff准备。
+
+本设计的基本路线为：
+
+```text
+DDR5 Donor
+     │
+     ▼
+确认现有实现
+     │
+     ▼
+识别DDR6真实变化
+     │
+     ▼
+最小必要修改
+     │
+     ▼
+RTL / DV / FPGA闭环
+```
+
+本文件不以重新构建一套全新的Memory Controller为目标。
+
+对于DDR5中已经成熟、且未被DDR6协议或目标平台变化直接影响的功能，应优先复用原有模块、Pipeline、Storage及控制结构。
+
+只有现有结构无法合理承载DDR6新增要求时，才进行结构性重构或新增Owner。
+
+当前文档及工程状态为：
+
+```text
+ENGINEERING_CANDIDATE
+```
+
+该状态表示当前设计已经具备模块级RTL实施、DV、donor Delta分析和技术评审基础，但不等同于：
+
+```text
+DDR6 Protocol Fully Proven
+
+PHY Integration Complete
+
+WHOLE_MC_PRODUCTION_RTL_AUTHORIZED
+
+PRODUCTION_READY
+```
+
+---
+
+## 1.2 引用文件
+
+本设计主要依据以下资料开展。
+
+a) 《DDR6 MC FPGA详细设计方案》；
+
+b) 《DDR6 MC FPGA详细设计报告》及其历次工程评审材料；
+
+c) 现有DDR5 MC设计文档及RTL Source；
+
+d) DDR6正式器件协议、Errata及相关规范；
+
+e) 项目选定版本的DDR PHY Interface（DFI）规范；
+
+f) DDR6 PHY/TC Interface Control Document；
+
+g) Product Profile、Topology、Feature及Policy定义；
+
+h) FPGA器件、Clock、IO及实现相关设计资料。
+
+当前DDR5 donor基线为：
+
+```text
+Root:
+D:\sunrui\DDR5\ddr54_src\i_DWC_ddrctl_ddr54
+
+Component:
+DWC_ddrctl_ddr54
+```
+
+具体版本、Primary Donor File及证据等级在附录C中统一维护。
+
+对于尚未获得正式编号、最终版本或签署状态的外部规范，本文件不自行推定其具体条款。
+
+相关功能按照第13章Open Gate及Fail Closed原则管理。
+
+---
+
+# 1.3 术语、定义及缩略语
+
+## 1.3.1 术语和定义
+
+### a) Logical Transaction
+
+由Host Request进入MC后建立的内部逻辑事务对象。
+
+默认设计采用：
+
+```text
+1 Host Request
+      =
+1 Logical Transaction
+```
+
+作为最小复杂度基线。
+
+Logical Transaction在完成、Retry及内部执行阶段保持稳定身份。
+
+---
+
+### b) Parent / Child
+
+Parent/Child是DDR6目标MC设计阶段新增的事务分层机制，但经当前预评审后，从默认基础结构降级为按真实Host/XPI及产品拆分需求启用的可选扩展。
+
+默认：
+
+```text
+HAS_CHILD_SPLIT = 0
+```
+
+只有当一个Host Request确实需要拆分成多个具有独立执行生命周期的内部对象时，才启用：
+
+```text
+Parent
+  ├── Child 0
+  ├── Child 1
+  └── ...
+```
+
+未启用时，不建立Child Table、Bitmap、Completion Reducer及额外Child Reclaim状态。
+
+---
+
+### c) Execution Attempt
+
+同一Logical Transaction的一次具体执行过程。
+
+发生Retry时：
+
+```text
+Logical Transaction
+        │
+        ├── Attempt 1
+        └── Attempt 2
+```
+
+逻辑事务身份保持不变，Fresh Attempt重新建立必要的执行Context和Physical Correlation。
+
+---
+
+### d) Command
+
+MC根据Transaction、Bank State、OpenRow、Timing及Maintenance状态生成的一条DDR操作。
+
+包括：
+
+```text
+ACT
+PRE
+RD
+WR
+REF
+RFM
+MR
+以及其他受支持的DDR操作
+```
+
+Command执行完成不等于其所属Host Transaction已经完成。
+
+---
+
+### e) Candidate
+
+CC根据当前Transaction和DRAM状态形成的结构命令候选。
+
+Candidate表示：
+
+> 当前Transaction下一步结构上需要执行什么Command。
+
+Candidate尚未获得最终调度和执行承诺。
+
+---
+
+### f) Class Head
+
+OS针对不同Command Class选择并稳定保持的当前候选。
+
+DDR6 OS采用：
+
+```text
+Multi-Class Heads
+```
+
+而不是单一Global Winner。
+
+---
+
+### g) Bundle
+
+GS根据多个Class Head、Maintenance Candidate、Timing和资源状态构造的当前可提交Command集合。
+
+一个Bundle可以包含一条或多条Command。
+
+Bring-up阶段允许限制为单Command，但不改变Bundle Builder的架构职责。
+
+---
+
+### h) MC Internal Commit
+
+Command已经完成：
+
+```text
+Timing
+Phase / Occupancy
+Read/Write资源
+Maintenance约束
+PI / DFI Output Capacity
+```
+
+等检查，并不可逆进入标准DFI输出流水线的边界。
+
+应严格区分：
+
+```text
+Selection
+!=
+Admission
+!=
+MC Internal Commit
+```
+
+---
+
+### i) DFI Presentation
+
+已经Commit的Command或Data通过标准DFI信号向PHY呈现的事件。
+
+DFI Presentation本身不自动表示DRAM Committed State已经更新。
+
+---
+
+### j) Registered-equivalent Event
+
+由：
+
+```text
+Standard DFI Presentation
+        +
+已签署的PI / PHY Timing Mapping
+```
+
+确定的MC内部事件。
+
+该事件表示对应Command已经达到可以安全更新MC中DRAM Committed Truth的执行边界。
+
+典型Consumer包括：
+
+```text
+BSM
+OpenRow
+Timing History
+Refresh / RFM Accounting
+PRAC / BAT
+Read / Write Physical Progress
+```
+
+RTL内部可采用类似：
+
+```text
+cmd_actual_internal
+```
+
+的命名，但它不是MC↔PHY外部DFI端口。
+
+---
+
+### k) Timing Reservation
+
+一条Command完成MC Internal Commit后，在Registered-equivalent Event形成前，对其未来Timing影响的内部记录。
+
+Timing Query同时观察：
+
+```text
+Committed Timing History
++
+Live Timing Reservation
+```
+
+Reservation属于MC内部状态，不是PHY握手或DFI协议字段。
+
+---
+
+### l) Slot
+
+RAM、FIFO、Table或Register Array中用于保存一条记录的物理位置。
+
+Slot可以重复使用，因此需要根据对象实际生命周期判断旧引用是否已经关闭。
+
+---
+
+### m) Generation / Version / Epoch
+
+用于解决Slot复用、Old Feedback、ABA或Old/New Context并存问题的Identity机制。
+
+本设计不要求所有对象默认携带：
+
+```text
+Generation
+Version
+Epoch
+```
+
+只有存在真实：
+
+```text
+资源已经复用
++
+旧引用或反馈仍可能到达
+```
+
+风险时才增加相应机制。
+
+如果通过：
+
+```text
+Drain
+Safe Point
+Stall
+Replay
+Sequential Reuse
+```
+
+已经消除风险，则优先采用更简单实现。
+
+---
+
+### n) Retire
+
+逻辑对象已经达到Terminal状态，不再产生新的正常执行行为。
+
+Retire不自动表示Storage已经可以复用。
+
+---
+
+### o) Reclaim
+
+对象Retire后，在所有外部引用、Late Feedback及内部依赖关闭后，释放对应Storage或Resource的过程。
+
+因此：
+
+```text
+Terminal
+!=
+Host Response
+!=
+Reclaim
+```
+
+---
+
+### p) Open Gate
+
+因正式规范、PHY/TC接口、Product参数、donor证据或FPGA测量尚未闭合，而暂时不能完成Positive Path授权的问题。
+
+Open Gate不得用于掩盖内部设计尚未完成的问题。
+
+---
+
+### q) Fail Closed
+
+当必要外部信息未知时：
+
+```text
+Unknown
+   │
+   ▼
+Positive Path Disabled
+```
+
+而不是通过默认值、经验值或猜测继续运行。
+
+例如：
+
+```text
+Unknown Timing Value
+    ->
+Timing PASS = 0
+```
+
+---
+
+## 1.3.2 缩略语
+
+**表1-1 主要缩略语**
+
+| 缩略语 | 含义 |
+|---|---|
+| ALPG | Algorithmic Pattern Generator |
+| BAT | PRAC/RFM相关Activation Accounting状态 |
+| BG | Bank Group |
+| BSM | Bank State Machine |
+| CC | Command Constructor |
+| CDC | Clock Domain Crossing |
+| DFI | DDR PHY Interface |
+| DQ | DRAM Data Pin / Data Bus |
+| DV | Design Verification |
+| FSP | Frequency Set Point |
+| GS | Global Scheduler / Final Admission Stage |
+| HIF | Host Interface |
+| IH | Input / Interface Handler |
+| MC | Memory Controller |
+| MR | Mode Register |
+| MRR | Mode Register Read |
+| MRW | Mode Register Write |
+| OS | Ordinary Scheduler |
+| PHY | Physical Layer |
+| PI | PHY Interface |
+| PRAC | Per Row Activation Counting |
+| PRFM | PRAC触发的Refresh Management Obligation |
+| RD | Read |
+| RDC | Reset Domain Crossing |
+| REF | Refresh |
+| RFM | Refresh Management |
+| TE | Transaction Engine |
+| WR | Write |
+
+部分donor模块缩略语的正式英文全称，应以DDR5原始设计文档和RTL定义为准。
+
+本文件重点统一其功能职责，不对源材料未明确的英文名称进行扩展推定。
+
+---
+
+# 1.4 总体设计原则
+
+本设计在后续章节中统一遵循以下原则。
+
+## 1.4.1 DDR5 Donor优先
+
+设计顺序统一为：
+
+```text
+Donor Fact
+    │
+    ▼
+DDR6 Requirement
+    │
+    ▼
+Delta
+    │
+    ▼
+KEEP / MODIFY /
+REPLACE / NEW / DELETE
+```
+
+不能仅因为某种结构在“通用MC架构”中常见，就引入DDR5 donor不存在且DDR6也没有真实需求的机制。
+
+同样不能因为DDR5已有某实现，就默认其Timing、Width、Depth或接口语义继续适用于DDR6。
+
+---
+
+## 1.4.2 最小必要复杂度
+
+新增机制必须回答：
+
+> 它具体解决什么当前已经存在的功能风险？
+
+以下机制均采用条件启用原则：
+
+```text
+Parent / Child
+Generation
+Version
+Epoch
+显式ARM
+复杂Same-cycle Reuse
+```
+
+如果简单实现已经能够保证正确性，不因“未来可能有用”提前增加硬件状态。
+
+---
+
+## 1.4.3 单一Truth Owner
+
+同一类Authoritative State只允许一个功能Owner。
+
+当前主要关系为：
+
+```text
+BSM
+    -> Bank Truth
+
+OpenRow
+    -> Row Truth
+
+Timing
+    -> Timing Truth
+
+Refresh
+    -> Refresh Debt / Coverage
+
+PRAC/BAT
+    -> Activation Accounting
+
+Config
+    -> Active Configuration
+
+Geometry
+    -> Canonical Resource Mapping
+```
+
+其他模块只能Query或保存可失效Cache，不得建立第二套独立Truth。
+
+---
+
+## 1.4.4 Bank State与Timing分离
+
+BSM只维护：
+
+```text
+INACCESSIBLE
+CLOSED
+OPEN
+ERROR_CONTAIN
+```
+
+Timing等待不编码成Bank State。
+
+例如：
+
+```text
+PRE Event
+    ->
+BSM = CLOSED
+```
+
+随后：
+
+```text
+tRP未满足
+    ->
+Timing.ACT_PASS = 0
+```
+
+不建立`CLOSED_PENDING`。
+
+Maintenance及Power阻塞同样通过独立Access Gate表达。
+
+---
+
+## 1.4.5 Command生命周期分离
+
+后续设计必须保持：
+
+```text
+Candidate
+!=
+Class Head
+!=
+Bundle Admission
+!=
+MC Internal Commit
+!=
+DFI Presentation
+!=
+Registered-equivalent Event
+!=
+Transaction Completion
+!=
+Resource Reclaim
+```
+
+不得因为某一阶段成立，就提前更新属于后续阶段的状态。
+
+---
+
+## 1.4.6 OS Multi-Class、GS Bundle Builder
+
+DDR5 donor实读已经证明OS并非单Global Winner，GS也具备Phase-aware Multi-command Scheduling基础。
+
+因此DDR6采用：
+
+```text
+CC Structural Candidates
+          │
+          ▼
+OS Multi-Class Heads
+          │
+          ▼
+GS Bundle Builder
+          │
+          ▼
+MC Internal Commit
+```
+
+不采用：
+
+```text
+Single Global Selected Hold
+        ->
+Single Production Admitted Hold
+```
+
+作为目标架构。
+
+Bring-up阶段允许单Lane配置，但不改变上述职责边界。
+
+---
+
+## 1.4.7 标准DFI子集
+
+MC↔PHY外部接口遵循：
+
+```text
+Standard DFI Signal Set
+       │
+       ▼
+Retain / Delete / Feature-gate
+```
+
+原则。
+
+即：
+
+> 可以从标准DFI接口中裁剪当前Product不使用的能力，但不建立新的私有“DFI协议”。
+
+以下对象默认属于MC内部：
+
+```text
+Timing Reservation
+Phase Placement
+Logical Transaction ID
+Attempt ID
+Read Correlation Journal
+Payload Reference
+Registered-equivalent Event
+Reset Epoch
+No-old-feedback Proof
+```
+
+不得直接包装为：
+
+```text
+cmd_ready
+cmd_actual
+rd_token
+flush_done
+session_epoch
+```
+
+等自定义DFI端口。
+
+`dfi_alert_n`作为标准PHY→MC异常/维护通道保留。
+
+---
+
+## 1.4.8 Read Correlation内部化
+
+Logical Read Identity与Physical Return Correlation分离。
+
+标准DFI Read Return没有私有Tag时，PI通过：
+
+```text
+Issue Journal
++
+正式签署的Ordered / Fixed-route Return合同
+```
+
+恢复Logical Read。
+
+如果无法唯一恢复：
+
+```text
+Read Physical Positive Path
+=
+GATED
+```
+
+不通过增加私有PHY Tag规避问题。
+
+---
+
+## 1.4.9 Write Payload与Attempt分离
+
+Write中：
+
+```text
+Payload
+!=
+Execution Attempt
+!=
+Result
+```
+
+Payload READY后保持Immutable。
+
+Retry重新建立Attempt，但继续使用原Payload。
+
+对于Device-visible或Visibility未知的Write，不默认允许Retry。
+
+---
+
+## 1.4.10 Maintenance Accounting分离
+
+Refresh与RFM可以共享：
+
+```text
+Shared PRE
+GS
+PI
+Timing
+```
+
+等后端执行能力。
+
+但必须独立维护：
+
+```text
+Refresh Debt / Coverage
+```
+
+和：
+
+```text
+PRAC / BAT / PRFM
+```
+
+Accounting Truth。
+
+普通REF不能给RFM Credit，RFM也不能减少普通Refresh Debt。
+
+---
+
+## 1.4.11 Config与Physical Effective State分离
+
+需要区分：
+
+```text
+Software Written
+!=
+Active Config
+
+MR Programmed
+!=
+MR Effective
+
+FSP Requested
+!=
+Effective FSP
+
+Training PASS
+!=
+MC Ready
+
+Reset Deassert
+!=
+MC Ready
+```
+
+任何影响Normal Traffic解释和PHY工作点的状态，都必须有明确Publication或Reopen条件。
+
+---
+
+## 1.4.12 Retry先隔离Old Attempt
+
+Retry统一遵循：
+
+```text
+Fence Old
+    │
+    ▼
+Allow Legal Old Progress
+    │
+    ▼
+Prove Old Cannot Pollute Fresh
+    │
+    ▼
+Fresh Authorization
+    │
+    ▼
+Normal CC / OS / GS Admission
+```
+
+Timeout本身不能证明Command没有执行。
+
+---
+
+## 1.4.13 Reset重新建立信任
+
+Reset的作用是：
+
+```text
+Discard Trust in Old Runtime State
+```
+
+Re-init的作用是：
+
+```text
+Establish Trust in Current State
+```
+
+因此Reset后Bank首先进入：
+
+```text
+INACCESSIBLE
+```
+
+而不是假定CLOSED。
+
+Traffic只有在PHY、DRAM、Config、Geometry、Timing、Bank、Maintenance及必要Training重新满足条件后才能Reopen。
+
+---
+
+## 1.4.14 Open Gate与Fail Closed
+
+凡依赖：
+
+```text
+DDR6 Spec
+PHY / TC ICD
+Product
+Donor Evidence
+FPGA Measurement
+```
+
+且尚未关闭的问题，通过第13章统一管理。
+
+Open Gate只限制受影响的：
+
+```text
+Coding
+Integration
+Feature
+Production
+```
+
+范围，不应简单解释为整个项目停止。
+
+---
+
+## 1.4.15 模块实施与Whole-MC状态分离
+
+某一模块具备RTL实施条件，不等于Whole-MC已经完成Production授权。
+
+必须区分：
+
+```text
+Semantic RTL Ready
+```
+
+和：
+
+```text
+Physical Positive Path Ready
+```
+
+以及：
+
+```text
+Production Signoff Ready
+```
+
+三个层次。
+
+当前整个工程统一保持：
+
+```text
+ENGINEERING_CANDIDATE
+```
+
+---
+
+# 1.5 文档结构
+
+本文档按照：
+
+```text
+总体设计
+   ↓
+差异分析
+   ↓
+功能详细设计
+   ↓
+验证
+   ↓
+实施
+   ↓
+风险闭环
+```
+
+组织，共13章正文及3个工程附录。
+
+## 1.5.1 正文章节
+
+**第1章 文档说明。**  
+说明适用范围、引用资料、统一术语、总体设计原则及文档结构。
+
+**第2章 DDR6 MC总体设计。**  
+给出DDR6 MC总体架构、主请求路径、Side-plane Control、标准DFI边界及整体生命周期。
+
+**第3章 DDR5 MC与DDR6 MC差异及影响分析。**  
+从工程实现角度分析DDR6变化，并明确DDR5 donor的继承、修改和新增方向。
+
+**第4章 前端请求处理设计。**  
+说明HIF、IH、TE及Logical Transaction、Address Mapping、Dependency和可选Parent/Child机制。
+
+**第5章 命令构造、调度与准入设计。**  
+说明CC Structural Candidate、OS Multi-Class Heads、GS Bundle Builder及MC Internal Commit。
+
+**第6章 DRAM状态及Timing管理。**  
+定义BSM、OpenRow及Timing三个Truth Owner，以及Registered-equivalent Event驱动的状态更新。
+
+**第7章 维护类服务设计。**  
+说明Refresh、PRAC/BAT、RFM、Shared PRE、Maintenance Deadline和`dfi_alert_n`处理。
+
+**第8章 模式配置、频率及电源控制设计。**  
+说明Config、Geometry、MR、FSP、Power和Training，以及Active/Effective/Reopen边界。
+
+**第9章 数据通路设计。**  
+说明Read Expected、PI内部Correlation、Assembly、Write Payload、Attempt及标准DFI数据路径。
+
+**第10章 异常、重试及复位设计。**  
+说明Local Containment、Retry、Visibility、Old-feedback隔离、Reset/Re-init及MC Ready。
+
+**第11章 验证方案。**  
+将设计合同转换为Assertion、Directed Test、Integration、FPGA及Hardware验证要求。
+
+**第12章 实施计划。**  
+按照技术依赖给出donor实读、RTL、DV、FPGA及PHY集成路线，并定义Coding和Integration Gate。
+
+**第13章 风险及待评审事项。**  
+作为正文收尾，统一管理仍需DDR6规范、PHY/TC、Product、donor证据或工程测量才能关闭的Open Gate。
+
+---
+
+## 1.5.2 工程附录
+
+**附录A MC/PHY标准DFI接口检查表。**  
+用于MC↔PHY接口设计、RTL Review及Integration检查，避免内部Identity或Proof被错误设计为私有DFI端口。
+
+**附录B 1:8 Phase Packer与吞吐评估。**  
+用于维护Command Span/Placement Matrix、Bundle能力、`ISSUE_LANES`及Production Command Throughput关闭过程。
+
+**附录C DDR5 Donor到DDR6 RTL Delta矩阵。**  
+记录DDR5直接源码证据、Evidence Level以及DDR6的KEEP/MODIFY/REPLACE/NEW/DELETE关系，并作为后续Coding Review的重要依据。
+
+---
+
+通过上述结构，正文回答：
+
+```text
+DDR6 MC为什么这样设计？
+各模块应该做什么？
+状态和生命周期如何正确推进？
+如何验证和实施？
+还剩哪些真正需要外部关闭的问题？
+```
+
+三个附录则回答：
+
+```text
+MC/PHY接口怎么检查？
+1:8性能怎么关闭？
+DDR5 donor到底有什么、DDR6具体改什么？
+```
+
+从而形成从：
+
+```text
+Donor Evidence
+      │
+      ▼
+Architecture
+      │
+      ▼
+Detailed Design
+      │
+      ▼
+RTL / DV
+      │
+      ▼
+FPGA / PHY
+      │
+      ▼
+Open Gate Closure
+```
+
+的完整工程闭环。
