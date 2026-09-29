@@ -1,0 +1,1642 @@
+# 9 数据通路设计
+
+## 9.1 功能范围与设计目标
+
+数据通路负责完成DDR6 MC中的Read Data返回、Write Data存储及下发，并管理相关数据对象、执行Attempt、结果以及内部资源生命周期。
+
+本章主要包括：
+
+a) Read Expected及返回关联；
+
+b) Read Assembly及Result；
+
+c) Write Payload Allocation及Capture；
+
+d) Write Attempt及Command/Data Join；
+
+e) 标准DFI Read/Write Data Path；
+
+f) Retry、Late Feedback及Reset场景的数据隔离；
+
+g) Result Transfer及内部资源Reclaim。
+
+现有DDR5 MC中的Read Tracking、Read Datapath、Write Data RAM、Mask以及ECC/CRC/Protection等结构作为后续donor实读和复用基础，但在对应RTL证据完成前，本章不将其具体内部实现视为已经冻结的DDR5 donor事实。
+
+DDR6数据通路设计重点不是重新定义数据处理算法，而是明确：
+
+```text id="dwc9cy"
+Logical Object
+Execution Attempt
+Physical Correlation
+Result
+Resource Reclaim
+```
+
+之间的边界。
+
+总体原则为：
+
+```text id="8w0e4p"
+Resource Available
+!=
+Command Commit
+!=
+DFI Presentation
+!=
+Data Return / Physical Progress
+!=
+Result Formed
+!=
+Host Transfer
+!=
+Resource Reclaim
+```
+
+---
+
+# 9.2 总体结构
+
+Read Path：
+
+```text id="r1gz9i"
+TE / CC / OS
+      │
+      ▼
+     GS
+      │
+      │ RD Commit前确认资源
+      ▼
+ ┌───────────────┐
+ │ Read Expected │
+ │ Read Assembly │
+ │ Return Capacity│
+ └───────┬───────┘
+         │
+         ▼
+        PI
+         │
+         │ dfi_rddata_en
+         ▼
+        PHY
+         │
+         │ dfi_rddata_valid
+         │ dfi_rddata
+         ▼
+        PI
+         │
+ Internal Correlation
+         │
+         ▼
+   Read Assembly
+         │
+         ▼
+    Result Hold
+         │
+         ▼
+        HIF
+         │
+         ▼
+        Host
+```
+
+Write Path：
+
+```text id="2g1epm"
+Host Write Data
+      │
+      ▼
+ Payload Store
+      │
+      ▼
+ Payload READY
+      │
+      ▼
+TE / CC / OS
+      │
+      ▼
+     GS
+      │
+      │ WR Commit
+      ▼
+     PI Join
+    /       \
+Command   Payload
+    \       /
+      \   /
+       ▼
+ Standard DFI
+ dfi_wrdata
+ dfi_wrdata_en
+ dfi_wrdata_mask
+       │
+       ▼
+      PHY
+```
+
+**图9-1 Read/Write数据通路总体结构**
+
+Read和Write均要求在Command Commit之前确认后续必须使用的有限资源可用，避免Command已经不可逆提交后才发现数据通路无资源接收或发送。
+
+---
+
+# 9.3 Read数据通路设计
+
+## 9.3.1 功能职责
+
+Read路径主要负责：
+
+a) 在RD Commit前确认未来Read Return有可用接收资源；
+
+b) 建立Logical Read与未来DFI Read Return之间的内部关联；
+
+c) 接收标准DFI Read Data；
+
+d) 将返回数据归并至对应Logical Read；
+
+e) 处理Byte Valid、Mask、Status及Protection信息；
+
+f) 形成稳定Read Result；
+
+g) 向HIF提交Result；
+
+h) 在确认不存在Old Return风险后回收相关内部资源。
+
+---
+
+## 9.3.2 Logical Read与Physical Attempt
+
+Read路径区分：
+
+```text id="jiyxig"
+Logical Read
+```
+
+和：
+
+```text id="es5xmp"
+Physical Execution Attempt
+```
+
+Logical Read表示Host/MC逻辑对象。
+
+当发生Retry时：
+
+```text id="spbzgy"
+Logical Read保持不变
+Attempt重新建立
+```
+
+因此Old Attempt Return不能仅凭Logical Read ID直接写入Fresh Attempt状态。
+
+具体隔离机制由PI内部Correlation Context负责。
+
+---
+
+# 9.4 Read Admission及资源准备
+
+## 9.4.1 Commit前置资源
+
+一条RD进入MC Internal Commit之前，至少应确认后续必需资源具备容量，例如：
+
+```text id="s9k83g"
+Expected Resource
+Assembly Resource
+Return Ingress Capacity
+PI Correlation Resource
+Result Path Capacity
+```
+
+具体是否需要将这些资源分别实现为独立Slot，由RTL结构决定。
+
+功能要求只是：
+
+> 一旦RD已经不可逆Commit，后续合法DFI Return必须存在确定的接收和关联路径。
+
+---
+
+## 9.4.2 Expected与Assembly分离
+
+Expected和Assembly承担不同职责。
+
+Expected回答：
+
+```text id="v0et0d"
+未来到达的Read Return属于谁？
+```
+
+Assembly回答：
+
+```text id="y85cmm"
+这条Read已经收到了哪些数据？
+```
+
+因此逻辑上：
+
+```text id="wdpgrb"
+Expected
+!=
+Assembly
+```
+
+但这不意味着RTL中必须实现为两张独立RAM。
+
+若容量、端口和生命周期允许，两者可以共享物理Storage。
+
+---
+
+## 9.4.3 原子Commit
+
+GS在Commit RD时，应确保该Read真正需要的资源同时获得。
+
+不能出现：
+
+```text id="0wsq6b"
+RD已经Commit
+但Expected无法建立
+```
+
+或：
+
+```text id="zjgfg1"
+RD已经Commit
+但Return Ingress没有容量
+```
+
+等Partial Commit。
+
+资源准备方式可以采用：
+
+```text id="5q0b8n"
+Capacity Check
+Reservation
+Credit
+```
+
+或等价实现。
+
+本章不要求资源Owner必须向GS返回复杂Token结构。
+
+---
+
+# 9.5 Read Expected设计
+
+## 9.5.1 基本内容
+
+Expected至少需要保存：
+
+```text id="ja81f2"
+Logical Read Reference
+Current Attempt Context
+Required Data Layout
+Assembly Reference
+PI Correlation Reference
+State / Progress
+```
+
+只有真正存在Slot复用及Late Return风险时，才进一步增加：
+
+```text id="z9fbjp"
+Generation
+```
+
+或等价Freshness字段。
+
+不将：
+
+```text id="oj9qw6"
+Transaction Generation
+Expected Generation
+Assembly Generation
+Physical Tag Generation
+Admission Generation
+```
+
+全部作为默认字段。
+
+---
+
+## 9.5.2 Expected建立时点
+
+Expected必须在Read有可能产生合法返回之前建立。
+
+优先关系为：
+
+```text id="newyfz"
+RD Commit
+    │
+    ├── Expected有效
+    ├── Assembly有效
+    └── PI Correlation有效或即将以可证明方式建立
+```
+
+如果PI能够在Commit时同步建立完整Correlation，则Expected可以直接进入可匹配状态。
+
+如果PI Correlation需要额外流水周期，则需要区分：
+
+```text id="6sae9d"
+Allocated
+```
+
+和：
+
+```text id="g1wq5s"
+Matchable
+```
+
+并通过显式ARM或等价机制控制。
+
+因此本章保留“Matchable”语义，但不强制所有实现采用固定：
+
+```text id="gqkvfu"
+RESERVED -> ARM -> MATCHABLE
+```
+
+三态状态机。
+
+---
+
+## 9.5.3 Earliest Return
+
+如果Expected/Correlation不能在DFI Return可能到达前建立，则必须满足以下至少一个条件：
+
+a) PI Return Ingress能够先缓存Return；
+
+b) PHY/DFI合同证明Earliest Return一定晚于Correlation建立；
+
+c) 对应Positive Path保持关闭。
+
+不得依赖：
+
+```text id="y8t02p"
+Read Data一般不会这么快回来
+```
+
+作为设计依据。
+
+---
+
+# 9.6 标准DFI Read Return
+
+## 9.6.1 外部接口
+
+Read数据外部仅使用最终Simplified DFI中保留的标准DFI Read成员，例如：
+
+```text id="w5925u"
+MC -> PHY
+dfi_rddata_en
+
+PHY -> MC
+dfi_rddata_valid
+dfi_rddata
+
+Optional:
+dfi_rddata_dbi
+dfi_rddata_cs
+```
+
+具体信号成员及宽度由最终采用的DFI版本和PHY ICD确认。
+
+不得增加：
+
+```text id="w3mn1n"
+rd_token
+physical_return_tag
+logical_read_id
+attempt_id
+```
+
+等私有DFI Read信号。
+
+---
+
+## 9.6.2 PI内部Correlation
+
+标准DFI Return进入PI后，由PI恢复它对应的Logical Read。
+
+目标合同只能采用以下两类方式之一：
+
+```text id="504atq"
+方式A：
+标准DFI Return保证签署的Ordered / Fixed-route关系
+        │
+        ▼
+PI根据Issue Journal恢复Logical Read
+```
+
+或：
+
+```text id="0nl4wl"
+方式B：
+所采用DFI版本提供标准Correlation机制
+        │
+        ▼
+PI严格使用该标准机制
+```
+
+如果两种方式均无法证明Read Return能够唯一恢复当前Read对象，则该Read Physical Positive Path保持Gated。
+
+不能通过新增私有Tag绕过该问题。
+
+---
+
+## 9.6.3 PI Issue Journal
+
+若采用Ordered/Fixed-route方式，PI需要保存能够恢复Read Return的最小Issue信息。
+
+例如：
+
+```text id="fhk8ow"
+Issue Order
+Logical Read Reference
+Attempt Context
+Expected Reference
+Return Layout
+```
+
+具体Journal结构取决于最终PHY Return Ordering。
+
+本章不预先规定：
+
+```text id="929mcx"
+Physical Tag
+Tag Generation
+Route Generation
+```
+
+为必选字段。
+
+---
+
+## 9.6.4 Return Match
+
+只有PI已经能够将DFI Return唯一恢复为Current Expected时，该Return才允许产生Assembly Functional Write。
+
+逻辑条件为：
+
+```text id="49uyjr"
+dfi_rddata_valid
+AND
+Correlation Valid
+AND
+Expected Current
+AND
+Attempt / Context Match
+AND
+Return Position Legal
+```
+
+否则：
+
+```text id="fpf369"
+Assembly Functional WE = 0
+```
+
+并进入对应Error、Stale Return或Recovery处理。
+
+---
+
+# 9.7 Read Assembly
+
+## 9.7.1 功能职责
+
+Assembly保存一条Logical Read已经接收到的数据及状态。
+
+逻辑内容可包括：
+
+```text id="u26nci"
+Valid
+Expected Reference
+
+Required Position Mask
+Received Position Mask
+
+Data
+Byte Valid
+Status
+Protection / Error
+```
+
+具体字段由最终DDR6 Read Packet Layout确定。
+
+---
+
+## 9.7.2 Required Mask
+
+Read Complete不应在架构层假定固定：
+
+```text id="k2l36t"
+收到N Beat就完成
+```
+
+而应按照当前Read要求的数据位置判断。
+
+典型条件为：
+
+```text id="7o9in7"
+(Received Mask & Required Mask)
+==
+Required Mask
+```
+
+这样能够覆盖不同Burst、Partial、Metadata及Profile Layout。
+
+如果最终Product的Read Layout确实始终固定，则RTL可以进一步简化为Counter实现。
+
+---
+
+## 9.7.3 Multi-lane Return
+
+若一个周期存在多个DFI Return Lane或内部Return Fragment，应保证同一Assembly Entry的更新从统一Pre-state归约。
+
+合法的不同Position可以Merge。
+
+同一Position重复返回时，不应无条件使用“最后一份数据覆盖前一份数据”。
+
+出现冲突Return时进入Error处理。
+
+---
+
+# 9.8 Read Result
+
+## 9.8.1 Result形成
+
+当Assembly满足正常Completion条件，或产生规定的Terminal Error时，形成稳定Read Result。
+
+流程为：
+
+```text id="398x9t"
+Assembly Terminal
+      │
+      ▼
+Result Snapshot
+      │
+      ▼
+Result Hold
+      │
+      ▼
+HIF
+```
+
+Result形成后，Host Backpressure期间完整Result必须保持稳定。
+
+---
+
+## 9.8.2 Result内容
+
+默认单Transaction模式下，Read Result至少包含：
+
+```text id="d5hwow"
+Logical Transaction Reference
+Logical Read Reference
+Data
+Byte Valid
+Status
+Host Ordering Information
+```
+
+如果第4章Parent/Child扩展启用，再增加Child相关Identity。
+
+不在Host Result中暴露内部Physical Correlation信息，除非调试或Telemetry明确需要。
+
+---
+
+# 9.9 Read Resource Reclaim
+
+## 9.9.1 Host Transfer不等于内部Reclaim
+
+HIF成功接收Read Result，只表示：
+
+```text id="6mygyy"
+Result Ownership已经转移
+```
+
+不自动表示：
+
+```text id="gm8lqh"
+Expected
+Assembly
+PI Correlation
+```
+
+均已经可以立即复用。
+
+回收前必须确认：
+
+```text id="npmjjq"
+Result不再引用Assembly
+PI不再引用Expected
+Old Return不会合法匹配该对象
+Retry / Recovery不再引用该对象
+```
+
+---
+
+## 9.9.2 Same-cycle Reclaim
+
+架构不强制：
+
+```text id="bpy5fx"
+Result Transfer
+和
+Expected Reclaim
+```
+
+必须分两个周期。
+
+如果RTL能够从统一Pre-state证明全部Reclaim条件成立，可以同周期释放。
+
+第一版也可以采用更保守的：
+
+```text id="q6y7n7"
+Result Transfer
+      │
+      ▼
+Later Reclaim
+```
+
+以降低Same-cycle复杂度。
+
+具体由性能和RTL实现决定。
+
+---
+
+# 9.10 Read Retry
+
+Read Retry保持：
+
+```text id="1yg3v8"
+Logical Read
+        │
+        ├── Attempt 1
+        └── Attempt 2
+```
+
+基本流程为：
+
+```text id="qkcjc7"
+Old Attempt
+    │
+    ▼
+Retry Requested
+    │
+    ▼
+Fence Old Attempt
+    │
+    ▼
+关闭Fresh Issue
+    │
+    ▼
+确认Old Return处理边界
+    │
+    ▼
+New Attempt Authorized
+    │
+    ▼
+Fresh GS Admission
+```
+
+Fence以后已经在PI/DFI返回路径中的合法Old Return如何处理，由第10章Retry合同统一确定。
+
+不能在Old Return仍可能匹配Fresh对象的情况下复用相关Correlation资源。
+
+---
+
+# 9.11 Write数据通路设计
+
+## 9.11.1 功能职责
+
+Write数据通路负责：
+
+a) 接收Host Write Data；
+
+b) 保存Data、Mask及必要Metadata；
+
+c) 判断Payload完整性；
+
+d) 为Write Transaction提供稳定Payload Reference；
+
+e) 在WR Commit时建立本次Execution Attempt所需资源；
+
+f) 在PI将Write Command与正确Payload进行关联；
+
+g) 按标准DFI要求组织Write Command及Write Data；
+
+h) 根据最终Write Completion合同形成Attempt Result；
+
+i) 支持Retry时复用同一Payload；
+
+j) 在所有引用关闭后回收Payload。
+
+---
+
+## 9.11.2 Payload与Attempt分离
+
+Write中必须区分：
+
+```text id="cwy7dm"
+Payload
+    = Host提供的数据本体
+
+Attempt
+    = 使用该Payload执行一次Write
+
+Result
+    = 某次Attempt的执行结果
+```
+
+因此：
+
+```text id="eafehg"
+Payload
+!=
+Attempt
+!=
+Result
+```
+
+发生Retry时：
+
+```text id="oz864x"
+Payload保持不变
+Attempt重新建立
+```
+
+不重新向Host获取WDATA。
+
+---
+
+# 9.12 Write Payload设计
+
+## 9.12.1 Payload Reference
+
+HIF为Write建立稳定Payload Reference。
+
+它可以是：
+
+```text id="0n355m"
+Payload Slot
+```
+
+或者在存在真实Slot复用/Late Reference风险时采用：
+
+```text id="077ie5"
+Payload Slot + Generation
+```
+
+Generation不是默认强制字段。
+
+如果设计能够保证：
+
+```text id="6wevna"
+Payload Slot直到所有Attempt/PI引用关闭后才允许复用
+```
+
+则单Slot Identity即可满足功能正确性。
+
+---
+
+## 9.12.2 Payload内容
+
+Payload逻辑上保存：
+
+```text id="0phr9i"
+Valid / State
+Logical Transaction Reference
+
+Expected Extent
+Received Extent / Segment State
+
+Write Data
+Byte Mask
+Metadata
+Protection / Error
+```
+
+Attempt Identity不写入Payload Data Object本身。
+
+---
+
+## 9.12.3 Payload状态
+
+第一版可以使用：
+
+```text id="e9g7n8"
+FREE
+CAPTURING
+READY
+```
+
+如需要延迟回收，可增加：
+
+```text id="0grwwa"
+RETIRE_PENDING
+```
+
+但不是功能必选状态。
+
+状态数量由实际实现决定。
+
+---
+
+# 9.13 Payload Allocation及Capture
+
+## 9.13.1 Allocation
+
+Payload Allocation表示：
+
+> 已经为该Write Request建立稳定的数据存储对象。
+
+Allocation不能被解释为：
+
+```text id="uu03w9"
+Payload已经完整
+```
+
+---
+
+## 9.13.2 Allocation与First Capture
+
+第一版可以采用：
+
+```text id="611o33"
+Cycle N:
+Allocate
+
+Cycle N+1:
+First Capture
+```
+
+以简化Free/Allocate/Capture Same-cycle处理。
+
+但这不是架构合同。
+
+如果RTL能够安全处理：
+
+```text id="f1cy9w"
+Allocation
++
+First WDATA Capture
+```
+
+同周期发生，并且RAM语义和Identity均明确，则允许合并。
+
+---
+
+## 9.13.3 Capture
+
+Host WDATA只允许写入当前合法Payload。
+
+需要验证：
+
+```text id="m0b6kb"
+Payload Reference Match
+Segment / Position Legal
+Byte Mask Legal
+```
+
+如果存在多Lane Capture，同一Payload的Bitmap及Control State从统一Pre-state归约。
+
+---
+
+# 9.14 Payload READY及不可变性
+
+Payload Complete应根据当前Host/DDR数据布局证明要求的数据已经完整捕获。
+
+不能仅依赖：
+
+```text id="knelyu"
+last = 1
+```
+
+判断完整性，除非Host接口合同已经证明`last`本身足以表示所有Required Data都已接受。
+
+当Payload进入READY后：
+
+```text id="cz1sps"
+Data
+Mask
+Metadata
+```
+
+在其剩余生命周期内保持不变。
+
+Retry复用同一READY Payload。
+
+---
+
+# 9.15 Write Admission及Attempt
+
+Write进入WR Commit之前，应确认：
+
+```text id="f95omw"
+Payload READY
+AND
+Required PI / DFI Resource Available
+AND
+Timing / GS Conditions Pass
+```
+
+WR Commit时建立当前Write Attempt所需的最小状态。
+
+Attempt至少能够关联：
+
+```text id="h6om95"
+Logical Write
+Payload Reference
+Current Execution Attempt
+PI Join State
+```
+
+如果不存在并发Retry或Late Feedback风险，不要求额外增加复杂Attempt Generation。
+
+---
+
+# 9.16 PI Write Command/Data Join
+
+## 9.16.1 功能要求
+
+Write Command和对应Write Data可能经过不同内部路径，因此PI必须保证：
+
+```text id="cdrgbo"
+正确的WR Command
+```
+
+与：
+
+```text id="5obk4m"
+正确的Payload
+```
+
+形成同一次标准DFI Write操作。
+
+---
+
+## 9.16.2 Join方式
+
+Join不能仅依赖：
+
+```text id="t1drku"
+最近一条Write Command
++
+当前Payload
+```
+
+这种隐式关系。
+
+应使用足以唯一关联当前Write Attempt的内部Context。
+
+具体可以由：
+
+```text id="vxivdr"
+Attempt Reference
+Admission Order
+Payload Reference
+```
+
+或等价结构完成。
+
+只有真实Slot复用/Late Half风险存在时，才需要进一步增加Generation。
+
+---
+
+## 9.16.3 Join Capacity
+
+PI Join属于有限资源时，GS在WR Commit前必须确认容量。
+
+不能出现：
+
+```text id="oo9nzh"
+Write已经Commit
+但PI无法保存Command/Data关联
+```
+
+的情况。
+
+---
+
+# 9.17 标准DFI Write Data Path
+
+Write外部接口只使用最终Simplified DFI中保留的标准Write Data成员，例如：
+
+```text id="2y2dik"
+dfi_wrdata
+dfi_wrdata_en
+dfi_wrdata_mask
+
+Optional:
+dfi_wrdata_cs
+```
+
+Write Command则通过标准DFI Command/Address路径发送。
+
+PI负责满足Command与Write Data之间的标准DFI时序关系。
+
+不得增加：
+
+```text id="g6j68w"
+write_accept
+write_drain
+write_done
+write_attempt_id
+payload_handle
+```
+
+等私有DFI端口。
+
+---
+
+# 9.18 Write Physical Progress与Completion
+
+## 9.18.1 内部逻辑边界
+
+从控制器角度，需要区分：
+
+```text id="ypdr8y"
+DFI Commit
+DFI Presentation
+不可取消边界
+Device-visible / Physical Progress
+Attempt Completion
+```
+
+但这些边界并不意味着标准DFI必须分别提供一个外部信号。
+
+---
+
+## 9.18.2 Physical Carrier
+
+最终Write Completion应严格依据：
+
+```text id="b8y058"
+所采用DFI版本
++
+PHY ICD
++
+DDR6命令/数据时序
+```
+
+所能提供的有效证据建立。
+
+如果标准DFI/PHY没有独立：
+
+```text id="2q0bm6"
+Accept
+Drain
+Final Status
+```
+
+Carrier，则MC不能自行虚构这些DFI接口。
+
+相应内部状态也只保留实际能够被证明的边界。
+
+---
+
+## 9.18.3 Visibility不确定
+
+在Write已经进入不可取消或Physical Visibility未知区域后，如果发生Timeout或异常，不能直接假定：
+
+```text id="nzse8i"
+Write没有发生
+```
+
+也不能无条件建立Fresh Retry。
+
+该场景进入第10章Unknown Visibility / Retry Policy处理。
+
+---
+
+# 9.19 Write Result
+
+Write Attempt Result的形成条件取决于最终签署的Write Completion合同。
+
+结果可分为：
+
+```text id="2pjfs4"
+Success
+Retryable Failure
+Terminal Failure
+Unknown / Recovery Required
+```
+
+具体Disposition由第10章Retry Policy定义。
+
+如果Product/PHY无法证明Device-visible Write是否发生，则不得把该Attempt直接分类为安全Retryable。
+
+默认单Transaction模式下，Write Result归属Logical Transaction。
+
+只有第4章Parent/Child扩展启用时，才进一步形成Child Result。
+
+---
+
+# 9.20 Result Transfer与资源释放
+
+必须区分：
+
+```text id="uyykfc"
+Write Result Transfer
+Attempt State Release
+Payload Free
+```
+
+三者不是同一概念。
+
+但本章不规定它们必须强制分三个时钟周期执行。
+
+如果同一周期能够从Pre-state证明：
+
+```text id="9qwwqn"
+Result已经稳定转移
+AND
+No Attempt Reference
+AND
+No PI Reference
+AND
+No Retry Reference
+AND
+No Future Feedback
+```
+
+则允许合并释放。
+
+第一版可以采用分阶段释放降低RTL复杂度。
+
+---
+
+## 9.20.1 Retryable Attempt
+
+如果Attempt允许安全Retry：
+
+```text id="3jnh3p"
+Payload保持READY
+Payload内容保持不变
+Old Attempt关闭
+Fresh Attempt随后重新Admission
+```
+
+Payload不会进入Free状态。
+
+---
+
+## 9.20.2 Terminal Write
+
+只有在：
+
+```text id="ozcsb8"
+Logical Write已经Terminal
+AND
+不存在Current Attempt
+AND
+PI不再引用Payload
+AND
+Retry不会再次使用Payload
+AND
+Recovery不再引用Payload
+```
+
+后，Payload才允许Free。
+
+---
+
+## 9.20.3 Host Response与Payload Free
+
+Host侧Write Response和Payload内部回收属于不同Owner。
+
+因此：
+
+```text id="y69ni5"
+Host Write Response Transfer
+!=
+Payload Free
+```
+
+但如果设计证明两者同周期条件同时成立，可以同周期执行。
+
+---
+
+# 9.21 Write Retry
+
+Write Retry继续复用原Payload：
+
+```text id="hrzkfm"
+Attempt 1
+   │
+   ▼
+Retryable Result
+   │
+   ▼
+Fence Old Attempt
+   │
+   ▼
+No-old-feedback / Visibility Proof
+   │
+   ▼
+Fresh Attempt Authorized
+   │
+   ▼
+Attempt 2
+   │
+   └── Same Payload
+```
+
+Fresh Attempt必须重新经过：
+
+```text id="m76rc1"
+CC / OS / GS
+```
+
+以及新的DFI Commit。
+
+Retry不得直接从Write Manager绕过Scheduler重新发WR。
+
+---
+
+# 9.22 Backpressure
+
+## 9.22.1 Read
+
+Expected/Assembly资源Full只阻止：
+
+```text id="z6ywtq"
+Fresh Read Admission
+```
+
+不得阻止：
+
+```text id="b87zrv"
+已有DFI Return
+Assembly Progress
+Result Transfer
+Resource Reclaim
+```
+
+否则可能形成Full状态无法自行解除的死锁。
+
+---
+
+## 9.22.2 Write
+
+Payload Store Full只阻止：
+
+```text id="hyoh8c"
+Fresh Payload Allocation
+```
+
+不得阻止：
+
+```text id="v69wyu"
+已分配Payload继续Capture
+已Commit Write继续下发
+Result Progress
+Payload Reclaim
+```
+
+---
+
+## 9.22.3 不可反压Return
+
+如果目标DFI/PHY Read Return不能被MC反压，则在RD Commit前必须预留能够覆盖最坏返回行为的接收容量。
+
+其具体Capacity Bound依赖最终PHY Return合同。
+
+---
+
+# 9.23 Same-cycle处理
+
+Read可能出现：
+
+```text id="dpfcqt"
+Expected建立 + Return
+Multiple Return Lanes
+Result形成 + Fresh Return
+Old Reclaim + Fresh Allocation
+Retry Fence + Old Return
+```
+
+Write可能出现：
+
+```text id="4mxvum"
+Payload Free + Fresh Allocation
+Multiple WDATA Capture
+WR Commit + Payload Read
+Result Transfer + Attempt Release
+Old Feedback + Fresh Retry
+```
+
+所有Same-cycle更新必须基于统一Pre-state归约。
+
+本章不强制：
+
+```text id="9flcf9"
+Old Free和Fresh Allocation绝对不能同拍
+```
+
+也不强制必须支持。
+
+第一版如果为了简化Identity和RAM行为，可以采用：
+
+```text id="9epdfe"
+Cycle N Free
+Cycle N+1 Reuse
+```
+
+后续只有在性能分析证明必要时，再增加Same-cycle Reuse。
+
+---
+
+# 9.24 Reset及Late Feedback
+
+Destructive Reset后，旧数据对象应失去Fresh Session的Functional Matchability。
+
+至少应使：
+
+```text id="vo3spn"
+Old Expected不可匹配Fresh Return
+Old Assembly不可被Fresh Result使用
+Old PI Correlation失效
+Old Write Attempt不可继续更新Fresh State
+Old Result Hold失效或按Reset合同处理
+```
+
+Data RAM本体不要求全部清零。
+
+真正需要清除或隔离的是：
+
+```text id="1dy6sk"
+Valid
+Current Reference
+Correlation
+Functional Write Enable
+```
+
+Reset前晚到的：
+
+```text id="3k0e67"
+dfi_rddata_valid
+Read Data
+Write相关反馈
+```
+
+不得写入Fresh Session状态。
+
+No-old-return及No-old-feedback证明在第10章统一定义。
+
+---
+
+# 9.25 ALPG与数据通路
+
+ALPG和Normal MC共用标准DFI Physical Data Path。
+
+Write方向：
+
+```text id="zdaj8z"
+Normal Write Data ----┐
+                      ├── Controlled MUX
+ALPG Write Data -------┘
+                              │
+                              ▼
+                         Standard DFI
+```
+
+Read方向在PI Return后，根据当前Ownership明确分流：
+
+```text id="55s09o"
+DFI Read Return
+      │
+      ▼
+PI Return Path
+   /          \
+Normal       ALPG
+Read         Checker
+```
+
+ALPG Takeover前Normal MC必须完成规定的Quiesce及Drain。
+
+ALPG Return不得写入Normal Read Expected/Assembly。
+
+---
+
+# 9.26 主要接口
+
+**表9-1 Read/Write数据通路主要逻辑接口**
+
+| 序号 | 接口 | 主要内容 | 要求 |
+|---|---|---|---|
+| 1 | GS → Read | Logical Read、Attempt、Required Layout | Commit前确认资源 |
+| 2 | PI → Read | Internal Correlation Result | 不映射为私有DFI Tag |
+| 3 | PHY/DFI → PI | `dfi_rddata_valid`、`dfi_rddata`等 | 标准DFI |
+| 4 | PI → Read Assembly | Logical Read Reference、Position、Data、Status | Correlation成功才产生WE |
+| 5 | Read → HIF | Stable Read Result | Backpressure期间稳定 |
+| 6 | HIF → Payload | Allocation及WDATA | 使用稳定Payload Reference |
+| 7 | Payload → GS/PI | READY、Data Reference | READY后Payload不可变 |
+| 8 | GS → Write | Attempt建立、Payload Reference | Commit前资源确认 |
+| 9 | PI → DFI | `dfi_wrdata`、`dfi_wrdata_en`、Mask等 | 标准DFI |
+| 10 | Write → HIF | Write Result | Completion条件由正式合同确定 |
+| 11 | Retry Controller ↔ Read/Write | Fence、Permit、Old Feedback状态 | Fresh Attempt前关闭旧风险 |
+| 12 | Resource Owner → GS | Capacity / Availability | Full仅阻Fresh工作 |
+
+---
+
+# 9.27 主要内部状态
+
+**表9-2 数据通路主要逻辑对象**
+
+| 对象 | 主要内容 | 创建时点 | 回收条件 |
+|---|---|---|---|
+| Read Expected | Logical Read、Attempt、Correlation Ref | RD Commit | Old Return风险及引用关闭 |
+| Read Assembly | Data、Mask、Status、Progress | RD Commit | Result及Return引用关闭 |
+| PI Read Journal | Issue→Logical Read映射 | RD Commit/Issue | Return关联关闭 |
+| Read Result Hold | Data、Status、Logical Identity | Read Terminal | HIF接收 |
+| Write Payload | Data、Mask、Metadata | Host Write Allocation | Logical Write完成且无引用 |
+| Write Attempt | Payload Ref、执行状态 | WR Commit | Attempt关闭 |
+| PI Write Join | Command与Payload关联 | WR Commit | DFI Presentation/引用关闭 |
+| Write Result Hold | Status、Disposition | Attempt Terminal | HIF接收 |
+
+Generation、Version等仅在对应对象存在真实复用/迟到风险时增加，不作为表中所有对象的默认字段。
+
+---
+
+# 9.28 典型流程
+
+## 9.28.1 Normal Read
+
+```text id="p0k9p9"
+Read Transaction Eligible
+      │
+      ▼
+CC / OS
+      │
+      ▼
+GS检查Read资源
+      │
+      ▼
+RD Commit
+      │
+      ├── Expected建立
+      ├── Assembly建立
+      └── PI Correlation建立
+      │
+      ▼
+dfi_rddata_en
+      │
+      ▼
+PHY
+      │
+      ▼
+dfi_rddata_valid / dfi_rddata
+      │
+      ▼
+PI Internal Correlation
+      │
+      ▼
+Assembly
+      │
+      ▼
+Read Terminal
+      │
+      ▼
+Result Hold
+      │
+      ▼
+HIF
+      │
+      ▼
+Safe Reclaim
+```
+
+---
+
+## 9.28.2 Normal Write
+
+```text id="45gh19"
+Host Write
+      │
+      ▼
+Payload Allocation / Capture
+      │
+      ▼
+Payload READY
+      │
+      ▼
+TE / CC / OS
+      │
+      ▼
+GS Commit
+      │
+      ▼
+PI Command/Data Join
+      │
+      ▼
+Standard DFI Command + WDATA
+      │
+      ▼
+PHY / DRAM
+      │
+      ▼
+Signed Completion Evidence
+      │
+      ▼
+Write Attempt Result
+      │
+      ▼
+HIF
+      │
+      ├── Retry -> Same Payload
+      │
+      └── Terminal -> Safe Payload Free
+```
+
+---
+
+# 9.29 DDR5继承与DDR6修改关系
+
+**表9-3 数据通路演进关系**
+
+| DDR5设计方向 | DDR6处理 | 收敛后的处理原则 |
+|---|---|---|
+| Read Tracking | KEEP/MODIFY | 保留思想，具体donor结构继续实读 |
+| Read Datapath | KEEP/MODIFY | ECC/CRC/Data处理优先复用 |
+| Read Logical ID | KEEP/MODIFY | 与Attempt Physical Correlation分离 |
+| Read Physical Tag外传 | NOT USED | Correlation留在PI内部 |
+| Expected / Assembly | LOGICAL SEPARATION | 功能分离，物理Storage可合并 |
+| 固定ARM FSM | CONDITIONAL | 只有Correlation晚于Allocation时需要 |
+| Read Complete立即Free | MODIFY | 等Old Return/引用关闭 |
+| WDATA RAM | KEEP/MODIFY | Payload Datapath优先复用 |
+| Payload Handle | KEEP/MODIFY | Stable Reference；Generation按风险启用 |
+| Payload与Attempt耦合 | REPLACE | Payload固定，Attempt独立 |
+| Allocation与First Capture必须分拍 | IMPLEMENTATION CHOICE | 第一版可分拍，安全时允许合并 |
+| Command/Data隐式Join | REPLACE | PI内部Exact Attempt Join |
+| 自定义Write Accept/Drain DFI接口 | NOT USED | 只使用标准DFI成员 |
+| Write Completion | OPEN PHYSICAL CONTRACT | 依据DFI/PHY正式证据 |
+| Result Transfer立即Free | MODIFY | 按No-reference条件Reclaim |
+| Retry重新抓WDATA | PROHIBITED | Retry复用Immutable Payload |
+
+由于Read、Write和PI尚未完成与BSM/OS/GS同等级的donor E2实读，表中KEEP/MODIFY表示当前设计继承方向，不表示具体RTL细节已经完成源码级冻结。
+
+---
+
+# 9.30 本章收敛结论及待闭合项
+
+经预评审，本章以下内容作为当前设计结论：
+
+a) Read Logical Identity与Physical Attempt Correlation分离；
+
+b) Read Correlation全部位于PI/Read内部，不形成私有DFI Tag；
+
+c) 标准DFI Read Path使用`dfi_rddata_en`、`dfi_rddata_valid`及`dfi_rddata`等最终保留成员；
+
+d) 如果DFI Return没有标准Tag，则依赖签署的Ordered/Fixed-route关系和PI Issue Journal恢复Logical Read；
+
+e) Expected负责“Return属于谁”，Assembly负责“收到什么”；
+
+f) Expected/Assembly逻辑职责分离，但不强制使用两张独立RAM；
+
+g) 显式ARM/MATCHABLE机制只在PI Correlation不能在Commit时同步建立时启用；
+
+h) Generation只在真实Slot复用/Late Return风险存在时使用；
+
+i) RD Commit前必须确认合法Return存在接收资源；
+
+j) Payload与Write Attempt明确分离；
+
+k) READY Payload保持不可变，Retry复用同一Payload；
+
+l) Write Command和Payload在PI内部进行明确关联，不依赖隐式先后顺序；
+
+m) Write Data只使用标准DFI `dfi_wrdata`、`dfi_wrdata_en`、Mask等成员；
+
+n) 不新增`write_accept`、`write_drain`、`write_done`等私有DFI接口；
+
+o) Write Physical Completion必须由最终DFI/PHY合同证明；
+
+p) Result Transfer与内部资源Reclaim语义分离，但不强制物理上分多个周期；
+
+q) Full状态只能阻止Fresh Allocation/Admission，不得阻止已有Transaction继续Progress；
+
+r) Same-cycle Free/Reuse不是第一版必选能力；
+
+s) Reset清除Functional Matchability，不要求清零Data RAM；
+
+t) Read/Write/PI donor细节仍需继续实读，当前不扩大解释为E2已关闭。
+
+**表9-4 本章待闭合项**
+
+| 类别 | 待闭合内容 | 关闭方式 |
+|---|---|---|
+| Read Return | Ordered/Fixed-route或标准Correlation合同 | DFI/PHY ICD |
+| Earliest Return | RD Issue至最早`dfi_rddata_valid`边界 | DFI/PHY ICD |
+| Read Layout | 1:8 Phase与Logical Position映射 | DDR6/PHY |
+| Read Capacity | Expected、Assembly、Ingress Depth | Traffic/FPGA评估 |
+| Read Lane | 最大并发Return数量 | DFI/PHY |
+| Read Protection | ECC/CRC/DBI/Metadata最终布局 | Product/DDR6 |
+| No-old-return | Old DFI Return何时保证消失 | 第10章 + PHY ICD |
+| Payload Capacity | WDATA Depth及RAM组织 | Host Traffic/FPGA |
+| WDATA Lane | Host Capture及DFI输出带宽 | Host/DFI |
+| Write Join | PI Join深度及Pipeline | RTL/P&R |
+| Write Visibility | 不可取消/Device-visible边界 | DFI/PHY ICD |
+| Write Completion | 可用于Success/Retry判断的正式证据 | DFI/PHY ICD |
+| Retry Policy | Device-visible Write是否允许Retry | Product Policy/第10章 |
+| Partial Write | Mask/Metadata/RMW最终布局 | DDR6/Product |
+| ALPG Data Path | Normal/ALPG数据MUX及Return分流位置 | Integration |
+| Donor Audit | PI/Read/Write实际RTL结构及可复用模块 | DDR5 donor实读 |
+
+上述开放项主要影响Physical Correlation、Write Completion、缓存容量及具体RTL组织，不重新打开“Read内部Correlation、Expected/Assembly职责、Payload/Attempt分离以及标准DFI数据接口”这些已经收敛的设计边界。
