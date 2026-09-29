@@ -1,0 +1,918 @@
+# 2 DDR6 MC总体设计
+
+## 2.1 设计目标
+
+DDR6 Memory Controller（MC）基于现有DDR5 MC架构进行演进，在尽可能继承已有模块职责、数据通路和控制机制的基础上，完成DDR6协议、资源组织、Timing、维护机制以及PHY接口变化所需的功能调整。
+
+本设计不以重新构建完整MC为目标。对于与DDR6变化不存在直接冲突的现有功能，应优先保留；对于受DDR6协议或目标FPGA平台影响的功能，应优先在现有模块职责范围内进行修改和扩展；仅当现有模块无法合理承载新增功能时，才新增独立设计对象或功能模块。
+
+总体设计满足以下原则：
+
+a) 保持Host请求处理、地址转换、事务管理、命令构造、调度、准入及PHY接口的基本层次关系；
+
+b) 根据DDR6要求调整地址及资源组织、Command Encoding、Timing、Refresh/RFM和模式控制；
+
+c) 建立明确的Transaction、Attempt及资源复用边界，避免Retry、Late Feedback和Slot Reuse造成错误匹配；
+
+d) 明确Selection、Admission、DFI Commit、Registered-equivalent Event、Result和Resource Reclaim之间的生命周期边界；
+
+e) MC与PHY之间采用标准DDR PHY Interface（DFI）协议的项目所需子集，不新增私有信号替代标准DFI接口；
+
+f) 对尚未通过DDR6规范、PHY接口控制文件或Product配置关闭的Positive Path保持Fail Closed；
+
+g) 设计应满足目标FPGA平台的综合、布局布线、时序收敛和硬件验证要求。
+
+当前方案保持：
+
+```text
+ENGINEERING_CANDIDATE
+```
+
+状态，不表示Architecture Frozen或Production Ready。
+
+---
+
+## 2.2 总体设计原则
+
+### 2.2.1 DDR5架构继承优先
+
+DDR6 MC采用现有DDR5 MC演进路线。设计首先确认DDR5 donor已有职责和实现方式，再分析DDR6变化对其产生的影响，并按照KEEP、MODIFY、REPLACE或NEW确定处理方式。
+
+现有HIF、IH、TE、CC、OS、GS、PI以及Read、Write、Refresh、MR和Power等主要功能层级原则上继续保留。能够通过增加字段、状态、计数、比较逻辑或局部流水实现的变化，不单独增加新的顶层功能模块。
+
+### 2.2.2 单一Truth Owner
+
+同一类Authoritative State只允许由一个功能Owner维护。
+
+主要职责划分如下：
+
+a) HIF负责Host请求接收、Logical Transaction、Host Ordering和最终响应；
+
+b) Parent/Child仅在真实Host拆分需求得到donor或产品证据后启用，不作为默认硬件层级；
+
+c) IH负责System Physical Address解析、合法性检查和Canonical Resource生成；
+
+d) TE负责Pending Transaction及Dependency；
+
+e) CC负责根据请求及当前状态构造Command Candidate；
+
+f) OS负责普通Host Candidate的分类选择；
+
+g) GS负责Normal及Maintenance Candidate的最终资源准入；
+
+h) PI负责MC内部命令到标准DFI接口之间的寄存、组织以及反馈关联；
+
+i) BSM只保存Bank State Truth；
+
+j) OpenRow只保存当前打开Row Truth；
+
+k) Timing Engine只保存Timing History、Rule及必要的Future Reservation；
+
+l) Read和Write模块分别维护各自的数据和结果生命周期。
+
+逻辑Owner的独立不等于必须使用独立物理RAM。具体Storage实现由容量、端口、Fmax及资源利用决定。
+
+### 2.2.3 生命周期边界明确
+
+MC内部应明确区分：
+
+```text
+Selection
+    !=
+Admission
+    !=
+DFI Commit
+    !=
+Registered-equivalent Event
+    !=
+Timing / Service Complete
+    !=
+Result Transfer
+    !=
+Resource Reclaim
+```
+
+任何模块均不得用前一阶段事件替代本模块真正需要的完成条件。
+
+### 2.2.4 最小必要复杂度
+
+新增Identity、Generation、Bitmap、Reservation或状态必须能够对应明确的ABA、Late Feedback、并发或资源复用风险。
+
+没有实际风险、donor证据或DDR6协议需求支持的通用化结构，不作为Production设计默认引入。
+
+---
+
+## 2.3 总体架构
+
+DDR6 MC由Normal MC Path、Maintenance Service Path、ALPG Path以及DFI/PHY Interface Path组成。
+
+Normal MC主处理路径为：
+
+```text
+Host
+ │
+ ▼
+HIF
+ │
+ ▼
+IH
+ │
+ ▼
+TE
+ │
+ ▼
+CC
+ │
+ ▼
+OS
+ │
+ ▼
+GS
+ │
+ ▼
+PI / DFI Adapter
+ │
+ ▼
+Simplified DFI 1:8
+ │
+ ▼
+PHY / TC
+ │
+ ▼
+DDR6 Device
+```
+
+其中：
+
+a) HIF接收Host请求并建立Logical Transaction；
+
+b) IH将System Physical Address转换为DDR6 Canonical Resource；
+
+c) TE保存尚未完成的请求及依赖关系；
+
+d) CC根据BSM、OpenRow及Timing Query形成下一条结构上合法的Command Candidate；
+
+e) OS按照Command Class、Priority及当前调度条件形成普通Host Class Head；
+
+f) GS综合Normal Candidate、Maintenance Candidate、Timing、资源容量及当前Context完成最终Admission；
+
+g) PI将已经准入的Command组织为标准DFI要求的Command/Address和Data接口时序，并管理MC内部执行关联；
+
+h) PHY完成DFI到DDR6 Pin-level Physical Timing的转换。
+
+Refresh、RFM、MR、Power、Training和Recovery等操作不通过普通Host OS形成最终调度结果，而分别形成Side-plane Service Candidate，并统一在GS进入最终准入路径。
+
+---
+
+## 2.4 地址及事务处理路径
+
+Normal MC以System Physical Address作为上游地址输入。
+
+地址处理分为两个阶段：
+
+```text
+System Physical Address
+        │
+        ▼
+Direct Bit-level Mapping
+        │
+        ├── Channel
+        ├── Logical Bank
+        ├── Row
+        └── Column
+        │
+        ▼
+Geometry Canonicalization
+        │
+        ▼
+Canonical DDR6 Resource
+```
+
+IH负责完成Mapping、Geometry转换以及合法性检查。
+
+只有地址范围、Config Version和Geometry均合法的请求，才能建立Canonical Descriptor并进入TE。
+
+ALPG不使用Normal MC的System Physical Address Mapper，而直接采用Rank、PSD、BG、BA、Row和Column等DDR Resource Semantic产生测试访问。
+
+---
+
+## 2.5 Bank、OpenRow及Timing总体关系
+
+DDR6 MC将Bank State、Open Row和Timing Eligibility分离为三个独立Truth：
+
+```text
+BSM
+    -> Bank当前事实
+
+OpenRow
+    -> 当前打开的Row
+
+Timing Engine
+    -> 命令之间的时间合法性
+```
+
+BSM收敛为：
+
+```text
+INACCESSIBLE
+CLOSED
+OPEN
+ERROR_CONTAIN
+```
+
+不再通过`CLOSED_PENDING`、`ACTIVATING`或其他Timing中间状态复制Timing Engine已经拥有的时间信息。
+
+例如PRE执行后的处理为：
+
+```text
+PRE Registered-equivalent Event
+        │
+        ├── BSM -> CLOSED
+        │
+        ├── OpenRow -> Invalid
+        │
+        └── Timing记录PRE occurrence
+                    │
+                    ▼
+                 tRP floor
+                    │
+                    ▼
+             Fresh ACT Allowed
+```
+
+因此：
+
+```text
+Bank Closed
+```
+
+只说明Bank当前不存在Open Row，不等于：
+
+```text
+ACT Timing Ready
+```
+
+ACT是否允许继续由Timing Engine统一判断。
+
+---
+
+## 2.6 命令构造、选择与准入
+
+CC、OS和GS继续保持三层职责：
+
+```text
+CC
+ -> 构造“下一条应该是什么”
+
+OS
+ -> 选择普通Host候选
+
+GS
+ -> 判断“当前能否真正准入”
+```
+
+CC只负责结构性Command Construction，不重新拥有Timing或OpenRow Truth。
+
+OS保持Multi-Class Selection，不将ACT、PRE、RD、WR等不同类别压缩为一个永久性的Global Winner。
+
+GS是最终Admission Point，应统一检查：
+
+a) BSM状态；
+
+b) OpenRow及Row Hit/Row Miss；
+
+c) Timing Query；
+
+d) Config/Geometry Context；
+
+e) Command Phase及Occupancy；
+
+f) Read/Write相关资源；
+
+g) Maintenance Deadline及Barrier；
+
+h) PI/DFI输出流水当前可接收条件。
+
+只有上述条件同时满足时，Command才能形成MC内部的最终Commit。
+
+---
+
+## 2.7 1:8 Simplified DFI接口原则
+
+### 2.7.1 Simplified DFI定义
+
+MC与PHY之间采用：
+
+```text
+1:8 Simplified DFI
+```
+
+本文中的“Simplified DFI”定义为：
+
+> 基于项目采用的标准DFI协议，仅保留DDR6 MC和目标PHY实际需要的标准DFI功能及信号，删除未使用的可选接口。
+
+Simplified DFI不是重新定义一套私有MC/PHY协议。
+
+因此MC↔PHY外部接口不得为了满足内部设计方便而自行增加：
+
+```text
+cmd_ready
+cmd_accept
+cmd_launch
+cmd_actual
+reserve_token
+physical_return_tag
+rd_token
+flush_done
+no_old_return_done
+session_epoch
+```
+
+等非标准DFI端口。
+
+上述名称可以作为MC内部状态、逻辑事件或验证概念存在，但不得作为“DFI接口信号”使用。
+
+如果后续确有标准DFI之外的接口需求，应作为独立的`NON_DFI_SIDEBAND`进行接口评审，不纳入Simplified DFI定义。
+
+### 2.7.2 DFI功能分类
+
+当前设计按照功能将DFI接口分为以下几类：
+
+| 接口类别 | 设计处理 |
+|---|---|
+| Command/Address | 保留DDR6命令下发所需标准DFI成员 |
+| Write Data | 保留Write Data、Enable、Mask等项目所需标准DFI成员 |
+| Read Data | 保留Read Enable、Read Data及Read Valid等标准DFI成员 |
+| Initialization | 保留PHY初始化及MC重新开放所需标准DFI生命周期接口 |
+| Update/Power/Frequency | 根据FSP、Power及目标PHY能力按Feature裁剪 |
+| ALERT | `dfi_alert_n`作为PHY→MC异常/维护反馈保留 |
+| 未使用标准DFI Feature | 从当前Simplified DFI Build中裁剪 |
+
+具体采用哪些DFI成员、各成员宽度以及1:8展开方式，以最终采用的DFI版本和PHY接口控制文件为准。
+
+DDR5 donor只能作为已有DFI接口组织和工程实现的参考，不能直接用于推定DDR6接口位宽和编码。
+
+---
+
+## 2.8 1:8 Phase组织
+
+1:8表示MC侧一个DFI接口周期对应8个有序逻辑Phase：
+
+```text
+P0 P1 P2 P3 P4 P5 P6 P7
+```
+
+它属于MC/PHY接口的逻辑频率关系，与PHY内部SERDES Ratio、TC内部实现比例以及DQ Data Rate属于不同层次。
+
+MC内部Command Placement描述至少包括：
+
+```text
+Issue Word
+Start Phase
+Span
+Continuation
+```
+
+其中Start Phase必须满足Timing返回的Legal Phase约束。
+
+对于跨DFI Word的Command，如果目标DFI/PHY实现允许，应明确Continuation关系；如果不允许，则必须在Command Span/Placement定义中限制合法Start Phase。
+
+1:8并不表示：
+
+```text
+每个Word一定只能放一条Command
+```
+
+也不表示：
+
+```text
+每个Word一定能放八条Command
+```
+
+具体能够同时承载多少条Command，应依据：
+
+a) Command Encoding；
+
+b) Command Span；
+
+c) Phase Occupancy；
+
+d) CA/Command Domain；
+
+e) Target Conflict；
+
+f) Data Schedule；
+
+g) PHY支持能力；
+
+综合确定。
+
+因此GS/PI设计保持可扩展的Phase Packing能力，不在总体设计阶段将Production结构固化为单Command Hold。
+
+---
+
+## 2.9 GS至DFI的Commit边界
+
+GS完成Admission之前，应确认该Command所需全部MC内部资源及DFI输出条件均已满足。
+
+Commit定义为：
+
+> GS和PI已经完成Timing、Phase Occupancy、Read/Write资源、Context以及当前DFI输出流水条件检查，并将对应Command Word不可逆地提交到标准DFI输出流水线的时刻。
+
+其关系为：
+
+```text
+Candidate
+    │
+    ▼
+OS Selection
+    │
+    ▼
+GS Resource Prepare
+    │
+    ▼
+PI / DFI Output Condition Check
+    │
+    ▼
+MC Internal Commit
+    │
+    ▼
+Standard DFI Presentation
+```
+
+此前设计中的Issue Reservation或Reservation Token可以继续作为GS/PI内部Storage和状态实现方式，但不要求PHY提供额外的：
+
+```text
+reserve_token
+cmd_ready
+cmd_accept
+```
+
+等私有per-command接口。
+
+Commit以后，PI不得因为MC内部普通拥塞重新选择Command Phase或重新解释Selected Tick。
+
+如果目标PHY无法提供与当前DFI输出模型相匹配的确定执行关系，则该问题应通过DFI/PHY接口定义重新关闭，而不是通过增加私有命令握手信号解决。
+
+---
+
+## 2.10 Timing Reservation与DFI Commit
+
+Timing Reservation继续用于处理已经Commit、但其对应时间影响尚未完全进入Committed Timing History的Command。
+
+Reservation的建立条件为：
+
+```text
+GS Resources Prepared
+AND
+PI / DFI Output Conditions Satisfied
+AND
+MC Internal Commit
+```
+
+而不是：
+
+```text
+OS Selected
+```
+
+或普通Candidate产生。
+
+后续Timing Query需要同时考虑：
+
+```text
+Committed Timing History
++
+Live Timing Reservation
+```
+
+避免多个尚在DFI Pipeline中的已Commit Command在未来时间上发生冲突。
+
+Reservation只属于MC内部Timing实现，不映射为PHY侧DFI信号。
+
+---
+
+## 2.11 Registered-equivalent Event
+
+MC内部仍需要一个能够驱动Committed DRAM State更新的事件。
+
+本文统一称为：
+
+```text
+Registered-equivalent Event
+```
+
+在内部RTL描述中可使用：
+
+```text
+cmd_actual_internal
+```
+
+等逻辑名称，但它不是DFI外部接口。
+
+其形成关系为：
+
+```text
+Standard DFI Presentation
+        │
+        ▼
+Signed PI / PHY Timing Relation
+        │
+        ▼
+Registered-equivalent Event
+        │
+        ▼
+MC State Update
+```
+
+该事件应足以证明对应Command已经达到能够安全更新MC中DRAM Committed Truth的执行边界。
+
+它可以驱动：
+
+```text
+BSM
+OpenRow
+Timing History
+ACT Lifetime
+Refresh/RFM Accounting
+Read/Write Physical Progress
+```
+
+但PI Presentation本身不得直接替代Registered-equivalent Event。
+
+Presentation与该事件之间的精确Fixed/Finite Mapping，需要由最终PHY/DFI接口合同关闭。
+
+---
+
+## 2.12 Read接口及返回关联
+
+DFI Read Path采用标准DFI Read Data机制。
+
+逻辑关系为：
+
+```text
+MC
+ │
+ └── Read Command / Read Data Enable
+                  │
+                  ▼
+                 PHY
+                  │
+                  └── Read Data + Read Valid
+                              │
+                              ▼
+                             MC
+```
+
+Logical Read Identity、Attempt、Expected Handle及Generation均属于MC内部Tracking信息，不作为自定义Tag通过DFI传递。
+
+PI应在内部维护Command Issue与Read Return之间的Correlation Journal。
+
+Read Return关联应优先基于以下一种已签署机制：
+
+a) PHY保证标准DFI Read Return按照固定且可证明的Ordering/Route返回，PI依据Issue Journal恢复Logical Read Identity；
+
+或：
+
+b) 所采用DFI版本提供标准Correlation机制，严格采用该机制。
+
+如果无法证明标准DFI返回能够唯一恢复当前Read对象，则Read Positive Path保持Gate状态，不通过增加私有`physical_return_tag`或`rd_token`接口解决。
+
+Retry情况下：
+
+```text
+Logical Read Identity
+```
+
+可以保持稳定，但每次Attempt应在MC内部具有独立Correlation Context，以防止Old Return错误作用于Fresh Attempt。
+
+---
+
+## 2.13 Write接口
+
+Write Path同样采用标准DFI Write Data接口。
+
+Write内部继续区分：
+
+```text
+Logical Write
+Payload
+Attempt
+DFI Presentation
+Physical Progress
+Result
+Reclaim
+```
+
+Write Payload由MC内部Payload Handle管理，其Identity不得作为自定义DFI Handle传递给PHY。
+
+PI负责根据内部Journal和调度关系保证：
+
+```text
+Write Command
+```
+
+与：
+
+```text
+DFI Write Data
+```
+
+在标准DFI要求的时间关系内正确对齐。
+
+Write Command提交、Write Data提交和内部Result/Resource Release仍属于不同生命周期边界。
+
+如果MC需要判断Write已经越过不可取消边界、数据已经Drain或最终状态已经稳定，相应证据必须来自标准DFI规定的机制以及PHY接口合同，不增加私有`write_done`、`drain_done`等DFI端口。
+
+---
+
+## 2.14 ALERT通路
+
+DDR6 MC保留标准DFI：
+
+```text
+PHY -> MC : dfi_alert_n
+```
+
+作为独立异常及维护反馈通道。
+
+`dfi_alert_n`进入MC后，应形成独立的Alert Event，并提供给相关Timing、Maintenance和Recovery逻辑。
+
+总体路径为：
+
+```text
+dfi_alert_n
+     │
+     ▼
+Capture / Synchronization
+     │
+     ▼
+Alert Event + Occurrence Time
+     │
+     ├── Timing / ABO Deadline
+     ├── PRAC / RFM / Recovery
+     ├── GS Maintenance Feasibility
+     └── Error / Trace
+```
+
+ALERT不得与一般Debug或内部Fatal Summary合并。
+
+MC可以基于ALERT及其他错误状态形成内部Error/Fatal判断，但不得用自定义`phy_fatal`接口替代标准`dfi_alert_n`。
+
+---
+
+## 2.15 Reset、Initialization与Session边界
+
+Destructive Reset仍采用Session隔离思想，但Session Epoch属于MC内部状态，不作为DFI信号输出。
+
+总体生命周期为：
+
+```text
+Block New Request
+        │
+        ▼
+Host / HIF Boundary
+        │
+        ▼
+MC Internal Epoch Update
+        │
+        ▼
+MC Local State Invalidate
+        │
+        ▼
+DFI Reset / Init Lifecycle
+        │
+        ▼
+PHY / DRAM Re-initialization
+        │
+        ▼
+Required MR / Training
+        │
+        ▼
+Config / Geometry / Timing Ready
+        │
+        ▼
+Bank State Known
+        │
+        ▼
+Maintenance State Valid
+        │
+        ▼
+mc_ready
+```
+
+MC不得通过增加：
+
+```text
+flush_req
+flush_done
+no_old_return_done
+session_epoch
+```
+
+等私有DFI端口实现Session管理。
+
+Old Feedback是否已经完全失效，应由标准DFI Reset/Initialization/Update生命周期以及PHY接口定义共同证明。
+
+在此之前：
+
+```text
+Reset Deassert
+!=
+mc_ready
+```
+
+Old Session的Read Data、ALERT或其他晚到反馈不得对Fresh Session产生功能性写入。
+
+---
+
+## 2.16 ALPG通路
+
+ALPG保持独立于Normal MC Frontend：
+
+```text
+ALPG不经过：
+HIF
+IH
+TE
+Normal OS
+```
+
+其Command在DFI Command Issue前与Normal MC进行受控选择：
+
+```text
+Normal MC
+    │
+    ├─────────────┐
+                  ▼
+             Command MUX
+                  │
+                  ▼
+          Standard DFI Issue
+                  ▲
+                  │
+ALPG ─────────────┘
+```
+
+ALPG原则上采用Exclusive Takeover。
+
+进入ALPG前需要：
+
+```text
+Block New Normal Work
+ -> Drain Outstanding
+ -> Quiesce
+ -> Transfer Ownership
+```
+
+退出ALPG后需要：
+
+```text
+Pattern Stop
+ -> Required Cleanup
+ -> Bank/OpenRow/Timing Resynchronization
+ -> Normal Ownership Restore
+```
+
+ALPG仍然通过标准DFI接口连接PHY，不建立独立私有PHY命令接口。
+
+`EXACT_COMPLIANT`、`AUTO_LEGAL`和`RAW_MARGIN`属于ALPG内部Timing Policy，不改变MC↔PHY采用标准DFI子集这一接口边界。
+
+---
+
+## 2.17 一次Row-miss Read的总体流程
+
+以Row-miss Read为例：
+
+```text
+Host Read
+   │
+   ▼
+HIF建立Logical Transaction
+   │
+   ▼
+IH完成Address Mapping / Geometry
+   │
+   ▼
+TE保存Pending Request
+   │
+   ▼
+CC查询BSM / OpenRow / Timing
+   │
+   ▼
+Row Miss -> PRE Candidate
+   │
+   ▼
+OS选择对应Class Head
+   │
+   ▼
+GS检查并Prepare资源
+   │
+   ▼
+MC Internal Commit
+   │
+   ▼
+标准DFI输出PRE
+   │
+   ▼
+Registered-equivalent PRE Event
+   │
+   ├── BSM -> CLOSED
+   ├── OpenRow -> Invalid
+   └── Timing记录PRE occurrence
+                │
+                ▼
+              tRP满足
+                │
+                ▼
+ACT Candidate / Commit / DFI
+                │
+                ▼
+Registered-equivalent ACT Event
+   │
+   ├── BSM -> OPEN
+   ├── OpenRow = Target Row
+   └── Timing记录ACT occurrence
+                │
+                ▼
+             tRCD满足
+                │
+                ▼
+RD Candidate
+   │
+   ▼
+GS预留Read内部资源
+   │
+   ▼
+RD DFI Presentation
+   │
+   ▼
+dfi_rddata_valid / dfi_rddata
+   │
+   ▼
+PI Internal Correlation
+   │
+   ▼
+Read Assembly / Result
+   │
+   ▼
+HIF Host Response
+```
+
+其中Logical Read Identity和内部Correlation信息均不要求通过自定义DFI Tag传递给PHY。
+
+---
+
+## 2.18 当前已收敛的总体设计结论
+
+经内部预评审，以下内容作为当前设计结论，不再作为专家开放问题：
+
+a) DDR6 MC继续采用DDR5 donor演进路线；
+
+b) Normal MC保持HIF→IH→TE→CC→OS→GS→PI总体层级；
+
+c) MC与PHY采用1:8 Simplified DFI；
+
+d) Simplified DFI定义为标准DFI接口的项目裁剪子集，而非自定义私有协议；
+
+e) 外部MC↔PHY接口不增加私有Command Ready、Actual、Read Tag、Flush或Session信号；
+
+f) OS保持Multi-Class Selection；
+
+g) GS负责最终资源Admission及Phase Packing，不预设Production只能单Command Issue；
+
+h) BSM、OpenRow及Timing保持独立Truth Owner；
+
+i) PRE实际生效后BSM直接进入CLOSED，tRP合法性统一由Timing控制；
+
+j) Timing Reservation与已经不可逆进入DFI输出流水线的Command相关联；
+
+k) Registered-equivalent Event作为MC内部状态更新边界，不作为DFI端口；
+
+l) Read Physical Correlation在PI/Read内部完成，不增加私有DFI Tag；
+
+m) Session Epoch、No-old-return及Reset Barrier属于MC内部控制语义；
+
+n) `dfi_alert_n`作为独立PHY→MC标准异常/维护反馈保留；
+
+o) ALPG与Normal MC共用标准DFI PHY接口。
+
+---
+
+## 2.19 本章待闭合项
+
+经过内部预评审后，本章仅保留真正依赖外部信息的设计Gate。
+
+| 待闭合项 | 当前已经确定 | 尚需外部输入 |
+|---|---|---|
+| DFI标准子集 | 使用标准DFI信号裁剪，不使用私有伪DFI端口 | 最终DFI版本、适用Signal List及位宽 |
+| 1:8 Physical Mapping | MC逻辑侧按8 Phase组织 | Phase与PHY Clock/CA之间的精确映射 |
+| Command Span | GS/PI支持Phase Packing框架 | 各DDR6 Command实际Span及Continuation规则 |
+| Registered-equivalent Event | MC内部状态更新边界已定义 | DFI Presentation到实际执行边界的固定/有限映射 |
+| Read Return | 采用标准DFI Read Path，Correlation保留在MC内部 | Return Ordering、Latency及Route Contract |
+| Write Physical Completion | Write生命周期已分层 | PHY可提供的有效Drain/Completion证据 |
+| Reset/Reopen | MC内部Session及Re-init流程已定义 | DFI/PHY侧Old Feedback排空证明 |
+| Update/Power/Frequency | 按标准DFI Feature选择性保留 | 目标PHY实际支持及使用的DFI Feature |
+| PHY高速能力 | 不通过修改MC DFI语义解决 | Clocking、TC/X5IO及Hardware Margin证明 |
+
+上述项目在外部接口及规范闭合前继续作为Integration Gate管理，不再通过增加自定义DFI信号绕过。
