@@ -1,0 +1,1669 @@
+# 10 异常、重试及复位设计
+
+## 10.1 功能范围与设计目标
+
+异常、重试及复位设计负责在DDR6 MC出现状态矛盾、数据关联错误、Timing违规、Physical Visibility不确定、Timeout、PHY异常或其他无法继续正常执行的情况时，首先阻止错误继续影响Functional State，再根据错误性质选择Retry、局部Recovery或Destructive Reset。
+
+本章主要包括：
+
+a) Error Detection及Local Containment；
+
+b) Error Classification及Visibility判断；
+
+c) Error Record及Telemetry；
+
+d) Read/Write Retry；
+
+e) Old Attempt Fence及No-old-feedback证明；
+
+f) Unknown Visibility处理；
+
+g) Graceful Recovery；
+
+h) Destructive Reset；
+
+i) 标准DFI Reset/Initialization生命周期；
+
+j) DRAM Re-initialization；
+
+k) MC Ready重新建立。
+
+总体原则为：
+
+```text id="kqqhd2"
+Error Detected
+      │
+      ▼
+Stop Unsafe Mutation
+      │
+      ▼
+Preserve Evidence
+      │
+      ▼
+Classify Visibility / Scope
+      │
+      ├── Safe Retry
+      │      │
+      │      ▼
+      │ Fence Old
+      │      │
+      │      ▼
+      │ Old-feedback Proof
+      │      │
+      │      ▼
+      │ Fresh Authorization
+      │
+      ├── Local Recovery
+      │      │
+      │      ▼
+      │ Functional Postcondition
+      │
+      └── Trust Lost
+             │
+             ▼
+       Destructive Reset
+             │
+             ▼
+          Re-init
+```
+
+任何Timeout、软件W1C或内部Valid清零都不能代替真正的Functional Safety Proof。
+
+---
+
+# 10.2 总体结构
+
+```text id="4x114i"
+        Functional Owners
+ HIF / TE / GS / PI / Timing
+ BSM / Read / Write / Maintenance
+              │
+              ▼
+       Local Detection
+              │
+        ┌─────┴─────┐
+        ▼           ▼
+ Local Safe      Error
+   Action        Record
+        │           │
+        └─────┬─────┘
+              ▼
+    Visibility / Policy
+       /       |       \
+      /        |        \
+     ▼         ▼         ▼
+   Retry    Recovery    Fatal
+     │         │          │
+     ▼         ▼          ▼
+Fence Old  Postcondition Reset Request
+     │                    │
+     ▼                    ▼
+Proof Old Safe      Joint Reset Boundary
+     │                    │
+     ▼                    ▼
+Fresh Permit      Standard DFI Reset /
+     │             Init + PHY Lifecycle
+     ▼                    │
+GS Fresh Admission         ▼
+                       DRAM Re-init
+                            │
+                            ▼
+                         MC Ready
+```
+
+**图10-1 异常、重试及复位总体结构**
+
+逻辑上应区分三个职责：
+
+```text id="rnspr4"
+Error Handling
+    -> 发生了什么以及影响范围是什么
+
+Retry Control
+    -> Old Attempt何时可以安全被Fresh Attempt替代
+
+Reset / Re-init
+    -> 如何丢弃Old Runtime Context并重新建立可信运行环境
+```
+
+具体RTL中可以根据现有DDR5架构合并部分控制状态，但功能边界不得混淆。
+
+---
+
+# 10.3 Error Detection与Local Safety
+
+## 10.3.1 Local Detection
+
+错误优先由最接近Authoritative Truth的Owner检测。
+
+典型错误包括：
+
+a) HIF检测Host Ordering或Transaction状态异常；
+
+b) IH检测Config/Geometry矛盾；
+
+c) TE检测Dependency状态错误；
+
+d) BSM/OpenRow检测状态不一致；
+
+e) Timing检测History、Reservation或Deadline异常；
+
+f) GS检测资源Commit不完整；
+
+g) PI检测DFI Return Correlation错误；
+
+h) Read检测Unexpected、Duplicate或Stale Return；
+
+i) Write检测Command/Data Join或Attempt状态异常；
+
+j) Refresh/RFM检测Accounting矛盾；
+
+k) Training检测非法或Stale Result；
+
+l) `dfi_alert_n`产生需要进入Maintenance/Recovery处理的ALERT事件。
+
+---
+
+## 10.3.2 Local Safe Action
+
+发生可能破坏状态正确性的错误时，应首先停止对应Functional Mutation。
+
+例如：
+
+```text id="l6xrh8"
+BSM = OPEN
+AND
+OpenRow.Valid = 0
+```
+
+属于Owner Coherence Fault。
+
+此时应立即：
+
+```text id="ajow75"
+Block Normal Command
+Disable Unsafe State WE
+Enter Resource Containment
+```
+
+不得等待Central Error Record成功写入以后才停止功能更新。
+
+因此：
+
+```text id="kr3nbc"
+Error Logging
+!=
+Functional Safety
+```
+
+---
+
+## 10.3.3 Functional Event不得被Telemetry阻塞
+
+Telemetry或Error Detail属于可观测信息。
+
+如果Telemetry FIFO已满：
+
+```text id="ds5xcb"
+Local Safety仍必须继续
+Functional Event仍必须正确处理
+```
+
+日志空间不足不能成为允许错误状态继续运行的理由。
+
+---
+
+# 10.4 Error分类
+
+## 10.4.1 Visibility
+
+对于可能涉及真实DDR副作用的错误，需要判断当前操作可能已经达到什么物理阶段。
+
+架构至少区分：
+
+```text id="qk7lz3"
+PRE_VISIBLE
+UNKNOWN_VISIBLE
+DEVICE_VISIBLE
+```
+
+必要时，可根据具体Read/Write实现进一步细分：
+
+```text id="czlnci"
+PARTIAL_VISIBLE
+FULL_VISIBLE
+```
+
+其核心语义为：
+
+### PRE_VISIBLE
+
+能够证明操作尚未产生不可撤销的Device Side Effect。
+
+### UNKNOWN_VISIBLE
+
+无法证明命令是否已经产生Device Side Effect。
+
+### DEVICE_VISIBLE
+
+能够证明对应操作已经达到器件可见边界。
+
+Visibility只描述：
+
+```text id="7vm3bo"
+器件侧可能发生了什么
+```
+
+不等同于错误Severity。
+
+---
+
+## 10.4.2 Severity
+
+产品可根据需要使用：
+
+```text id="7ia3fp"
+INFO
+WARNING
+RECOVERABLE
+FATAL
+```
+
+或现有DDR5错误等级体系。
+
+本章不强制增加更多Severity等级。
+
+---
+
+## 10.4.3 Containment Scope
+
+Containment应尽可能限制在满足安全要求的最小范围，例如：
+
+```text id="rhk4dg"
+Transaction
+Resource
+Resource Set
+Service
+Channel
+Whole MC
+```
+
+如果一个Bank的OpenRow状态发生矛盾，没有必要默认冻结整个MC；但在无法证明局部状态独立时，应升级Containment范围。
+
+---
+
+# 10.5 Error Record与软件可见状态
+
+## 10.5.1 Error Record
+
+Error记录至少需要能够说明：
+
+```text id="313yk6"
+Error Type
+Source
+Affected Object / Scope
+Visibility
+Syndrome / Reason
+```
+
+可以选择记录：
+
+```text id="67w9ga"
+Timestamp
+First-error Detail
+Summary Bitmap
+Lost Error Count
+```
+
+等调试信息。
+
+不要求为每条Error强制附带ACV、GMV、TDBV、Epoch等全部Context；只有这些信息对区分错误实例真正必要时才保留。
+
+---
+
+## 10.5.2 First Error
+
+为避免后续衍生错误覆盖第一现场，可以保留：
+
+```text id="5w9syw"
+First Error Detail
++
+Error Summary
+```
+
+如果硬件资源有限，第一版不需要实现大型Error Log FIFO。
+
+---
+
+## 10.5.3 W1C
+
+软件W1C只能清除：
+
+```text id="sfaevl"
+Interrupt
+Sticky Status
+Software-visible Error Record
+```
+
+不能直接：
+
+```text id="q3tbfi"
+Release Containment
+Release Retry Fence
+Change BSM
+Change OpenRow
+Clear Maintenance Obligation
+Declare PHY Flush Complete
+```
+
+因此：
+
+```text id="luwzd4"
+W1C
+!=
+Recovery Complete
+```
+
+---
+
+# 10.6 Retry适用原则
+
+Retry不是错误发生后的默认动作。
+
+允许Retry至少需要满足：
+
+a) Product Policy允许；
+
+b) Old Attempt已停止继续扩展新的Physical Operation；
+
+c) Old Feedback不能再错误作用于Fresh Attempt；
+
+d) 若Old Operation可能已经Device-visible，则重试语义安全已经得到证明。
+
+尤其禁止：
+
+```text id="jznyze"
+Timeout
+   │
+   ▼
+Assume No Effect
+   │
+   ▼
+Reissue Command
+```
+
+Timeout不能证明Command未执行。
+
+---
+
+# 10.7 Retry基本流程
+
+所有Read/Write Retry均遵循：
+
+```text id="3m9dj4"
+Old Attempt
+      │
+      ▼
+Fence Old
+      │
+      ▼
+Allow Legal Old Progress to Drain
+      │
+      ▼
+Prove Old Cannot Affect Fresh
+      │
+      ▼
+Old Attempt Non-matchable
+      │
+      ▼
+Fresh Attempt Authorized
+      │
+      ▼
+Normal CC / OS / GS
+      │
+      ▼
+Fresh Commit
+```
+
+这里存在四个关键边界：
+
+```text id="f8eqvi"
+Fence
+!=
+Proof
+!=
+Authorization
+!=
+Fresh Admission
+```
+
+---
+
+# 10.8 Old Attempt Fence
+
+Retry Fence只负责：
+
+> 禁止Old Attempt继续创建新的执行行为。
+
+Fence以后Old Attempt不得：
+
+a) 产生新的Command Commit；
+
+b) 建立新的Read Return Correlation；
+
+c) 扩展新的Physical Scope；
+
+d) 获取新的执行资源。
+
+但已经在途的合法Old Progress仍可以继续，例如：
+
+```text id="o6dlx8"
+Old Read Return
+Old PI Record Drain
+Old Write Data Progress
+已有Physical Feedback
+```
+
+因此：
+
+```text id="1ibwm0"
+Fence Old
+!=
+Discard All Old Progress
+```
+
+---
+
+# 10.9 No-old-feedback Proof
+
+## 10.9.1 Read
+
+Fresh Read Attempt建立前，必须能够证明：
+
+```text id="6ktjvn"
+Old Attempt不会建立Fresh Return
+AND
+Old PI Correlation已关闭
+AND
+已在途Old Return已完成、隔离或分类
+AND
+Old Expected不能再写Fresh State
+```
+
+具体证明依据来自：
+
+```text id="4gmd7g"
+Standard DFI Read Lifecycle
++
+PI Journal State
++
+PHY Return Ordering / Latency Contract
+```
+
+不新增：
+
+```text id="pm8xoy"
+no_old_return_done
+```
+
+作为自定义DFI端口。
+
+---
+
+## 10.9.2 Write
+
+Fresh Write Attempt建立前，需要确认与Old Attempt有关的：
+
+```text id="drbcfe"
+PI Join
+Write Data Reference
+Physical Feedback
+Visibility State
+```
+
+已经达到不会与Fresh Attempt混淆的边界。
+
+如果无法证明Old Write是否已经Device-visible，则不能按普通No-effect Retry处理。
+
+---
+
+## 10.9.3 Same-cycle Old Progress
+
+若某周期同时出现：
+
+```text id="jcrvtv"
+Old Legal Progress
++
+No-old-feedback条件准备成立
+```
+
+则Proof必须覆盖该Old Progress。
+
+如果不能覆盖，则先处理Old Progress，再重新判断Proof。
+
+不能为了尽快Retry而丢弃合法Old Feedback。
+
+---
+
+# 10.10 Fresh Attempt Authorization
+
+只有Old Attempt已经进入：
+
+```text id="2dj33t"
+Non-matchable
+```
+
+状态后，才允许Fresh Attempt。
+
+Fresh Authorization仅表示：
+
+> 对应Logical Transaction现在允许重新进入Normal Execution Path。
+
+它不直接：
+
+```text id="ymx6w6"
+Allocate Read Expected
+Allocate Write Attempt
+Reserve Timing
+Issue Command
+```
+
+Fresh Attempt仍需重新经过：
+
+```text id="ruc1vb"
+TE / CC
+    │
+    ▼
+OS
+    │
+    ▼
+GS
+    │
+    ▼
+MC Internal Commit
+```
+
+---
+
+## 10.10.1 Authorization与Proof是否必须分拍
+
+功能上必须保证：
+
+```text id="e18bp9"
+Fresh Authorization不能使用未经稳定确认的Old-safe条件
+```
+
+第一版可以采用：
+
+```text id="hzqlpo"
+Cycle N:
+Register Old-safe
+
+Cycle N+1:
+Authorize Fresh
+```
+
+降低Same-cycle复杂度。
+
+如果RTL能够使用严格组合Proof并完成完整形式验证，也可以优化。
+
+因此这里保留逻辑边界，但不强制永远多一个时钟周期。
+
+---
+
+# 10.11 Attempt Identity
+
+如果实现允许：
+
+```text id="bwn6hy"
+Old Attempt Feedback晚到
++
+Fresh Attempt已经建立
+```
+
+则必须有足以区分二者的Attempt Context。
+
+可以采用：
+
+```text id="7vo4ix"
+Attempt ID
+Generation
+Journal Entry
+Strict Sequential Ordering
+```
+
+等方式。
+
+不强制全系统统一使用：
+
+```text id="vna9fe"
+Attempt Generation Counter
+```
+
+如果系统通过：
+
+```text id="ew7xlz"
+Old Attempt完全Drain以后才允许Fresh Attempt
+```
+
+消除了ABA风险，可以使用更简单Identity。
+
+若采用有限ID并允许复用，则不能在Old Reference仍存在时Blind Wrap。
+
+---
+
+# 10.12 Read Retry
+
+Read Retry流程为：
+
+```text id="cwvuqy"
+Read Attempt 1
+      │
+      ▼
+Retry Decision
+      │
+      ▼
+Fence Attempt 1
+      │
+      ├── 已在途合法Old Return继续处理
+      │
+      ▼
+Close Old Correlation
+      │
+      ▼
+No-old-return Proof
+      │
+      ▼
+Attempt 1 Non-matchable
+      │
+      ▼
+Authorize Attempt 2
+      │
+      ▼
+Fresh GS Admission
+      │
+      ▼
+New Expected /
+Assembly / Correlation
+```
+
+Logical Read Identity可以保持稳定。
+
+Fresh Attempt的Physical Correlation必须重新建立。
+
+Old Expected和Assembly不得仅通过修改ID直接转换为Fresh Attempt对象。
+
+---
+
+# 10.13 Write Retry
+
+Write Retry相比Read具有更严格的Device Side Effect问题。
+
+典型流程为：
+
+```text id="7bzr8y"
+Write Attempt 1
+      │
+      ▼
+Retry Candidate
+      │
+      ▼
+Determine Visibility
+      │
+      ├── PRE_VISIBLE
+      │       │
+      │       ▼
+      │   Fence / Proof
+      │       │
+      │       ▼
+      │   Retry Allowed
+      │
+      └── UNKNOWN / DEVICE_VISIBLE
+              │
+              ▼
+      Product-specific Policy /
+      Recovery / Fatal
+```
+
+Retry成功建立Fresh Attempt时：
+
+```text id="jqfm1i"
+Payload仍然使用原READY Payload
+```
+
+不得重新向Host抓取Write Data。
+
+---
+
+## 10.13.1 Device-visible Write
+
+对于：
+
+```text id="pw9gdk"
+UNKNOWN_VISIBLE
+DEVICE_VISIBLE
+PARTIAL_VISIBLE
+```
+
+Write是否能够Retry不能由MC架构自行决定。
+
+只有具备：
+
+```text id="rrax6h"
+Idempotence Proof
+明确Repair Sequence
+或Product允许的恢复策略
+```
+
+时，才允许Fresh Retry。
+
+否则进入Recovery或Destructive Reset。
+
+这是当前需要保留的Product Policy Gate。
+
+---
+
+# 10.14 Timeout
+
+Timeout只表示：
+
+```text id="86pjvz"
+某个预期事件没有在规定时间内观察到
+```
+
+Timeout不能直接证明：
+
+```text id="3gl49s"
+Command没有执行
+Old Read Return不存在
+PHY已经退出某状态
+Training已经失败
+```
+
+因此：
+
+```text id="lfvrzs"
+Timeout
+   │
+   ▼
+Error / Visibility Evaluation
+```
+
+而不是：
+
+```text id="tk6o8f"
+Timeout
+   │
+   ▼
+Fake Completion
+```
+
+---
+
+# 10.15 Graceful Recovery
+
+如果当前DRAM/PHY状态仍然可信，可以采用Graceful Recovery。
+
+典型流程为：
+
+```text id="038gyu"
+Block Fresh Work
+      │
+      ▼
+Drain Outstanding
+      │
+      ▼
+Reach Safe Point
+      │
+      ▼
+Repair / Retrain /
+Reconfigure
+      │
+      ▼
+Validate Postcondition
+      │
+      ▼
+Resume
+```
+
+例如：
+
+a) FSP切换失败但Old Workpoint仍然可信；
+
+b) 某Training Phase需要重新执行；
+
+c) 某局部Resource可以重新建立Closed/Timing状态；
+
+d) 某Maintenance Service能够安全重新规划。
+
+Graceful Recovery不应无条件丢弃正常Host Transaction。
+
+---
+
+# 10.16 Recovery Complete
+
+Containment解除必须由真正的Functional Postcondition驱动。
+
+例如Bank State矛盾后的局部恢复，只有能够证明：
+
+```text id="zp8bjw"
+Resource Accessible
+AND
+Bank Physical State Known
+AND
+OpenRow State Known
+AND
+Timing Baseline Ready
+```
+
+后，才能重新允许Normal Access。
+
+如果只能证明：
+
+```text id="u8qwsg"
+当前无法安全解释Bank状态
+```
+
+则保持：
+
+```text id="5pn02q"
+INACCESSIBLE
+```
+
+或：
+
+```text id="5djdp3"
+ERROR_CONTAIN
+```
+
+而不是猜测它已经CLOSED。
+
+---
+
+# 10.17 Destructive Reset边界
+
+## 10.17.1 Joint Boundary
+
+Destructive Reset会放弃当前运行Context，因此不能由某个局部模块擅自发起后立刻清除所有跨域状态。
+
+基本流程为：
+
+```text id="mlh9gm"
+Reset Request
+      │
+      ▼
+Block Fresh Traffic
+      │
+      ▼
+Host / HIF Reset Boundary
+      │
+      ▼
+Destructive Clear Allowed
+```
+
+在该Boundary建立前，跨Domain已有工作应按Reset合同处理。
+
+当前方案不要求Destructive Reset后恢复Reset前Host Transaction。
+
+---
+
+## 10.17.2 Session隔离
+
+Reset前后的反馈必须能够被隔离。
+
+功能要求是：
+
+> Reset前产生的RDATA、Write反馈、Training Result、Maintenance反馈等，不得修改Reset后新建立的Functional State。
+
+实现可以使用：
+
+```text id="adngyj"
+Reset Epoch
+```
+
+也可以通过：
+
+```text id="44f6vv"
+Full Drain
++
+PHY Reset
++
+No-old-feedback Barrier
+```
+
+实现。
+
+因此`Reset Epoch`是可选内部隔离机制，不规定为所有模块都必须携带的字段。
+
+它更不能作为DFI外部端口。
+
+---
+
+# 10.18 MC Local Clear
+
+Joint Reset Boundary建立后，各Owner清除自己拥有的功能状态。
+
+## 10.18.1 HIF/IH/TE
+
+原则上失效：
+
+```text id="i28355"
+Logical Transaction Valid
+Optional Parent/Child State
+Ordering State
+IH Hold
+TE Entries
+Dependency State
+Response Hold
+```
+
+第4章Parent/Child未启用时不存在Child相关状态。
+
+---
+
+## 10.18.2 CC/OS/GS
+
+失效：
+
+```text id="u6a0gk"
+CC Candidate
+OS Class Heads
+GS Uncommitted Bundle
+Command Occupancy / Local Admission State
+```
+
+对于已经进入DFI、物理可见性尚不明确的Command，不能仅通过Local Clear认为其“从未发生”。
+
+---
+
+## 10.18.3 PI
+
+失效当前MC Session下的：
+
+```text id="7j1zcc"
+Command Hold
+Read Issue Journal
+Write Join
+Return Correlation
+Ingress Control
+```
+
+但：
+
+```text id="tv2i03"
+PI Local Clear
+!=
+PHY Old Feedback已消失
+```
+
+---
+
+## 10.18.4 Read/Write
+
+Read侧应使：
+
+```text id="3r34sy"
+Old Expected不可匹配
+Old Assembly不可写Fresh Result
+Old Result Hold失效或按Reset合同处理
+```
+
+Write侧应使：
+
+```text id="vk21zo"
+Old Attempt不可继续修改Fresh State
+Old Result失效或按Reset合同处理
+Payload Functional Reference失效
+```
+
+Data RAM本体无需逐字清零。
+
+---
+
+## 10.18.5 State/Maintenance/Control
+
+同时失效或重建：
+
+```text id="in78c5"
+BSM
+OpenRow
+Timing
+Refresh / RFM Service
+MR/FSP/Power Context
+Training Context
+Retry Context
+```
+
+具体Owner按照各章节Reset合同处理。
+
+---
+
+# 10.19 Reset后的Bank与Timing状态
+
+Reset以后：
+
+```text id="mbnryr"
+OpenRow.Valid = 0
+```
+
+只表示旧OpenRow信息不再可信。
+
+它不表示Bank已经物理关闭。
+
+因此：
+
+```text id="w3ot74"
+BSM = INACCESSIBLE
+```
+
+而不是直接：
+
+```text id="u1sc6v"
+BSM = CLOSED
+```
+
+Timing同时进入：
+
+```text id="hgooxm"
+Timing Ready = 0
+```
+
+直到Re-init后重新建立可靠Baseline。
+
+---
+
+# 10.20 标准DFI Reset与PHY生命周期
+
+## 10.20.1 原则
+
+Reset、Flush及Old-feedback隔离优先使用最终Simplified DFI中保留的标准生命周期机制，例如：
+
+```text id="87hzrl"
+dfi_reset_n
+
+dfi_init_start
+dfi_init_complete
+
+以及本Build实际保留的：
+ctrlupd / phyupd
+power
+frequency
+等标准DFI Feature
+```
+
+具体成员由最终DFI版本和PHY ICD确定。
+
+---
+
+## 10.20.2 不新增私有Flush接口
+
+不得为了解决Reset Proof自行增加：
+
+```text id="a267df"
+flush_req
+flush_done
+no_old_return_done
+session_epoch
+```
+
+等信号并将其称为DFI。
+
+如果标准DFI之外确实需要额外PHY Sideband，应明确标记：
+
+```text id="n8kxgx"
+NON_DFI_SIDEBAND
+```
+
+并单独完成接口评审。
+
+当前基线不默认增加此类接口。
+
+---
+
+## 10.20.3 No-old-feedback Proof
+
+MC Local Clear只能证明：
+
+```text id="rwhm0y"
+MC不再引用Old State
+```
+
+不能证明：
+
+```text id="7lscn1"
+PHY内部Old Pipeline已经排空
+Old dfi_rddata_valid不会再来
+Old Training Result不会再来
+```
+
+因此Traffic重新开放前，必须通过：
+
+```text id="iqwdig"
+Standard DFI Lifecycle
++
+PHY ICD
++
+PI Local State
+```
+
+形成足够的No-old-feedback证明。
+
+---
+
+# 10.21 DRAM Re-initialization
+
+Destructive Reset后的总体恢复流程为：
+
+```text id="cz4qeq"
+Reset Boundary
+      │
+      ▼
+MC Local Clear
+      │
+      ▼
+CDC / RDC Barrier
+      │
+      ▼
+Standard DFI Reset / Init
+      │
+      ▼
+PHY Ready
+      │
+      ▼
+DRAM Initialization
+      │
+      ▼
+Required MR Programming
+      │
+      ▼
+Required Training
+      │
+      ▼
+Config / Geometry /
+Timing Ready
+      │
+      ▼
+Bank State Known
+      │
+      ▼
+Maintenance State Ready
+      │
+      ▼
+MC Ready
+```
+
+Reset和Re-init承担两个不同功能：
+
+```text id="8a5zb8"
+Reset
+    -> 丢弃对Old State的信任
+
+Re-init
+    -> 建立对Current State的新信任
+```
+
+不能合并。
+
+---
+
+# 10.22 MC Ready
+
+`mc_ready`表示：
+
+> 当前MC、PHY及DRAM状态已经满足Normal Traffic重新进入的全部必要条件。
+
+典型条件包括：
+
+```text id="t3q1rb"
+Host/HIF Reset Boundary Complete
+AND
+MC Local Clear Complete
+AND
+CDC/RDC Safe
+AND
+DFI/PHY Initialization Complete
+AND
+Old Feedback不能污染Fresh State
+AND
+DRAM Initialization Complete
+AND
+Required MR Effective
+AND
+Required Training Complete
+AND
+Active Config Ready
+AND
+Active Geometry Ready
+AND
+Timing Ready
+AND
+Bank State Known
+AND
+Maintenance State Ready
+AND
+!Fatal
+```
+
+具体条件根据最终Product及PHY接口裁剪。
+
+因此：
+
+```text id="wfh4mj"
+Reset Deassert
+!=
+mc_ready
+```
+
+并且：
+
+```text id="jrtw6y"
+dfi_init_complete
+!=
+mc_ready
+```
+
+单一PHY完成信号不能直接开放Normal Traffic。
+
+---
+
+# 10.23 Fatal处理
+
+当出现以下情况且无法建立安全局部Recovery时，应升级为Fatal：
+
+a) Physical Visibility长期无法确定；
+
+b) PHY/DFI Trust丢失；
+
+c) Old Read Return无法安全隔离；
+
+d) Write Side Effect无法判断且无安全修复方案；
+
+e) Timing或State发生不可恢复矛盾；
+
+f) Functional Event丢失导致Controller状态无法重建；
+
+g) 必须的Maintenance Deadline已不可恢复；
+
+h) Re-init无法建立Known DRAM State。
+
+Fatal流程为：
+
+```text id="nuidkr"
+Fatal
+  │
+  ▼
+Block Normal Traffic
+  │
+  ▼
+Request Joint Reset Boundary
+  │
+  ▼
+Destructive Reset
+```
+
+Error模块不直接异步清除所有MC状态。
+
+---
+
+# 10.24 Same-cycle处理
+
+## 10.24.1 Retry Fence与Old Progress
+
+如果同一周期发生：
+
+```text id="1x2l0l"
+Fence Old
++
+Legal Old Progress
+```
+
+则：
+
+```text id="ntfdl9"
+Old Progress仍归Old Attempt处理
++
+Fence阻止后续Fresh扩展
+```
+
+---
+
+## 10.24.2 Old-safe Proof与Progress
+
+如果：
+
+```text id="v43h34"
+Old-safe Proof
++
+尚未被Proof覆盖的Old Progress
+```
+
+同周期出现，应重新判断Proof。
+
+不得用旧Proof关闭新观察到的合法Old Progress。
+
+---
+
+## 10.24.3 Reset与Functional Event
+
+Joint Destructive Reset Boundary正式建立后：
+
+```text id="6zoqzc"
+Old Session Functional WE = 0
+```
+
+Reset优先于Fresh Allocation、Admission、Result、Config Publish等普通功能更新。
+
+但只有Local Reset Intent、尚未完成Joint Boundary时，不得擅自丢弃其他Domain中的合法Active Work。
+
+---
+
+## 10.24.4 MC Ready与Fresh Fault
+
+如果最后一个Re-init条件成立的同一周期出现：
+
+```text id="0psd1x"
+Fresh Fatal
+```
+
+或：
+
+```text id="y6gj96"
+New Reset Request
+```
+
+则：
+
+```text id="sjknnn"
+mc_ready不得置1
+```
+
+---
+
+# 10.25 Backpressure原则
+
+异常、Retry及Reset路径满足：
+
+a) Error Log Full不阻止Local Containment；
+
+b) Telemetry Full不阻止Functional Safe Action；
+
+c) Retry等待Old-safe Proof时，可以阻止Fresh Attempt，但不得阻止合法Old Progress；
+
+d) Reset/Re-init期间Normal Admission保持关闭；
+
+e) 某Owner尚未完成必要Reset/Re-init条件时，不得绕过直接进入MC Ready；
+
+f) Recovery Postcondition未满足时，相应Scope继续保持Containment。
+
+---
+
+# 10.26 主要接口
+
+**表10-1 异常、重试及复位主要逻辑接口**
+
+| 序号 | 接口 | 主要内容 | 要求 |
+|---|---|---|---|
+| 1 | Local Owner → Error | Error Type、Scope、Visibility、Reason | Local Safety不等待Error Manager |
+| 2 | Error → Owner | Containment/Retry/Recovery/Fatal Policy | 不修改原始Error事实 |
+| 3 | Owner → Retry | Logical Object、Old Attempt、Retry Reason | 稳定保持 |
+| 4 | Retry → Owner | Fence Old | 禁Fresh扩展，保留合法Old Progress |
+| 5 | PI/Owner → Retry | Old-safe / No-old-feedback Proof | 必须针对当前Old Attempt |
+| 6 | Retry → Owner/GS | Fresh Attempt Permit | 不直接建立资源 |
+| 7 | Host/HIF ↔ Reset | Joint Reset Boundary | 建立后才Destructive Clear |
+| 8 | Reset → Owners | Local Clear / Traffic Gate | 各Owner只清自己的状态 |
+| 9 | Reset ↔ DFI/PHY | 标准Reset/Init生命周期 | 不使用私有DFI Flush信号 |
+| 10 | Re-init Owners → Reset | Init/Training/Timing/State-known | 当前Recovery Context有效 |
+| 11 | Recovery → Owner | Functional Recovery Complete | 真正Postcondition满足 |
+| 12 | Reset → HIF/GS | `mc_ready` / Admission Block | Reopen统一控制 |
+
+---
+
+# 10.27 主要内部状态
+
+**表10-2 异常、重试及复位主要逻辑对象**
+
+| 对象 | 主要内容 | 说明 |
+|---|---|---|
+| Error Summary | Error Type、Source、Scope | 必选基础信息 |
+| First Error Detail | 首次错误现场 | 推荐，可按资源裁剪 |
+| Containment State | Affected Scope及处理状态 | Functional Safety |
+| Retry Context | Old Attempt、Fence、Proof、Permit | 可按并发量配置 |
+| Reset/Re-init State | 当前恢复阶段 | 必选 |
+| Recovery Proof State | Required Postcondition | 按Recovery类型实现 |
+| Optional Epoch/Generation | Old/Fresh隔离 | 仅真实Late Feedback风险需要 |
+
+不要求为上述每个逻辑对象独立实现RAM。
+
+---
+
+# 10.28 典型流程
+
+## 10.28.1 Read Timeout后Retry
+
+```text id="e60v4n"
+Read Attempt 1
+      │
+      ▼
+Return Timeout
+      │
+      ▼
+Error Evaluation
+      │
+      ▼
+Retry Policy允许
+      │
+      ▼
+Fence Attempt 1
+      │
+      ├── Old合法Return继续处理
+      │
+      ▼
+Close Old Correlation
+      │
+      ▼
+No-old-return Proof
+      │
+      ▼
+Fresh Attempt Permit
+      │
+      ▼
+GS Fresh Admission
+      │
+      ▼
+Attempt 2
+```
+
+Timeout本身不产生No-old-return Proof。
+
+---
+
+## 10.28.2 Write Retry
+
+```text id="i0wyql"
+Write Attempt 1
+      │
+      ▼
+Retry Candidate
+      │
+      ▼
+Visibility Check
+      │
+      ├── Safe PRE_VISIBLE
+      │       │
+      │       ▼
+      │ Fence / Old-safe Proof
+      │       │
+      │       ▼
+      │ Fresh Attempt
+      │
+      └── UNKNOWN / DEVICE_VISIBLE
+              │
+              ▼
+       Product Policy /
+       Recovery / Reset
+```
+
+Fresh Attempt继续使用原READY Payload。
+
+---
+
+## 10.28.3 State矛盾Recovery
+
+```text id="pnp1vr"
+BSM / OpenRow Contradiction
+       │
+       ▼
+Block Resource
+       │
+       ▼
+ERROR_CONTAIN
+       │
+       ▼
+Recovery Procedure
+       │
+       ▼
+Physical State Proof
+       │
+       ├── Known Closed
+       │       │
+       │       ▼
+       │    CLOSED
+       │
+       └── State Unknown
+               │
+               ▼
+          INACCESSIBLE
+```
+
+---
+
+## 10.28.4 Fatal Reset
+
+```text id="6v7ltn"
+Physical Trust Lost
+      │
+      ▼
+Fatal
+      │
+      ▼
+Joint Reset Boundary
+      │
+      ▼
+MC Clear
+      │
+      ▼
+DFI / PHY Reset + Init
+      │
+      ▼
+DRAM Re-init
+      │
+      ▼
+MR / Training
+      │
+      ▼
+Config / Geometry /
+Timing / Bank Ready
+      │
+      ▼
+MC Ready
+```
+
+---
+
+# 10.29 DDR5继承与DDR6修改关系
+
+**表10-3 异常、重试及复位演进关系**
+
+| DDR5设计内容 | DDR6处理 | 收敛后的变化 |
+|---|---|---|
+| Existing Error/Interrupt | KEEP/MODIFY | 与Functional Containment明确分离 |
+| Central Error Summary | KEEP | 可增加First Detail，但不阻塞Safety |
+| W1C | KEEP WITH LIMIT | 只清软件可见状态 |
+| Retry直接Reissue | REPLACE | Fence→Proof→Fresh Permit |
+| Attempt/Tag自然复用 | REVIEW | 只有No-old-reference后才复用 |
+| 全局Attempt Generation | CONDITIONAL | 仅真实ABA/Late Feedback风险需要 |
+| Timeout直接推进 | PROHIBITED | Timeout进入Error/Visibility判断 |
+| Device-visible Write重发 | FEATURE/POLICY GATED | 需要Idempotence/Repair证明 |
+| Local Reset | KEEP/MODIFY | 不得破坏未建立Joint Boundary的跨域状态 |
+| Reset后Bank=CLOSED | REPLACE | Reset后进入INACCESSIBLE |
+| OpenRow Reset清零 | KEEP SEMANTIC | 表示Truth失效，不证明Physical Closed |
+| RAM全清零 | NOT REQUIRED | 清Functional Valid/Reference即可 |
+| PHY私有Flush接口 | NOT USED AS DFI | 使用标准DFI生命周期+PHY ICD |
+| Reset Epoch | CONDITIONAL INTERNAL | 仅作为必要的Old/Fresh隔离机制 |
+| Reset Deassert后立即Ready | REPLACE | 完整Re-init后才`mc_ready` |
+| Training/FSP局部恢复 | KEEP/MODIFY | 优先Graceful Recovery |
+| 无法恢复状态 | FATAL PATH | Joint Destructive Reset |
+
+Read、Write、Retry、Reset等donor模块目前仍未完成与BSM/OS/GS相同等级的E2源码审计，因此本表表示当前架构演进方向，不将具体DDR5 RTL实现描述为已经完成源码级冻结。
+
+---
+
+# 10.30 本章收敛结论及待闭合项
+
+经预评审，本章以下内容作为当前设计结论：
+
+a) Functional Owner首先负责Local Safety，Error Logging不能成为Safe Action前置条件；
+
+b) Visibility与Severity分开处理；
+
+c) Timeout只表示事件未按期观察到，不表示Command没有执行；
+
+d) Retry不是简单Reissue；
+
+e) Retry统一采用Fence Old→Old-safe Proof→Fresh Permit→正常GS Admission流程；
+
+f) Fence只阻止Old Attempt继续扩展，不丢弃仍然合法的Old Progress；
+
+g) Fresh Attempt建立前必须证明Old反馈不会污染Fresh State；
+
+h) Read Retry重新建立Physical Correlation，不把Old Expected直接重命名为Fresh对象；
+
+i) Write Retry继续复用Immutable Payload；
+
+j) UNKNOWN_VISIBLE或DEVICE_VISIBLE Write不得自动按普通Retry处理；
+
+k) Attempt ID/Generation仅在真实Late Feedback/ABA风险存在时使用；
+
+l) W1C不等于Functional Recovery；
+
+m) Reset后OpenRow失效，但不代表Bank物理Closed；
+
+n) Reset后BSM进入INACCESSIBLE；
+
+o) Reset/Flush/Reopen优先依赖标准DFI Reset/Init/Update/Power生命周期及PHY ICD；
+
+p) 不新增`flush_req`、`flush_done`、`no_old_return_done`、`session_epoch`等私有DFI端口；
+
+q) Reset Epoch可以作为内部隔离方式，但不是必选全局字段；
+
+r) Destructive Reset采用Host/HIF Joint Boundary后再执行Local Clear；
+
+s) Reset Deassert和`dfi_init_complete`均不等于`mc_ready`；
+
+t) `mc_ready`由Config、Geometry、Timing、Bank State、Maintenance、PHY和Training等共同证明；
+
+u) 能够维持Physical Trust时优先使用Graceful Recovery；
+
+v) 无法恢复可信状态时升级为Joint Destructive Reset。
+
+**表10-4 本章待闭合项**
+
+| 类别 | 待闭合内容 | 关闭方式 |
+|---|---|---|
+| Host Reset | Joint Reset Boundary及Outstanding响应方式 | Host/Product |
+| Read Retry | No-old-return的最终证明条件 | DFI/PHY ICD |
+| Write Retry | Write Physical Visibility及Completion证据 | DFI/PHY ICD |
+| Write Policy | Device-visible Write是否允许Retry | Product Policy |
+| Attempt Identity | 是否需要显式Attempt Generation及位宽 | 实际Late Feedback分析 |
+| DFI Reset | 最终Reset/Init标准Signal Subset | DFI/PHY ICD |
+| PHY Stale Drain | Old RDATA/Feedback何时不再可能返回 | PHY ICD |
+| CDC/RDC | Reset Barrier具体实现 | Integration/CDC设计 |
+| Re-init | DRAM Initialization最终Sequence | DDR6规范/PHY |
+| Training | Reset后Required Training Phase | PHY ICD |
+| Maintenance | Reset后Refresh/RFM状态重建 | DDR6规范/Product |
+| Error Policy | Error→Scope/Severity/Recovery映射 | Product Policy |
+| Recovery | 各类Local Recovery的Postcondition | 模块详细设计 |
+| Timeout | 各流程Finite Bound及Watchdog | RTL/PHY测量 |
+| MC Ready | 最终Reopen Proof Checklist | Integration/PHY |
+
+上述开放项主要影响Physical Proof、Product Retry Policy以及Reset/Re-init的具体实现，不重新打开“Local Safety优先、Retry先隔离Old Attempt、标准DFI生命周期以及Reset后重新建立可信状态”的总体设计原则。
