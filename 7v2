@@ -1,0 +1,1456 @@
+# 6 DRAM状态及Timing管理
+
+## 6.1 功能范围与设计目标
+
+DRAM状态及Timing管理负责维护命令构造和最终准入所需的Bank状态、当前打开Row以及DDR协议Timing状态，并根据已经确认的命令执行事件更新相应状态。
+
+本章包括：
+
+a) Bank State Machine（BSM）；
+
+b) OpenRow；
+
+c) Timing Engine；
+
+d) ACT/PRE及Row相关Timing；
+
+e) RD/WR及Column/Data Turnaround Timing；
+
+f) 1:8 Phase Timing及Timing Reservation；
+
+g) Query、状态更新、Same-cycle及Reset处理。
+
+Refresh、RFM、MR、FSP、Power及Training相关Timing仍统一使用Timing Engine提供的Timing能力，其各自的Service Lifecycle在后续章节说明。
+
+本章采用以下职责划分：
+
+```text
+BSM
+    回答：
+    “这个Bank当前是什么状态？”
+
+OpenRow
+    回答：
+    “这个Bank当前打开的是哪一行？”
+
+Timing Engine
+    回答：
+    “从DDR Timing角度，
+     这条Command什么时候可以执行？”
+```
+
+三者共同参与Command合法性判断，但不得复制彼此的Authoritative Truth。
+
+---
+
+## 6.2 总体结构
+
+总体关系如下。
+
+```text
+                     Command Candidate
+                            │
+         ┌──────────────────┼──────────────────┐
+         │                  │                  │
+         ▼                  ▼                  ▼
+      ┌───────┐        ┌─────────┐       ┌──────────┐
+      │  BSM  │        │ OpenRow │       │  Timing  │
+      │       │        │         │       │  Engine  │
+      │ Bank  │        │ Row     │       │ History  │
+      │ Truth │        │ Truth   │       │ Rule     │
+      └───┬───┘        └────┬────┘       │Reservation
+          │                 │            └────┬─────┘
+          └─────────────────┼─────────────────┘
+                            │
+                            ▼
+                         CC / GS
+                            │
+                            ▼
+                      MC Internal Commit
+                            │
+                            ▼
+                      Standard DFI
+                            │
+                            ▼
+                           PHY
+                            │
+                 Registered-equivalent Event
+                            │
+          ┌─────────────────┼─────────────────┐
+          │                 │                 │
+          ▼                 ▼                 ▼
+         BSM             OpenRow            Timing
+       Update             Update            Update
+```
+
+**图6-1 DRAM状态及Timing管理总体结构**
+
+Candidate Query路径与Committed State Update路径必须严格区分。
+
+CC和GS只能读取BSM、OpenRow及Timing状态。
+
+Command完成Selection、Admission甚至进入标准DFI输出，都不直接等于DRAM状态已经改变。只有形成经过确认的Registered-equivalent Event后，相关Owner才能更新Committed State。
+
+---
+
+# 6.3 状态职责划分
+
+## 6.3.1 BSM职责
+
+BSM是Bank状态的唯一Owner。
+
+DDR6 BSM只维护：
+
+```text
+INACCESSIBLE
+CLOSED
+OPEN
+ERROR_CONTAIN
+```
+
+BSM不保存：
+
+```text
+Row Address
+tRP / tRCD / tRAS / tRC等待状态
+Refresh / RFM Claim
+Power Block
+Scheduler Reservation
+DFI Pipeline Progress
+```
+
+因此：
+
+```text
+Bank State
+!=
+Timing Eligibility
+!=
+Maintenance Ownership
+!=
+Power Accessibility
+```
+
+---
+
+## 6.3.2 OpenRow职责
+
+OpenRow是当前打开Row的唯一Owner。
+
+每个Resource只保存完成Row判断真正需要的信息，例如：
+
+```text
+Valid
+Row Address
+必要的Geometry Context
+```
+
+OpenRow不负责：
+
+```text
+Bank Lifecycle
+Timing Counter
+Maintenance Claim
+Power State
+```
+
+---
+
+## 6.3.3 Timing职责
+
+Timing Engine是DDR协议Timing的统一Owner。
+
+其输入包括：
+
+```text
+Command Type
+Target Resource
+Current Timing History
+Live Timing Reservation
+Active Timing Configuration
+```
+
+其输出主要回答：
+
+```text
+Earliest Legal Time
+Legal Phase Mask
+必要的Block Reason / Deadline
+```
+
+Timing Engine不决定Bank当前OPEN还是CLOSED，也不保存当前Open Row。
+
+---
+
+## 6.3.4 Access Gate
+
+Maintenance、Power、Reset/Re-init及Config切换可能暂时禁止Normal Access，但这些情况不通过增加BSM状态表达。
+
+统一形成独立Access Gate：
+
+```text
+Normal Access Allowed
+    =
+Maintenance Gate Pass
+AND Power Gate Pass
+AND Reset/Re-init Gate Pass
+AND Config Gate Pass
+```
+
+因此一个Bank可以同时满足：
+
+```text
+BSM = CLOSED
+```
+
+以及：
+
+```text
+Normal Access Blocked
+```
+
+两者不存在矛盾。
+
+---
+
+# 6.4 标准DFI与状态更新边界
+
+## 6.4.1 DFI Presentation不是状态更新依据
+
+MC与PHY之间采用第2章规定的1:8标准DFI子集。
+
+Command进入标准DFI接口只表示：
+
+```text
+DFI Presentation
+```
+
+不直接表示对应DDR操作已经达到MC可以更新Committed State的执行边界。
+
+因此不得采用：
+
+```text
+dfi command valid
+      │
+      ▼
+直接更新BSM / OpenRow / Timing
+```
+
+---
+
+## 6.4.2 Registered-equivalent Event
+
+本章统一使用：
+
+```text
+Registered-equivalent Event
+```
+
+表示能够安全更新MC中DRAM Committed Truth的内部事件。
+
+其形成关系为：
+
+```text
+Standard DFI Presentation
+        │
+        ▼
+已确认的PI / PHY Timing Mapping
+        │
+        ▼
+Registered-equivalent Event
+```
+
+RTL内部可以使用类似：
+
+```text
+cmd_actual_internal
+```
+
+的命名，但它不是标准DFI外部端口。
+
+不同Command Type的Registered-equivalent Event应能够明确关联：
+
+```text
+Command Type
+Target Resource
+Context
+必要的内部Command Reference
+```
+
+具体从DFI Presentation到该事件的Fixed/Finite Mapping由PHY接口控制文件关闭。
+
+---
+
+# 6.5 BSM设计
+
+## 6.5.1 状态定义
+
+**表6-1 BSM状态定义**
+
+| 状态 | 含义 | Normal Command处理 |
+|---|---|---|
+| INACCESSIBLE | MC无法证明Bank当前处于可信可访问状态 | 禁止Normal Command |
+| CLOSED | 已知当前没有Open Row | 可以考虑ACT，但仍需Timing和Access Gate |
+| OPEN | 已知存在有效Open Row | 可以考虑Row-hit RD/WR或Row-miss PRE |
+| ERROR_CONTAIN | Bank状态出现无法安全解释的矛盾 | 禁止Normal Command |
+
+不再设置：
+
+```text
+CLOSED_PENDING
+BLOCKED_SERVICE
+BLOCKED_POWER
+```
+
+其中：
+
+```text
+CLOSED_PENDING
+    -> 实质是tRP未完成
+    -> 归Timing Engine
+
+BLOCKED_SERVICE
+    -> 归Maintenance Access Gate
+
+BLOCKED_POWER
+    -> 归Power Access Gate
+```
+
+---
+
+## 6.5.2 Reset后的INACCESSIBLE
+
+Reset使MC原Bank状态失效，但不能证明DRAM已经处于CLOSED。
+
+因此：
+
+```text
+Reset
+  │
+  ▼
+INACCESSIBLE
+```
+
+只有完成Re-init以及能够证明Bank进入已知可访问状态后，才允许：
+
+```text
+INACCESSIBLE
+      │
+Known Closed / Initialization Proof
+      ▼
+CLOSED
+```
+
+因此：
+
+```text
+Reset Deassert
+!=
+Bank Known Closed
+```
+
+---
+
+## 6.5.3 CLOSED
+
+CLOSED只表示：
+
+> MC能够确认该Bank当前没有Open Row。
+
+不表示：
+
+```text
+ACT可以立即执行
+```
+
+ACT仍必须满足：
+
+```text
+BSM == CLOSED
+AND Timing.ACT_PASS
+AND Access Gate Pass
+```
+
+例如PRE已经发生但tRP尚未满足时：
+
+```text
+BSM = CLOSED
+Timing.ACT_PASS = 0
+```
+
+无需额外增加一个BSM Timing状态。
+
+---
+
+## 6.5.4 OPEN
+
+OPEN表示：
+
+> Bank当前存在有效Open Row。
+
+BSM本身不保存Row Address。
+
+Row Hit判断为：
+
+```text
+BSM == OPEN
+AND
+OpenRow.Valid
+AND
+OpenRow.Row == Requested Row
+```
+
+---
+
+## 6.5.5 状态更新
+
+ACT Registered-equivalent Event满足当前Context及Target检查后：
+
+```text
+CLOSED
+  │
+  ▼
+OPEN
+```
+
+Qualified PRE/Close Event发生后：
+
+```text
+OPEN
+  │
+  ▼
+CLOSED
+```
+
+同一PRE Event还分别触发：
+
+```text
+OpenRow.Valid = 0
+Timing记录PRE History / tRP约束
+```
+
+BSM不因以下事件改变Bank Truth：
+
+```text
+OS Selection
+GS Admission
+DFI Presentation
+Maintenance Claim
+Power Gate
+tRP Complete
+```
+
+---
+
+# 6.6 OpenRow设计
+
+## 6.6.1 存储内容
+
+OpenRow按照Canonical Resource保存当前Row状态。
+
+逻辑字段原则上为：
+
+```text
+Valid
+Row Address
+必要的Geometry Context
+```
+
+若实际流水存在跨周期Old Query误用风险，可以增加轻量Freshness信息；不要求为了统一格式固定增加Generation或全局Sequence。
+
+---
+
+## 6.6.2 ACT更新
+
+只有ACT Registered-equivalent Event能够建立OpenRow：
+
+```text
+ACT Event
+   │
+   ▼
+OpenRow.Valid = 1
+OpenRow.Row   = ACT Target Row
+```
+
+以下阶段不得提前写OpenRow：
+
+```text
+ACT Candidate
+OS Selection
+GS Admission
+DFI Presentation
+```
+
+---
+
+## 6.6.3 PRE及Qualified Close
+
+Qualified PRE/Close Event发生后，对实际关闭的Resource执行：
+
+```text
+OpenRow.Valid = 0
+```
+
+对于作用于多个Bank的PRE类操作，应区分：
+
+```text
+Command Target Set
+```
+
+和：
+
+```text
+Actual Close Member Set
+```
+
+前者表示Command作用范围，后者表示此次操作真正使哪些OPEN Bank发生关闭。
+
+OpenRow只对Actual Close Member清除Row Truth。
+
+---
+
+## 6.6.4 Auto-precharge
+
+RDA/WRA的Command Event本身不一定等价于Row立即关闭。
+
+逻辑关系为：
+
+```text
+RDA / WRA
+    │
+    ▼
+Auto-precharge Obligation
+    │
+相关Data / Row Timing满足
+    │
+    ▼
+Qualified Internal Close
+    │
+    ├── OpenRow.Valid = 0
+    ├── BSM -> CLOSED
+    └── Timing建立Close/tRP约束
+```
+
+因此Auto-precharge Intent不能直接清除OpenRow。
+
+其精确Qualified Close时点仍需DDR6 Timing定义关闭。
+
+---
+
+## 6.6.5 Row Hit/Miss
+
+OpenRow Query至少包含：
+
+```text
+Resource
+Requested Row
+必要的Geometry Context
+```
+
+返回：
+
+```text
+Open Valid
+Stored Row
+Row Match
+Context Valid
+```
+
+Row Hit基本条件为：
+
+```text
+BSM == OPEN
+AND
+OpenRow.Valid
+AND
+Context Match
+AND
+Stored Row == Requested Row
+```
+
+Context不一致不作为普通Row Miss处理，而应重新获取有效状态或进入相应异常处理。
+
+---
+
+## 6.6.6 BSM与OpenRow一致性
+
+**表6-2 BSM与OpenRow典型关系**
+
+| BSM | OpenRow | 含义 |
+|---|---|---|
+| CLOSED | Valid=0 | 正常 |
+| OPEN | Valid=1 | 正常 |
+| INACCESSIBLE | Valid=0 | 不用于Normal Row判断 |
+| ERROR_CONTAIN | 不参与Normal访问 | 等待Recovery |
+
+以下关系属于状态矛盾：
+
+```text
+BSM = CLOSED
+AND OpenRow.Valid = 1
+```
+
+或：
+
+```text
+BSM = OPEN
+AND OpenRow.Valid = 0
+```
+
+发生矛盾时CC不得自行选择相信其中一路。
+
+---
+
+# 6.7 Timing Engine设计
+
+## 6.7.1 设计原则
+
+DDR5 donor中的Timing状态分散在Bank FSM、Rank、BG和Window控制等多个位置。
+
+DDR6将Timing Authoritative State统一至Timing Engine。
+
+这并不意味着所有Timing必须物理上存放在一张RAM中，而是：
+
+> 所有Timing判断必须来自统一的Timing规则及状态体系，不再由BSM、CC等模块分别维护第二套Timing Truth。
+
+---
+
+## 6.7.2 Timing状态组织
+
+Timing State根据实际Scope组织，例如：
+
+### a) Per-resource
+
+可包含：
+
+```text
+Last ACT
+Last PRE
+Last RD
+Last WR
+
+ACT Earliest
+PRE Earliest
+RD Earliest
+WR Earliest
+```
+
+### b) Per-BG
+
+用于处理：
+
+```text
+tRRD
+tCCD
+tWTR
+```
+
+等BG相关关系。
+
+### c) Per-PSD / Device
+
+用于：
+
+```text
+跨BG ACT关系
+Refresh / RFM相关Timing
+其他Device级Timing
+```
+
+### d) Window State
+
+例如：
+
+```text
+tFAW
+```
+
+可以保存必要的历史Event窗口。
+
+### e) Shared Data Resource
+
+若DDR6产品配置存在Shared DQS或其他共享Data Resource，则保存相应RD/WR Turnaround历史。
+
+具体Scope由DDR6 Timing Rule Catalog确定。
+
+---
+
+## 6.7.3 Timing配置
+
+Timing Value不在RTL中散落为硬编码常量。
+
+Timing Engine从当前有效Timing配置获得：
+
+```text
+tRP
+tRCD
+tRAS
+tRC
+tRRD
+tFAW
+tCCD
+tWTR
+tRTW
+...
+```
+
+对应具体Value及Scope。
+
+本章不预先规定一套独立`TDBV`版本字段。
+
+如果后续FSP/Timing Image切换确实可能使跨周期Query使用旧Timing配置，则需要通过Config Publication、Pipeline Flush或必要Version机制保证一致性。
+
+目标是满足：
+
+> 一条Query只能使用同一套有效Timing配置。
+
+而不是预先给所有Timing State增加统一Version字段。
+
+---
+
+# 6.8 1:8 Timing Query与Phase Mask
+
+## 6.8.1 Timing Timebase
+
+Timing Engine使用统一逻辑Timing Tick。
+
+对于1:8接口，一个DFI Issue Word包含：
+
+```text
+P0 P1 P2 P3 P4 P5 P6 P7
+```
+
+逻辑时间表示为：
+
+```text
+Phase Tick
+    =
+Issue Word Base Tick
+    +
+Phase Offset
+```
+
+具体Phase Offset与PHY实际CK/CA边界之间的映射由DFI/PHY接口定义关闭。
+
+---
+
+## 6.8.2 Timing Query
+
+Candidate提交Timing Query时，应提供计算所需的：
+
+```text
+Command Type
+Canonical Resource
+相关Resource Relationship
+Issue Word Time Context
+当前Config / Geometry Context
+```
+
+Timing Engine根据：
+
+```text
+Committed Timing History
++
+Live Timing Reservations
++
+Active Timing Parameters
+```
+
+形成结果。
+
+---
+
+## 6.8.3 Legal Phase Mask
+
+在1:8接口中，不使用单一：
+
+```text
+Timing Pass
+```
+
+作为最终结果，而返回：
+
+```text
+Legal Phase Mask[7:0]
+```
+
+例如：
+
+```text
+Legal Phase Mask = 8'b11111000
+```
+
+表示当前Issue Word中只有后5个Phase满足该Command全部Timing要求。
+
+GS进一步结合：
+
+```text
+Timing Legal Phase
+AND
+Bundle Occupancy
+AND
+Command Span
+AND
+其他资源约束
+```
+
+确定最终Start Phase。
+
+---
+
+## 6.8.4 Phase选择边界
+
+Timing只计算合法Phase集合。
+
+最终Phase由GS决定。
+
+因此：
+
+```text
+Timing Legal Phase
+!=
+GS Selected Phase
+```
+
+并且：
+
+```text
+OS Selection
+!=
+Phase Commit
+```
+
+最终Start Phase在第5章定义的MC Internal Commit时固定。
+
+---
+
+# 6.9 Timing Reservation
+
+## 6.9.1 作用
+
+Timing Query不能只考虑已经发生的Event。
+
+如果一条Command已经完成MC Internal Commit并进入DFI输出流水线，后续Command必须看到它即将产生的Timing影响。
+
+例如：
+
+```text
+ACT_A Commit
+    │
+    ▼
+尚未形成Registered-equivalent ACT Event
+    │
+    ▼
+ACT_B Timing Query
+```
+
+若ACT_B完全忽略ACT_A，则可能违反：
+
+```text
+tRRD
+tFAW
+```
+
+等未来关系。
+
+因此需要Timing Reservation。
+
+---
+
+## 6.9.2 创建时点
+
+Timing Reservation只在：
+
+```text
+MC Internal Commit
+```
+
+时建立。
+
+以下阶段不能建立正式Reservation：
+
+```text
+CC Candidate
+OS Class Head
+GS Bundle Try
+```
+
+避免Speculative Candidate污染Timing状态。
+
+---
+
+## 6.9.3 Reservation内容
+
+Reservation保存实现Timing判断真正需要的信息，例如：
+
+```text
+Command Type
+Target Scope
+Committed Issue Word / Phase
+Selected Tick
+必要的Command Reference
+Context
+```
+
+不要求为了统一Identity模型增加额外Admission Generation等字段。
+
+只要能够保证Reservation与对应Committed Command一一关联即可。
+
+---
+
+## 6.9.4 Query视图
+
+Timing Query使用：
+
+```text
+Committed History
++
+Live Reservation
+```
+
+得到Prospective Timing State。
+
+这样后续Candidate可以看到已经Commit但尚未更新Committed History的前序Command。
+
+---
+
+## 6.9.5 Promote
+
+对应Registered-equivalent Event形成时：
+
+```text
+Reservation
+     │
+     ├──> Committed Timing History Update
+     │
+     └──> Reservation Remove
+```
+
+两者应作为一个一致的状态转换处理，避免：
+
+```text
+History已经加入
++
+Reservation又额外阻塞一次
+```
+
+---
+
+## 6.9.6 Cancel
+
+Reservation只有在能够证明对应Command仍处于可安全取消状态时才能删除。
+
+不能仅根据：
+
+```text
+Timeout
+```
+
+或：
+
+```text
+尚未收到Registered-equivalent Event
+```
+
+推断Command一定没有执行。
+
+已经进入物理可见性不确定区间的Command，进入第10章Recovery流程。
+
+---
+
+# 6.10 ACT及PRE Timing
+
+## 6.10.1 ACT
+
+ACT Timing可能涉及：
+
+```text
+tRP
+tRC
+tRRD
+tFAW
+Refresh / RFM blocker
+```
+
+及最终DDR6 Timing Rule Catalog规定的其他约束。
+
+ACT合法条件可抽象为：
+
+```text
+ACT Legal
+    =
+BSM == CLOSED
+AND
+ACT Timing Pass
+AND
+Access Gate Pass
+```
+
+ACT Registered-equivalent Event形成后：
+
+```text
+BSM -> OPEN
+OpenRow -> Target Row
+Timing更新ACT相关History/Floor
+```
+
+典型包括：
+
+```text
+Next ACT earliest
+RD earliest
+WR earliest
+PRE earliest
+tFAW history
+```
+
+具体公式由当前有效DDR6 Timing参数确定。
+
+---
+
+## 6.10.2 PRE
+
+PRE Timing主要考虑：
+
+```text
+tRAS
+tRTP
+Write-to-PRE相关Timing
+其他PRE限制
+Live Reservation
+```
+
+PRE Registered-equivalent Event后：
+
+```text
+BSM -> CLOSED
+OpenRow -> Invalid
+Timing记录PRE
+Timing建立ACT Earliest = PRE Event + tRP
+```
+
+因此：
+
+```text
+PRE Event
+     │
+     ▼
+Bank已经CLOSED
+```
+
+但：
+
+```text
+tRP未满足
+     │
+     ▼
+Fresh ACT仍然禁止
+```
+
+无需`CLOSED_PENDING`。
+
+---
+
+## 6.10.3 多Bank PRE
+
+对于可能作用多个资源的PRE类Command，应区分：
+
+```text
+Command Target Set
+Timing Target Set
+Actual Close Member Set
+```
+
+Timing Target表示该Command应对哪些Resource更新PRE相关Timing。
+
+Actual Close Member表示哪些OPEN Bank实际被关闭。
+
+二者不能简单当成同一个Mask使用。
+
+具体集合展开规则在第7章Maintenance/Qualified Close部分进一步说明。
+
+---
+
+# 6.11 RD、WR及Data Turnaround Timing
+
+## 6.11.1 总体关系
+
+RD/WR Timing根据最终DDR6 Rule可能涉及：
+
+```text
+Same Bank
+Same BG
+Different BG
+PSD
+Shared DQS / Data Resource
+Read-to-Read
+Write-to-Write
+Read-to-Write
+Write-to-Read
+```
+
+等不同Scope。
+
+Timing Engine根据Canonical Resource关系选择对应规则。
+
+---
+
+## 6.11.2 RD
+
+RD Registered-equivalent Event后，应更新与后续：
+
+```text
+RD
+WR
+PRE
+Data Turnaround
+```
+
+相关的Timing History。
+
+具体包含哪些规则及参数，不在本章自行假定，以DDR6 Timing Rule Catalog为准。
+
+---
+
+## 6.11.3 WR
+
+WR同样在Registered-equivalent Event后更新：
+
+```text
+后续WR限制
+后续RD限制
+PRE限制
+Data Turnaround
+```
+
+Write Data是否已经完全Drain属于Write Data Path / PHY相关生命周期，不直接由本章Timing History推断。
+
+---
+
+## 6.11.4 Shared DQS及PHY相关Timing
+
+涉及：
+
+```text
+RL
+WL
+DQS Preamble/Postamble
+Shared DQS
+PHY内部延迟
+```
+
+等物理相关信息时，应区分：
+
+```text
+DDR Protocol Timing
+```
+
+和：
+
+```text
+PHY Physical Timing
+```
+
+MC Timing Engine只维护其必须知道的协议约束。
+
+PHY内部SerDes、TC、DQ/DQS物理延迟不复制到MC Timing State中。
+
+若某项PHY结果会改变MC可合法发令时间，则通过正式DFI/PHY接口定义提供必要信息。
+
+---
+
+# 6.12 Query Freshness与Same-cycle处理
+
+## 6.12.1 Freshness功能要求
+
+CC或GS使用的BSM、OpenRow和Timing Query必须反映当前有效状态。
+
+但本章不强制所有Query统一增加：
+
+```text
+Generation
+Global Sequence
+Global Epoch
+```
+
+Freshness可以根据RTL实现采用：
+
+a) Same-cycle Forwarding；
+
+b) Pipeline Stall；
+
+c) Query Replay；
+
+d) 局部Sequence；
+
+e) Context Version；
+
+中的一种或组合。
+
+原则只有一个：
+
+> 已失效的旧Query Result不得产生Fresh Command Commit。
+
+---
+
+## 6.12.2 Same-cycle State Update
+
+同一周期可能有多个Event影响同一Timing State。
+
+对于可以合法合并的Earliest Floor更新：
+
+```text
+Next Floor
+    =
+MAX(
+Old Floor,
+Event A Floor,
+Event B Floor,
+...
+)
+```
+
+对于无法合法共存的Event，不通过多个Nonblocking Assignment书写顺序决定结果，而应阻止正常功能更新并进入异常处理。
+
+---
+
+## 6.12.3 Query与Update同拍
+
+若Query和Committed Event Update访问同一State，则Query必须看到等价于：
+
+```text
+Current State
++
+Same-cycle Authenticated Update
++
+Live Reservation
+```
+
+的有效结果。
+
+高频State可以使用Forwarding。
+
+若实现复杂度过高，也可以在冲突周期阻塞或Replay Query。
+
+第一版不要求所有State都支持复杂全旁路。
+
+---
+
+# 6.13 BSM、OpenRow与Timing联合更新
+
+同一Registered-equivalent Event可以被多个Owner同时消费，但每个Owner只写自己的状态。
+
+ACT：
+
+```text
+ACT Registered-equivalent Event
+          │
+          ├── BSM
+          │     CLOSED -> OPEN
+          │
+          ├── OpenRow
+          │     Valid = 1
+          │     Row = Target Row
+          │
+          └── Timing
+                ACT History
+                tRCD / tRAS / tRC
+                tRRD / tFAW等
+```
+
+PRE：
+
+```text
+PRE Registered-equivalent Event
+          │
+          ├── BSM
+          │     OPEN -> CLOSED
+          │
+          ├── OpenRow
+          │     Valid = 0
+          │
+          └── Timing
+                PRE History
+                tRP
+                其他PRE关系
+```
+
+后续：
+
+```text
+tRP满足
+```
+
+只改变Timing Query结果，不再触发BSM：
+
+```text
+CLOSED_PENDING -> CLOSED
+```
+
+之类的状态转换。
+
+---
+
+# 6.14 Reset、Backpressure与异常处理
+
+## 6.14.1 Query Backpressure
+
+BSM、OpenRow及Timing Query可以根据物理实现增加Pipeline或Result Hold。
+
+下游不能接收时，应保持完整Response稳定。
+
+---
+
+## 6.14.2 Registered-equivalent Event不得丢失
+
+Registered-equivalent Event代表Committed DRAM State更新依据。
+
+如果State Store当周期无法接受全部更新，应设置：
+
+```text
+Update Ingress Buffer
+```
+
+或等效结构。
+
+不得因为RAM Port不足静默丢弃Event。
+
+---
+
+## 6.14.3 Reset
+
+Destructive Reset后：
+
+```text
+BSM -> INACCESSIBLE
+OpenRow.Valid -> 0
+Timing Ready -> 0
+```
+
+并使当前旧Session Query/Reservation按照Reset合同失效。
+
+Timing尚未重新建立可信状态时：
+
+```text
+Legal Phase Mask = 0
+```
+
+OpenRow被清零只代表MC旧Row Truth失效，不证明DRAM已经物理Closed。
+
+---
+
+## 6.14.4 状态矛盾
+
+以下情况禁止继续Normal Command：
+
+a) BSM=CLOSED但OpenRow.Valid=1；
+
+b) BSM=OPEN但OpenRow.Valid=0；
+
+c) CLOSED状态出现无法解释的Close Event；
+
+d) OPEN Bank收到不合法Fresh ACT Event；
+
+e) 同一Resource同周期出现无法同时成立的ACT/PRE更新；
+
+f) Timing State收到互相矛盾的Update；
+
+g) Reservation与Registered-equivalent Event无法对应；
+
+h) Old Session Event试图修改Fresh State；
+
+i) Timing Config Context失配但继续返回PASS。
+
+无法安全解释时进入：
+
+```text
+ERROR_CONTAIN
+```
+
+或对应Timing/Error Containment路径。
+
+---
+
+# 6.15 DDR5继承与DDR6修改关系
+
+**表6-3 DRAM状态及Timing模块演进关系**
+
+| DDR5设计内容 | DDR6处理 | 收敛后的变化 |
+|---|---|---|
+| Per-bank FSM | MAJOR REFACTOR | 收敛为四态Bank Truth |
+| INIT/IDLE/ACTIVE思想 | KEEP SEMANTIC | 映射为INACCESSIBLE/CLOSED/OPEN |
+| ACTIVATING/PRECHARGING | DELETE AS BSM STATE | Timing等待归Timing Engine |
+| BSM内tRCD/tRP/tRAS/tRC Counter | MOVE | 统一进入Timing Engine |
+| BSM内Command OK | DECOUPLE | Bank State Pass与Timing Pass分离 |
+| TE page-open shadow | DELETE AS TRUTH | OpenRow成为唯一Row Owner |
+| Page Table思想 | MODIFY/REUSE | 形成per-resource OpenRow |
+| ACT Candidate写Row | DELETE | 仅Registered-equivalent ACT更新 |
+| PRE Intent清Row | DELETE | 仅Qualified Close更新 |
+| Auto-precharge Intent清Row | DELETE | 等待Qualified Internal Close |
+| 分散Timing Counter | MAJOR REFACTOR | 集中Timing Owner |
+| tFAW/window实现思想 | REUSE | 可复用Window算法 |
+| 固定Phase Timing | MODIFY | 适配1:8 Legal Phase Mask |
+| Grant更新Timing | DELETE | Registered-equivalent Event更新History |
+| 无Future Reservation | NEW | MC Internal Commit建立Reservation |
+| Service/Power Block写入BSM | DELETE | 独立Access Gate |
+| 私有`cmd_actual` PHY接口 | NOT USED | 由标准DFI+PHY Mapping恢复内部Event |
+
+---
+
+# 6.16 本章收敛结论及待闭合项
+
+经过预评审及DDR5 donor实读，本章以下内容作为当前架构结论：
+
+a) BSM、OpenRow和Timing为三个独立Authoritative Owner；
+
+b) BSM收敛为`INACCESSIBLE / CLOSED / OPEN / ERROR_CONTAIN`四态；
+
+c) 删除`CLOSED_PENDING`，PRE发生后Bank Truth直接进入CLOSED；
+
+d) tRP、tRCD、tRAS、tRC等协议Timing全部归Timing Engine；
+
+e) Maintenance Claim和Power Block不再作为BSM State；
+
+f) OpenRow成为唯一Row Truth，TE中的Page信息仅允许作为可失效Cache；
+
+g) ACT只在Registered-equivalent Event后建立OpenRow；
+
+h) Qualified PRE/Close Event直接清除实际关闭Bank的OpenRow；
+
+i) Auto-precharge Intent不直接清Row；
+
+j) Timing Engine统一管理DDR协议Timing，不再让BSM、Rank Logic和CC分别拥有Timing Truth；
+
+k) 1:8 Timing Query输出Legal Phase Mask；
+
+l) 最终Start Phase由GS确定；
+
+m) Timing Reservation仅在MC Internal Commit时建立；
+
+n) Reservation属于MC内部状态，不形成DFI外部接口；
+
+o) `cmd_actual`只保留为内部Registered-equivalent语义，不作为DFI信号；
+
+p) Freshness是功能要求，但不强制所有Query统一增加Generation/Global Epoch；
+
+q) Reset后BSM首先进入INACCESSIBLE，而不是直接假定CLOSED。
+
+**表6-4 本章待闭合项**
+
+| 类别 | 待闭合内容 | 关闭方式 |
+|---|---|---|
+| Timing Rule | DDR6完整Rule、Scope及约束关系 | DDR6规范 |
+| Timing Value | 各Profile/FSP对应参数 | DDR6规范/Product |
+| 1:8 Mapping | P0～P7与PHY实际CK/CA Timing Point | DFI/PHY ICD |
+| Registered-equivalent Event | DFI Presentation到内部Event的Fixed/Finite Mapping | PHY ICD |
+| Topology | PSD、BG、1p12等资源关系 | Product/DDR6配置 |
+| Shared DQS | 最终Shared DQS Group定义 | Product/PHY |
+| Auto-precharge | Qualified Internal Close精确时点 | DDR6规范 |
+| Multi-bank PRE | Timing Target与Actual Close集合展开 | DDR6规范/Geometry |
+| Timing Storage | Hot State Port、RAM/FF组织 | RTL/P&R |
+| Timing Reservation | 实际深度及存储方式 | 吞吐/资源评估 |
+| Query Pipeline | BSM/OpenRow/Timing Query具体Latency | RTL/P&R |
+| Config/FSP切换 | Timing配置安全发布方式 | 第8章联合关闭 |
+| Physical Timing | RL/WL及需要暴露给MC的PHY相关参数 | DFI/PHY ICD |
+
+上述开放项主要影响Timing规则、参数、物理实现及DFI映射，不重新打开BSM、OpenRow和Timing三者的Owner划分。
