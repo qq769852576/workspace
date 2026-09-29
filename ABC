@@ -1,0 +1,490 @@
+# 附录A MC/PHY标准DFI接口检查表
+
+## A.1 目的
+
+本附录用于DDR6 MC与PHY接口设计、RTL Review、DV及集成阶段的统一检查。
+
+其核心原则为：
+
+```text
+MC ↔ PHY External Interface
+        =
+Standard DFI Signal Subset
+```
+
+即：
+
+> 所采用DFI版本已经定义的信号可以根据Product和PHY需求保留或裁剪，但不得为了实现MC内部状态、Identity或Proof重新定义一套私有“DFI协议”。
+
+以下对象原则上属于MC/PI内部：
+
+```text
+Phase Placement
+Legal Phase Mask
+Timing Reservation
+Logical Transaction ID
+Attempt Context
+Read Correlation Journal
+Payload Reference
+Registered-equivalent Event
+Reset/Session Context
+No-old-feedback Proof
+```
+
+除非所采用标准DFI版本本身已有对应标准Carrier，否则不得直接映射为新的MC↔PHY端口。
+
+---
+
+## A.2 标准DFI信号分类
+
+**表A-1 DFI信号分类原则**
+
+| 类别 | 处理 | 设计原则 |
+|---|---|---|
+| Command/Address | RETAIN | DDR6 Command通过标准DFI Command/Address成员输出 |
+| Write Data | RETAIN | 使用标准`dfi_wrdata`、`dfi_wrdata_en`、Mask等 |
+| Read Data | RETAIN | 使用标准`dfi_rddata`、`dfi_rddata_valid`、`dfi_rddata_en`等 |
+| `dfi_alert_n` | MANDATORY RETAIN | 独立PHY→MC ALERT通路 |
+| Initialization | RETAIN | 保留当前Build需要的标准初始化生命周期 |
+| Update | FEATURE-GATED | `ctrlupd/phyupd`等按PHY需求启用 |
+| Frequency | FEATURE-GATED | FSP/频率切换实际使用时保留 |
+| Low Power | FEATURE-GATED | Power方案实际需要时保留 |
+| PHY Master | FEATURE-GATED | 仅在目标PHY流程要求时保留 |
+| Training相关标准机制 | FEATURE-GATED | 根据DFI版本及PHY ICD确定 |
+| 自定义Command Ready/Accept | DELETE AS DFI PORT | 如需Resource Ready，仅留在MC内部 |
+| 自定义`cmd_actual` | DELETE AS DFI PORT | 仅保留内部Registered-equivalent Event |
+| 自定义Read Tag | DELETE AS DFI PORT | Read Correlation留PI内部 |
+| 自定义Flush/Session/Epoch | DELETE AS DFI PORT | Reset隔离属于内部状态或正式PHY合同 |
+| 自定义`phy_fatal/op_done` | DELETE AS DFI PORT | 不替代标准DFI已有能力 |
+
+---
+
+## A.3 1:8 Command接口检查
+
+MC内部采用：
+
+```text
+P0 P1 P2 P3 P4 P5 P6 P7
+```
+
+作为逻辑Phase Placement空间。
+
+内部Command可以描述为：
+
+```text
+Command Type
+Target
+Start Phase
+Span
+Continuation
+Context
+```
+
+其中：
+
+```text
+Start Phase
+Span
+Continuation
+Legal Phase Mask
+```
+
+均属于MC内部调度字段。
+
+PI负责将已经Commit的Command按照正式DFI定义转换为标准Command/Address信号。
+
+检查项：
+
+```text
+[ ] GS确定的Start Phase属于Timing Legal Phase Mask
+[ ] 同一Issue Word不存在Phase/Span冲突
+[ ] Cross-word Continuation完整
+[ ] GS Commit以后PI不重新选择Phase
+[ ] PI不重新进行OS/GS Arbitration
+[ ] P0～P7最终编码来自正式DFI/PHY Mapping
+```
+
+---
+
+## A.4 MC Internal Commit检查
+
+MC Internal Commit定义为：
+
+> Command已经完成Timing、Phase Occupancy、数据资源及PI/DFI输出条件检查，并被不可逆地插入标准DFI输出流水线。
+
+逻辑关系为：
+
+```text
+Candidate
+   │
+   ▼
+OS Class Head
+   │
+   ▼
+GS Bundle
+   │
+   ▼
+Resource Prepare
+   │
+   ▼
+MC Internal Commit
+   │
+   ▼
+Standard DFI Presentation
+```
+
+Commit之后：
+
+a) Command Type不得因普通Backpressure改变；
+
+b) Start Phase不得重新选择；
+
+c) Bundle内部顺序不得重新调度；
+
+d) 正式Timing Reservation已经生效。
+
+内部可以存在：
+
+```text
+Output Hold
+Credit
+Reservation
+Occupancy
+```
+
+等实现。
+
+但不得因此增加外部：
+
+```text
+cmd_ready
+cmd_accept
+cmd_launch
+reserve_token
+```
+
+私有DFI握手。
+
+---
+
+## A.5 Registered-equivalent Event检查
+
+标准DFI Presentation不直接等价于DRAM Committed Truth更新。
+
+统一采用：
+
+```text
+Standard DFI Presentation
+          │
+          ▼
+Signed PI / PHY Mapping
+          │
+          ▼
+Registered-equivalent Event
+```
+
+Registered-equivalent Event可在MC内部称为：
+
+```text
+cmd_actual_internal
+```
+
+但不得成为外部DFI端口。
+
+其主要Consumer包括：
+
+```text
+BSM
+OpenRow
+Timing History
+Refresh / RFM Accounting
+PRAC / BAT
+Read / Write Physical Progress
+```
+
+检查项：
+
+```text
+[ ] Presentation→Event关系有正式PHY ICD依据
+[ ] BSM不在Presentation时提前更新
+[ ] OpenRow不在Presentation时提前更新
+[ ] Committed Timing History不在Presentation时提前更新
+[ ] 外部不存在cmd_actual私有端口
+```
+
+---
+
+## A.6 Read接口及Correlation检查
+
+外部Read Path使用标准DFI成员，例如：
+
+```text
+MC -> PHY:
+dfi_rddata_en
+
+PHY -> MC:
+dfi_rddata_valid
+dfi_rddata
+
+Optional:
+dfi_rddata_dbi
+dfi_rddata_cs
+```
+
+具体成员及Width以最终DFI版本和PHY ICD为准。
+
+以下对象留在PI/Read内部：
+
+```text
+Logical Read Identity
+Execution Attempt
+Expected Reference
+Assembly Reference
+Issue Journal
+Correlation Context
+```
+
+如果标准DFI Read Return没有Tag，则必须证明：
+
+```text
+Issue Order
++
+Ordered / Fixed-route Return
++
+Known Return Layout
+```
+
+能够唯一恢复Logical Read。
+
+检查项：
+
+```text
+[ ] Logical Read ID没有出现在DFI端口
+[ ] Attempt ID没有出现在DFI端口
+[ ] 不存在rd_token
+[ ] 不存在physical_return_tag
+[ ] Return Ordering合同已签署或Positive Path保持Gated
+[ ] Earliest Return已定义
+[ ] Old Return不会写Fresh Attempt
+```
+
+---
+
+## A.7 Write接口检查
+
+外部Write Path使用标准成员：
+
+```text
+dfi_wrdata
+dfi_wrdata_en
+dfi_wrdata_mask
+```
+
+以及最终Build要求的其他标准Write成员。
+
+PI内部负责：
+
+```text
+WR Command
++
+Write Attempt
++
+Payload Reference
+```
+
+的正确Join。
+
+检查项：
+
+```text
+[ ] Payload Reference不暴露至PHY
+[ ] Attempt ID不暴露至PHY
+[ ] Command/Data Join在PI内部明确建立
+[ ] Write Data Timing符合DFI合同
+[ ] 不存在write_accept私有DFI端口
+[ ] 不存在write_drain私有DFI端口
+[ ] 不存在write_done私有DFI端口
+```
+
+如果PHY没有独立Accept/Drain/Status Carrier，则MC内部Write Completion必须根据实际可证明的标准DFI/PHY边界重新定义，不能虚构反馈。
+
+---
+
+## A.8 Reset及Reopen检查
+
+外部优先采用正式DFI生命周期，例如：
+
+```text
+dfi_reset_n
+dfi_init_start
+dfi_init_complete
+```
+
+以及Build实际保留的：
+
+```text
+ctrlupd
+phyupd
+lp
+phymstr
+frequency
+```
+
+等标准Feature。
+
+MC内部可以维护：
+
+```text
+Reset/Re-init State
+Local Matchability
+CDC/RDC Barrier
+Retry Context
+Optional Reset Epoch
+```
+
+但不得将以下内部概念作为DFI外部信号：
+
+```text
+flush_req
+flush_done
+no_old_return_done
+session_epoch
+```
+
+Traffic Reopen至少需要证明：
+
+```text
+Host/HIF Boundary Complete
+AND MC Local Clear Complete
+AND CDC/RDC Safe
+AND DFI/PHY Initialization Complete
+AND Old Feedback Cannot Pollute Fresh State
+AND DRAM Initialization Complete
+AND Required MR Effective
+AND Required Training Complete
+AND Config/Geometry/Timing Ready
+AND Bank State Known
+AND Maintenance Ready
+AND !Fatal
+```
+
+因此：
+
+```text
+Reset Deassert
+!=
+mc_ready
+```
+
+并且：
+
+```text
+dfi_init_complete
+!=
+mc_ready
+```
+
+---
+
+## A.9 ALERT检查
+
+必须保留：
+
+```text
+PHY -> MC : dfi_alert_n
+```
+
+内部路径为：
+
+```text
+dfi_alert_n
+     │
+     ▼
+Capture
+     │
+     ├── Timing / Deadline
+     ├── PRAC / RFM / Recovery
+     ├── GS Maintenance Gate
+     └── Trace / Error
+```
+
+检查项：
+
+```text
+[ ] ALERT不会被普通Command/Data路径吞掉
+[ ] ALERT与REF/RFM Command Event相互独立
+[ ] Old ALERT不得修改Fresh Recovery State
+[ ] Reset过程中不会Silent Lose尚未处理的ALERT
+[ ] 不使用phy_fatal替代dfi_alert_n
+```
+
+---
+
+## A.10 External Port Lint
+
+每次MC↔PHY接口修改后，应自动或人工执行：
+
+```text
+RTL External Port List
+          │
+          ▼
+Compare
+          │
+          ▼
+Signed DFI Signal Master List
+```
+
+允许结果：
+
+```text
+STANDARD_DFI_RETAIN
+STANDARD_DFI_FEATURE_GATED
+APPROVED_NON_DFI_SIDEBAND
+```
+
+禁止存在未经批准的：
+
+```text
+cmd_ready
+cmd_accept
+cmd_actual
+reserve_token
+rd_token
+physical_return_tag
+flush_done
+session_epoch
+write_done
+training_done
+phy_fatal
+```
+
+等“DFI”信号。
+
+---
+
+## A.11 PHY Integration前检查表
+
+真实PHY Positive Path接入前至少确认：
+
+```text
+[ ] 最终DFI版本已确定
+[ ] Standard DFI Signal Master List已签署
+[ ] Command/Address Width已关闭
+[ ] P0～P7 Physical Mapping已关闭
+[ ] Presentation→Registered-equivalent Mapping已关闭
+[ ] DFI Output Timing具有Finite/Deterministic合同
+[ ] Read Return Ordering已关闭
+[ ] Earliest Read Return已关闭
+[ ] Write Command/Data关系已关闭
+[ ] Write Visibility/Completion合同已关闭
+[ ] dfi_alert_n行为已关闭
+[ ] Reset/Init生命周期已关闭
+[ ] FSP/Power/Update标准Feature已确定
+[ ] Training Carrier已确定
+[ ] CDC/RDC已Review
+[ ] 外部Interface Lint通过
+```
+
+未关闭项目继续由第13章Open Gate管理。
+
+本附录仅作为接口检查和集成准入依据，不建立第二套MC/PHY协议定义。
