@@ -1,0 +1,1087 @@
+# 5 命令构造、调度与准入设计
+
+## 5.1 功能范围与设计目标
+
+命令构造、调度与准入模块负责将TE提供的Eligible Transaction转换为满足当前Bank状态、OpenRow、Timing、资源容量及维护类服务要求的DDR6 Command，并最终提交至PI/DFI输出路径。
+
+该过程由CC、OS和GS三个阶段组成：
+
+```text
+TE Eligible Transaction
+          │
+          ▼
+         CC
+  Structural Candidate
+          │
+          ▼
+         OS
+   Multi-Class Heads
+          │
+          ├──────── Maintenance Service Heads
+          │
+          ▼
+         GS
+   Bundle / Admission
+          │
+          ▼
+      PI / DFI
+```
+
+三个阶段分别回答：
+
+```text
+CC：
+下一条结构命令是什么？
+
+OS：
+普通Host候选中，各Command Class当前选择谁？
+
+GS：
+当前哪些Command能够一起安全Commit？
+```
+
+应严格区分：
+
+```text
+Candidate
+!=
+Selection
+!=
+Admission
+!=
+DFI Commit
+!=
+Registered-equivalent Event
+```
+
+CC、OS和GS均不得直接更新BSM、OpenRow或Committed Timing History。
+
+---
+
+## 5.2 总体结构
+
+命令处理总体结构如下。
+
+```text
+                    TE Eligible Transactions
+                             │
+          ┌──────────────────┼──────────────────┐
+          │                  │                  │
+          ▼                  ▼                  ▼
+         BSM              OpenRow            Timing
+        Query              Query              Query
+          │                  │                  │
+          └──────────────────┼──────────────────┘
+                             ▼
+                         ┌───────┐
+                         │  CC   │
+                         └───┬───┘
+                             │
+                    Structural Candidates
+                             │
+                             ▼
+                     ┌──────────────┐
+                     │      OS      │
+                     │ Multi-Class  │
+                     │    Heads     │
+                     └──────┬───────┘
+                            │
+                    ┌───────┴────────┐
+                    │                │
+                    │        Refresh / RFM /
+                    │        MR / Recovery /
+                    │        Power等Service
+                    │                │
+                    └───────┬────────┘
+                            ▼
+                     ┌──────────────┐
+                     │      GS      │
+                     │ Bundle Build │
+                     │ Admission    │
+                     └──────┬───────┘
+                            │
+                    PI / DFI Output
+                            │
+                            ▼
+                           PHY
+```
+
+**图5-1 命令构造、选择及准入总体结构**
+
+DDR5 donor已经证明OS和GS具有多Class及Phase-aware调度基础，因此DDR6不采用“OS单Global Winner→GS单Admitted Command”的Production架构。
+
+Bring-up阶段可以限制一次只Commit一条Command，但该限制属于配置，不改变OS和GS的功能边界。
+
+---
+
+# 5.3 CC设计
+
+## 5.3.1 功能职责
+
+CC负责根据TE Transaction及当前DRAM状态确定该Transaction下一步需要执行的结构命令。
+
+主要职责为：
+
+a) 接收TE Eligible Transaction；
+
+b) 查询目标资源BSM状态；
+
+c) 查询OpenRow状态；
+
+d) 判断Row Hit或Row Miss；
+
+e) 获取当前Timing判断；
+
+f) 获取Read/Write相关基本Prerequisite；
+
+g) 形成ACT、PRE、RD或WR等Normal Candidate；
+
+h) 将Candidate及其有效性依据提供给OS。
+
+CC不负责：
+
+a) Normal Candidate之间的全局仲裁；
+
+b) Maintenance与Normal之间的优先级；
+
+c) 最终Bundle Packing；
+
+d) DFI输出资源分配；
+
+e) Timing Reservation Commit；
+
+f) Bank/OpenRow状态更新；
+
+g) Transaction Terminal。
+
+---
+
+## 5.3.2 Structural Command生成
+
+普通Read/Write Transaction的基本命令关系为：
+
+| BSM状态 | OpenRow关系 | 下一步命令 |
+|---|---|---|
+| CLOSED | 无有效Open Row | ACT |
+| OPEN | Row Hit | RD或WR |
+| OPEN | Row Miss | PRE |
+| INACCESSIBLE / ERROR_CONTAIN | — | 不生成Normal Candidate |
+
+当Bank为CLOSED时，即使当前tRP尚未满足，结构命令仍然是ACT。
+
+因此：
+
+```text
+Timing Not Ready
+!=
+改变Structural Command
+```
+
+Timing只决定该ACT当前能否进入后续选择和Commit，不应通过修改命令类型绕过Timing约束。
+
+---
+
+## 5.3.3 状态Owner边界
+
+DDR5 donor中的CC曾同时消费Bank状态、Timing结果、Page Hit以及部分Maintenance和Page-close策略。
+
+DDR6对CC职责进行拆分：
+
+```text
+Bank Truth
+    -> BSM
+
+Row Truth
+    -> OpenRow
+
+Timing Truth
+    -> Timing Engine
+
+Maintenance Ownership
+    -> 对应Maintenance Owner
+
+Final Phase Packing
+    -> GS
+```
+
+CC只读取这些Owner提供的Query结果，不保存并独立演化第二份状态。
+
+---
+
+## 5.3.4 Candidate有效性
+
+一个Normal Candidate能够进入OS，至少应满足：
+
+```text
+Transaction Eligible
+AND
+Structural Command Valid
+AND
+BSM Query Valid
+AND
+OpenRow Query Valid
+AND
+Timing Query Valid
+AND
+Read/Write Prerequisite Valid
+AND
+Config / Geometry / Session Valid
+```
+
+其中Timing Query可以给出：
+
+```text
+Timing Pass
+Legal Phase Mask
+Earliest Legal Time
+其他必要Timing Constraint
+```
+
+若当前Timing尚未满足，Transaction继续保留，等待后续重新查询，不需要删除或改变Transaction。
+
+---
+
+## 5.3.5 Candidate及Freshness
+
+Candidate在等待期间，BSM、OpenRow、Timing或Config状态可能变化。
+
+因此Candidate应能够关联其形成时所依据的状态版本或Freshness信息。
+
+若发现Candidate依据已经失效：
+
+```text
+Candidate Stale
+     │
+     ▼
+Invalidate
+     │
+     ▼
+Transaction仍有效
+     │
+     ▼
+重新查询状态
+     │
+     ▼
+重新构造Candidate
+```
+
+不得仅修改已Hold Candidate中的局部字段继续执行。
+
+第一版不要求为了Freshness统一增加复杂Generation；具体采用Sequence、Version或重新查询方式，根据对应Owner实际实现决定。
+
+---
+
+## 5.3.6 Normal与Maintenance分离
+
+CC只处理Normal Host Transaction。
+
+Refresh、RFM、MR、Recovery、Power等操作由各自Owner形成Service Candidate，不转换成伪Host Transaction进入Normal CC。
+
+二者最终在GS汇合。
+
+---
+
+# 5.4 OS设计
+
+## 5.4.1 OS职责
+
+OS负责Normal Host Candidate选择。
+
+DDR5 donor已经证明OS不是单一Global Winner，而是对ACT、PRE、RD/WR以及不同Priority分别进行选择。
+
+因此DDR6继续采用：
+
+```text
+Multi-Class Heads
+```
+
+而不是：
+
+```text
+所有Candidate
+     │
+     ▼
+一个Global Winner
+```
+
+---
+
+## 5.4.2 Command Class
+
+初始逻辑Class可以包括：
+
+```text
+RW High Priority
+RW Low Priority
+
+ACT High Priority
+ACT Low Priority
+
+PRE High Priority
+PRE Low Priority
+```
+
+具体Class数量可根据现有DDR5 donor和Product QoS需要进行裁剪。
+
+Maintenance Service不作为Normal OS Class加入。
+
+---
+
+## 5.4.3 Class Head
+
+每个Class由OS选择当前Head。
+
+Class Head至少关联：
+
+```text
+Command Type
+Logical Transaction
+Source Reference
+Target Resource
+Priority / QoS
+Timing / Phase Information
+Config / Session Context
+Freshness Information
+```
+
+当下游暂时无法消费时，对应Class Head应稳定保持。
+
+不同Class可以同时存在Head。
+
+---
+
+## 5.4.4 Phase-aware Selection
+
+DDR5 donor已经存在Phase-aware Selection，因此DDR6 OS继续保留这一设计思想。
+
+Timing Engine提供的：
+
+```text
+Legal Phase Mask[7:0]
+```
+
+可以随Candidate进入OS/GS。
+
+但OS只负责选择Candidate，不负责最终固定Start Phase。
+
+最终Placement由GS在构造完整1:8 Bundle时确定。
+
+因此：
+
+```text
+OS Selection
+!=
+Phase Commit
+```
+
+---
+
+## 5.4.5 Fairness
+
+Priority、Round-Robin、Age及Quota等性能策略可以继续在OS中使用。
+
+但Fairness状态只应在对应Head**真正完成GS Commit**后更新。
+
+不能在：
+
+```text
+Candidate Valid
+OS Head形成
+GS尝试但最终未Commit
+```
+
+时提前认为该Source已获得服务。
+
+---
+
+# 5.5 GS设计
+
+## 5.5.1 功能职责
+
+GS是Normal Traffic和Maintenance Service的最终准入点。
+
+其输入包括：
+
+```text
+OS Multi-Class Heads
++
+Refresh / RFM / MR /
+Recovery / Power等Service Candidate
+```
+
+GS负责决定当前DFI Issue Word中哪些Command能够一起安全提交。
+
+主要职责包括：
+
+a) 检查Candidate Freshness；
+
+b) 处理Normal与Mandatory Service关系；
+
+c) 确定Command Placement；
+
+d) 检查Phase和Span冲突；
+
+e) 检查不同Command之间的Target和Domain冲突；
+
+f) 确认Read/Write及其他有限资源可用；
+
+g) 建立必要Timing Reservation；
+
+h) 确认PI/DFI输出流水能够接受该Bundle；
+
+i) 完成MC Internal Commit。
+
+---
+
+## 5.5.2 为什么采用Bundle结构
+
+DDR5 donor GS已经能够在1:4调度中组合RW、ACT、PRE及REF，并使用Extension State处理跨Word占用。
+
+因此DDR6目标1:8接口不能在架构阶段固定为：
+
+```text
+一个OS Winner
+    │
+    ▼
+一个GS Admitted Hold
+```
+
+DDR6 GS采用可扩展Bundle结构：
+
+```text
+Multi-Class Heads
+        │
+        ▼
+Bundle Candidate
+        │
+        ▼
+Phase / Span Check
+        │
+        ▼
+Resource Prepare
+        │
+        ▼
+DFI Output Check
+        │
+        ▼
+Commit
+```
+
+Bring-up可以配置：
+
+```text
+ISSUE_LANES = 1
+```
+
+但Production是否继续采用1 Lane，应通过吞吐分析和FPGA实现结果确定，而不能由架构文档提前固定。
+
+---
+
+# 5.6 1:8 Command Bundle与Phase Packing
+
+## 5.6.1 Issue Word
+
+一个1:8 DFI Command Word包含：
+
+```text
+P0 P1 P2 P3 P4 P5 P6 P7
+```
+
+每条Command具有：
+
+```text
+Start Phase
+Span
+Continuation
+```
+
+GS维护当前Issue Word的Phase Occupancy。
+
+---
+
+## 5.6.2 Bundle兼容条件
+
+两条Command允许进入同一Bundle至少需要满足：
+
+```text
+Phase/Span不重叠
+AND
+Command Domain兼容
+AND
+Target不存在非法冲突
+AND
+Timing相互兼容
+AND
+Read/Write资源充足
+AND
+Mandatory Service Deadline不被破坏
+AND
+PI/DFI输出结构能够承载
+```
+
+最终兼容规则由Command Span/Placement Matrix确定。
+
+在该Matrix关闭前，不假设：
+
+```text
+每条Command span = 1
+```
+
+也不假设：
+
+```text
+每Word只能放一条Command
+```
+
+---
+
+## 5.6.3 Cross-word Command
+
+若DDR6 Command允许跨DFI Word：
+
+```text
+Word N
+  └── Command前半部分
+
+Word N+1
+  └── Continuation
+```
+
+则Continuation必须显式记录，并占用下一Word对应Phase。
+
+不得到下一周期重新仲裁该Command的剩余部分。
+
+如果最终DFI/PHY不支持Cross-word Placement，则Command Span Matrix应相应限制合法Start Phase。
+
+---
+
+# 5.7 Resource Prepare与原子Commit
+
+## 5.7.1 Prepare
+
+GS在真正Commit前，应检查Command执行所需全部有限资源。
+
+典型资源包括：
+
+```text
+Timing Reservation Capacity
+Read Expected / Assembly Capacity
+Write Payload / Attempt相关资源
+Command Occupancy
+Maintenance Service State
+PI / DFI Output Buffer Capacity
+```
+
+资源检查应基于当前Bundle整体进行。
+
+---
+
+## 5.7.2 单Command原子性
+
+一条Command被Commit时，其所需资源必须：
+
+```text
+All-or-none
+```
+
+不允许出现：
+
+```text
+Timing Reservation已经写入
+但Read Expected分配失败
+```
+
+或者：
+
+```text
+Command Occupancy已经占用
+但DFI输出无法建立
+```
+
+等Partial Commit。
+
+---
+
+## 5.7.3 Multi-command Bundle
+
+Bundle包含多条Command时，不要求所有候选必须全部Commit。
+
+GS可以从候选集合中形成一个合法Accepted Subset。
+
+但Accepted Subset必须基于统一Pre-state计算，使：
+
+```text
+Phase Occupancy
+Command Domain
+Shared Resources
+Timing Reservation
+```
+
+整体自洽。
+
+未被Commit的Head继续保持，不更新对应Fairness。
+
+---
+
+# 5.8 DFI Commit边界
+
+## 5.8.1 不再使用私有PHY握手
+
+此前设计中的“PI Issue Reservation Token”只保留为可能的MC内部实现概念，不作为PHY接口。
+
+MC↔PHY外部DFI不增加：
+
+```text
+cmd_ready
+cmd_accept
+cmd_launch
+reserve_token
+```
+
+等私有信号。
+
+---
+
+## 5.8.2 MC Internal Commit
+
+Command Commit定义为：
+
+> GS和PI已经完成Timing、Phase Occupancy、数据资源及当前PI/DFI输出条件检查，并将对应Command不可逆提交到标准DFI输出流水线。
+
+因此：
+
+```text
+GS Bundle Prepared
+        │
+        ▼
+PI / DFI Output Capacity Confirmed
+        │
+        ▼
+MC Internal Commit
+        │
+        ▼
+Standard DFI Presentation
+```
+
+Commit之后不得因为MC内部普通拥塞：
+
+a) 重新选择Start Phase；
+
+b) 重新安排到其他Issue Word；
+
+c) 修改已Commit Bundle的Command顺序；
+
+d) 静默取消Command。
+
+---
+
+## 5.8.3 Timing Reservation建立点
+
+Timing Reservation应在：
+
+```text
+MC Internal Commit
+```
+
+时正式生效。
+
+其作用是表示：
+
+> 该未来Command已经成为MC不可逆调度承诺，因此后续Timing Query必须考虑它产生的未来时间影响。
+
+Timing Reservation仍属于MC内部状态，不映射为DFI端口。
+
+---
+
+## 5.8.4 Commit与Actual
+
+应继续保持：
+
+```text
+DFI Commit
+!=
+Registered-equivalent Event
+```
+
+Commit只表示Command已经不可逆进入DFI输出路径。
+
+BSM、OpenRow和Committed Timing History仍由后续Registered-equivalent Event更新。
+
+---
+
+# 5.9 Maintenance Service准入
+
+Refresh、RFM、MR、Recovery及其他Service分别维护自己的：
+
+```text
+Obligation
+Target
+Urgency
+Deadline
+Progress
+```
+
+并向GS提供Typed Service Candidate。
+
+GS不复制其内部Accounting State。
+
+---
+
+## 5.9.1 Mandatory Service
+
+对于具有Deadline的Maintenance Service，应考虑Latest-safe-start。
+
+Normal Traffic不得仅依赖Priority避免Maintenance Deadline Miss。
+
+GS必须保证：
+
+```text
+Remaining Time
+>=
+Service Worst-case Completion Requirement
+```
+
+才能继续接受会阻塞该Service的Normal Command。
+
+---
+
+## 5.9.2 Normal与Service共存
+
+Maintenance并不必然要求整个Issue Word完全独占。
+
+若Command Span、Target、Timing及DFI规则允许：
+
+```text
+Service Command
++
+Normal Command
+```
+
+可以进入同一Bundle。
+
+是否允许共存由明确Compatibility Matrix决定，而不是单纯依据Priority推断。
+
+---
+
+# 5.10 Normal命令处理示例
+
+## 5.10.1 Row Hit Read
+
+```text
+TE Read Eligible
+      │
+      ▼
+CC：
+BSM = OPEN
+OpenRow = Hit
+      │
+      ▼
+RD Candidate
+      │
+      ▼
+OS RW Class Head
+      │
+      ▼
+GS Bundle Build
+      │
+      ├── Timing / Phase
+      ├── Read Resource
+      ├── Conflict
+      └── DFI Output Check
+      │
+      ▼
+MC Internal Commit
+      │
+      ▼
+DFI RD
+```
+
+Read Expected等资源只在RD真正Commit时正式建立，不在CC或OS选择阶段提前永久占用。
+
+---
+
+## 5.10.2 Row Miss Read
+
+```text
+TE Read RowB
+      │
+BSM = OPEN
+OpenRow = RowA
+      │
+      ▼
+CC -> PRE
+      │
+OS / GS / DFI
+      │
+Registered-equivalent PRE
+      │
+BSM = CLOSED
+OpenRow Invalid
+      │
+等待tRP
+      │
+      ▼
+CC -> ACT RowB
+      │
+OS / GS / DFI
+      │
+ACT完成
+      │
+等待tRCD
+      │
+      ▼
+CC -> RD
+```
+
+整个过程中仍是同一个Logical Read Transaction。
+
+PRE和ACT不终止TE Transaction。
+
+---
+
+## 5.10.3 Maintenance插入
+
+```text
+OS：
+RW Head
+ACT Head
+PRE Head
+       │
+       ├──────────────┐
+       │              │
+       │        Refresh Service
+       │              │
+       └──────┬───────┘
+              ▼
+             GS
+              │
+        Bundle Builder
+              │
+              ▼
+      Accepted Subset
+```
+
+当Refresh达到Mandatory条件时，GS优先保证Refresh能够满足Deadline。
+
+未被消费的Normal Head继续保持，并在下一轮重新检查Freshness。
+
+---
+
+# 5.11 主要接口
+
+**表5-1 CC、OS及GS主要逻辑接口**
+
+| 序号 | 接口 | 主要内容 | 要求 |
+|---|---|---|---|
+| 1 | TE → CC | Logical Transaction、Canonical Resource、Request Type、QoS | Transaction在明确Progress前保持有效 |
+| 2 | BSM → CC | Bank State、Resource、Freshness | 只读Query |
+| 3 | OpenRow → CC | Valid、Row、Freshness | 只读Query |
+| 4 | Timing → CC/GS | Timing Pass、Legal Phase、Reservation相关信息 | 与Candidate匹配 |
+| 5 | CC → OS | Normal Candidate | Whole Candidate稳定 |
+| 6 | OS → GS | Multi-Class Heads | Consume前保持稳定 |
+| 7 | Service Owner → GS | Service Candidate、Urgency、Deadline | 不经过Normal OS |
+| 8 | Read/Write Owner ↔ GS | Capacity / Prepare / Commit信息 | All-or-none |
+| 9 | GS → PI | Committed Issue Bundle | Commit后Placement稳定 |
+| 10 | PI内部 → GS | DFI Output Capacity / Local Pipeline状态 | 仅MC内部，不是DFI外部信号 |
+
+本章不定义任何新的MC↔PHY私有接口。
+
+实际PHY端口仍严格采用第2章规定的标准DFI子集。
+
+---
+
+# 5.12 主要内部状态
+
+**表5-2 CC、OS及GS主要内部状态**
+
+| 对象 | 主要内容 | 说明 |
+|---|---|---|
+| CC Query/Candidate Hold | Transaction、Command、Query结果 | 可与现有Pipeline合并 |
+| OS Class Head | 各Class当前Candidate | 不采用单Global Winner |
+| OS Fairness State | RR、Age、Priority等 | 真正Commit后更新 |
+| GS Bundle State | Candidate Subset、Phase Occupancy、Conflict | Bundle构造使用 |
+| Timing Reservation | 已Commit未来Timing影响 | Timing Owner维护 |
+| Command Occupancy | 当前及必要Future Phase占用 | GS/PI内部使用 |
+| PI/DFI Output Hold | 已Commit DFI输出内容 | MC内部状态 |
+
+上述对象属于逻辑功能状态，不要求全部做成独立RAM或独立模块。
+
+---
+
+# 5.13 Backpressure与Same-cycle处理
+
+CC、OS、GS均应支持内部Backpressure。
+
+基本要求包括：
+
+a) CC Candidate未被OS接受前保持稳定；
+
+b) 某OS Class Head未被消费时，不用Fresh Candidate覆盖；
+
+c) 某Class被阻塞不应阻塞所有其他Class；
+
+d) GS没有足够资源Commit某Command时，不提前修改任何Committed State；
+
+e) DFI Output Hold未释放时，不覆盖已经Commit的Bundle。
+
+同一周期可能发生：
+
+```text
+Old Reservation Release
+Old Occupancy Release
+Fresh Bundle Build
+Head Invalidate
+Actual Promotion
+Fairness Update
+```
+
+各Owner应基于统一Pre-state计算Next State。
+
+不得通过RTL语句书写先后顺序形成隐式资源旁路。
+
+---
+
+# 5.14 Reset、Retry与异常处理
+
+## 5.14.1 Reset
+
+Reset进入后停止Fresh Candidate Commit。
+
+CC Candidate、OS Class Head及未Commit的GS Bundle可以按照内部Reset合同清除。
+
+对于已经Commit至DFI输出路径的Command，不得仅因MC局部Reset将其假定为“从未发生”。
+
+其后续处理由第10章Reset/Re-init及PHY生命周期合同确定。
+
+---
+
+## 5.14.2 Retry
+
+Retry建立新的Execution Attempt后，仍重新经过：
+
+```text
+TE
+ -> CC
+ -> OS
+ -> GS
+ -> DFI Commit
+```
+
+Retry本身不绕过Normal Scheduling和Admission。
+
+Old Attempt和Fresh Attempt必须由对应Read/Write内部Context隔离。
+
+---
+
+## 5.14.3 Cancel
+
+允许取消的Command必须仍处于可证明的Pre-visible状态。
+
+Timeout本身不能证明：
+
+```text
+Command没有执行
+```
+
+已经Commit但物理可见性不明确的Command，不得直接释放所有相关状态后重发。
+
+---
+
+## 5.14.4 异常
+
+以下情况应阻止正常Commit：
+
+a) BSM和OpenRow状态互相矛盾；
+
+b) Candidate所依据的Context已经失效；
+
+c) 同一Source被重复Commit到同一Bundle；
+
+d) Phase Occupancy冲突；
+
+e) Resource Prepare只成功一部分；
+
+f) Maintenance被错误当成Normal OS Candidate；
+
+g) OS Head Stall期间内容发生非法变化；
+
+h) DFI Commit后Placement被普通逻辑重新修改。
+
+---
+
+# 5.15 DDR5继承与DDR6修改关系
+
+**表5-3 命令构造、选择和准入模块演进关系**
+
+| DDR5设计内容 | DDR6处理 | 收敛后的变化 |
+|---|---|---|
+| Per-resource ACT/PRE/RD/WR Candidate | KEEP/MODIFY | 继续作为CC基础 |
+| DS Timing OK | REPLACE | 改为独立Timing Query |
+| TE Page Hit输入 | MODIFY | 改为OpenRow唯一Truth |
+| CC Maintenance PRE注入 | REMOVE | Maintenance独立Service Path |
+| CC Global Policy | DECOUPLE | Global Bundle Policy移至GS |
+| ACT/PRE/RW分Class选择 | KEEP | donor已有Multi-Class基础 |
+| Single Global Winner | DELETE | 不作为DDR6架构 |
+| Phase-aware Selection | KEEP/MODIFY | 从DDR5 1:4扩展至DDR6 1:8 |
+| PAS GS Dynamic Scheduling | KEEP/REFACTOR | 演进为1:8 Bundle Builder |
+| Cross-word Extension | KEEP CONCEPT | 按DDR6 Span Matrix重新定义 |
+| Single Admitted Hold | DELETE | 不作为Production结构 |
+| Final Admission Boundary | KEEP | GS继续负责 |
+| DFI私有Ready/Accept | NOT USED | 外部只使用标准DFI子集 |
+| Timing Reservation | MODIFY | 在MC Internal Commit建立 |
+| Admission后直接更新Bank | DELETE | Committed Truth由Registered-equivalent Event更新 |
+
+DDR5 donor实读已经直接证明CC、OS和GS的上述主要结构基础，因此这三部分不再作为“是否需要如此设计”的专家开放问题。
+
+---
+
+# 5.16 本章收敛结论及待闭合项
+
+经内部预评审，本章以下内容作为当前设计结论：
+
+a) CC、OS和GS继续保持“构造—选择—准入”三层关系；
+
+b) CC只负责Structural Command Construction，不拥有Timing、OpenRow及Maintenance Truth；
+
+c) OS采用Multi-Class Heads，不使用单Global Winner；
+
+d) GS采用可扩展Bundle Builder，不使用Single Admitted Hold作为Production架构；
+
+e) Bring-up允许`ISSUE_LANES=1`，但其不等于Production吞吐结论；
+
+f) Final Start Phase在GS Bundle构造和Commit过程中确定；
+
+g) 多Command Bundle采用统一Phase、Domain、Target及Resource冲突检查；
+
+h) 一条Command需要的有限资源必须All-or-none Commit；
+
+i) Timing Reservation在MC Internal Commit时建立；
+
+j) MC Internal Commit表示不可逆进入标准DFI输出流水线；
+
+k) 不新增`cmd_ready`、`cmd_accept`、`reserve_token`等私有DFI端口；
+
+l) OS Fairness只对真正Commit的Normal Head更新；
+
+m) Maintenance Service不经过Normal OS，在GS与Normal Head汇合；
+
+n) BSM、OpenRow及Committed Timing History只由后续Registered-equivalent Event更新。
+
+当前真正需要继续闭合的内容如下。
+
+**表5-4 本章待闭合项**
+
+| 类别 | 待闭合内容 | 关闭方式 |
+|---|---|---|
+| Command Encoding | 各DDR6 Command具体编码及Span | DDR6规范/DFI/PHY |
+| 1:8 Placement | 合法Start Phase及Cross-word规则 | DFI/PHY ICD |
+| Bundle能力 | 同一Word允许哪些Command组合 | Command Compatibility Matrix |
+| ISSUE_LANES | Production实际Lane数 | 吞吐分析 + FPGA实现 |
+| Query Pipeline | CC/Timing/State Query具体Latency | RTL/P&R |
+| OS性能策略 | Priority、Age、QoS、RR具体参数 | Product/性能评估 |
+| Mandatory Service | Latest-safe-start和Worst-case Latency | 第7章 + Timing |
+| DFI Output | PI Pipeline深度及固定时序关系 | PI/PHY详细设计 |
+| Read/Write资源 | Expected、Assembly、Write Attempt等容量 | 第9章 + 资源评估 |
+| Registered-equivalent Mapping | DFI Presentation到MC内部Actual Event的关系 | PHY ICD |
+
+除上述具体Command Packing、吞吐及Physical Mapping问题外，不再将CC/OS/GS三层职责、Multi-Class OS或Bundle GS本身作为专家架构评审问题。
