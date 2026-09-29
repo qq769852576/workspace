@@ -1,0 +1,1664 @@
+# 8 模式配置、频率及电源控制设计
+
+## 8.1 功能范围与设计目标
+
+模式配置、频率及电源控制负责建立DDR6 MC正常运行所需的有效配置、资源组织、器件模式、工作点、低功耗状态及PHY训练状态，并保证状态切换期间不存在新旧配置混用、未生效参数提前使用或PHY/DRAM状态未知时提前恢复Normal Traffic等问题。
+
+本章主要包括：
+
+a) Config Resolver；
+
+b) Geometry Manager；
+
+c) Mode Register（MR）Service；
+
+d) Frequency Set Point（FSP）及工作点切换；
+
+e) Power Down及Self Refresh；
+
+f) Training Orchestrator；
+
+g) Config、Timing、DFI/PHY及运行状态之间的发布和恢复关系。
+
+上述功能均属于Side-plane Control，但保持独立Owner：
+
+```text
+Config
+    -> 当前MC采用什么配置
+
+Geometry
+    -> 当前配置对应什么资源组织
+
+MR
+    -> DRAM Mode Register被编程为什么
+
+FSP
+    -> 当前工作点是什么
+
+Power
+    -> 当前是否处于低功耗状态
+
+Training
+    -> 当前PHY工作点是否完成所需训练
+```
+
+各Owner不得通过复制或直接修改其他Owner的Authoritative State完成状态切换。
+
+---
+
+## 8.2 总体结构
+
+总体关系如下。
+
+```text
+Software / APB
+      │
+      ▼
+Candidate Config
+      │
+      ▼
+Validate / Prepare
+      │
+      ├───────────────┐
+      ▼               ▼
+   Geometry         Timing
+   Prepare          Prepare
+      │               │
+      └───────┬───────┘
+              ▼
+         Safe Point
+              │
+              ▼
+        Atomic Publish
+              │
+      ┌───────┴────────┐
+      ▼                ▼
+Active Config     Active Geometry
+      │                │
+      └───────┬────────┘
+              ▼
+          Normal MC
+
+
+        Side-plane Control
+              │
+      ┌───────┼──────────┐
+      ▼       ▼          ▼
+     MR      FSP       Power
+      │       │          │
+      └───────┼──────────┘
+              │
+              ▼
+       Standard DFI Path
+              │
+              ▼
+             PHY
+              │
+              ▼
+          Training
+              │
+              ▼
+       Effective State
+              │
+              ▼
+        Traffic Reopen
+```
+
+**图8-1 配置及运行状态控制总体结构**
+
+不同功能可能经历不同的状态阶段，但总体需要区分：
+
+```text
+Requested / Written
+        ↓
+Candidate
+        ↓
+Prepared
+        ↓
+Committed / Programmed
+        ↓
+Physical Operation
+        ↓
+Effective
+```
+
+不能把多个阶段统一压缩成一个`valid`或`done`。
+
+---
+
+# 8.3 Config Resolver设计
+
+## 8.3.1 功能职责
+
+Config Resolver负责将Software Shadow中的候选配置安全发布为Normal MC实际使用的Active Config。
+
+主要职责包括：
+
+a) 接收Software/APB写入的Candidate Config；
+
+b) 执行本地合法性检查；
+
+c) 请求Geometry及其他相关Owner完成Prepare；
+
+d) 等待配置切换Safe Point；
+
+e) 与Geometry共同完成原子发布；
+
+f) 返回Apply成功或Reject结果；
+
+g) 保证Old Apply Result不能错误作用于Fresh Apply。
+
+Config Resolver不负责计算Geometry内部资源关系，也不直接修改BSM、OpenRow、Timing、PHY或MR状态。
+
+---
+
+## 8.3.2 Shadow与Active分离
+
+软件写配置时，只修改：
+
+```text
+Shadow / Candidate Config
+```
+
+不能直接修改Active Config。
+
+基本流程为：
+
+```text
+Software Write
+      │
+      ▼
+Candidate Config
+      │
+      ▼
+Validate
+      │
+      ▼
+Prepare
+      │
+      ▼
+Wait Safe Point
+      │
+      ▼
+Atomic Publish
+      │
+      ▼
+Active Config
+```
+
+Normal Datapath只能使用Active Config。
+
+---
+
+## 8.3.3 Local Validate
+
+Candidate进入Prepare前，应首先检查能够在Config内部完成的合法性条件，例如：
+
+a) Profile是否合法；
+
+b) Density、Device Count等是否在Build支持范围内；
+
+c) Feature组合是否合法；
+
+d) Address Map是否完整；
+
+e) Source Bit是否超出允许范围；
+
+f) 是否存在非法重复映射；
+
+g) Fixed Offset及Mapping Policy是否合法；
+
+h) Candidate是否与目标Geometry能力兼容。
+
+Validate失败时：
+
+```text
+Active Config保持不变
+Active Geometry保持不变
+Normal MC继续使用Old Context
+```
+
+并返回明确Reject。
+
+---
+
+## 8.3.4 Config Context与Version原则
+
+配置切换必须能够区分：
+
+```text
+Old Active Context
+```
+
+与：
+
+```text
+New Candidate Context
+```
+
+但第一版不强制建立复杂的Configuration Version Pool。
+
+如果设计采用全局Safe Point，使旧Transaction、旧Command、旧Read/Write及旧Maintenance全部退出后才发布New Config，则可以使用：
+
+```text
+Single Active Config Snapshot
++
+Apply Context
+```
+
+完成第一版实现。
+
+只有后续设计允许：
+
+```text
+Old Context仍存在
++
+New Context已经进入流水
+```
+
+时，才需要引入ACV或等价Version机制。
+
+因此：
+
+> Version是解决真实并存和Stale Reference问题的工具，不是Config功能成立的先决条件。
+
+---
+
+# 8.4 Geometry Manager设计
+
+## 8.4.1 功能职责
+
+Geometry负责定义当前Product/Profile下DDR6资源如何组织和解释。
+
+Geometry回答：
+
+```text
+哪些Resource存在？
+Logical Address如何映射到这些Resource？
+一个Target Set实际包含哪些Resource？
+```
+
+Geometry不回答：
+
+```text
+Bank是否OPEN
+当前打开哪一Row
+Command何时满足Timing
+```
+
+---
+
+## 8.4.2 Geometry Snapshot
+
+Active Geometry原则上包含：
+
+```text
+Topology
+Device Count
+PSD / BG / BA组织
+Logical Bank / Resource Count
+Row / Column Range
+Resource Mapping
+Target Expansion
+```
+
+具体字段由最终Product Topology确定。
+
+Normal MC只使用Active Geometry。
+
+---
+
+## 8.4.3 Config与Geometry关系
+
+Config和Geometry属于两个不同职责：
+
+```text
+Config
+    -> 选择当前工作配置
+
+Geometry
+    -> 将该配置转换为Canonical Resource定义
+```
+
+IH根据二者共同完成：
+
+```text
+System Physical Address
+        │
+        ▼
+Logical Address
+        │
+        ▼
+Canonical DDR6 Resource
+```
+
+如果第一版通过Safe Point保证不存在新旧Geometry并存，则不强制单独实现GMV。
+
+若后续支持多Context并存，则可以增加Geometry Version或等价Freshness机制。
+
+---
+
+## 8.4.4 Geometry Prepare
+
+Config Apply过程中，Geometry先计算Candidate对应的Prepared Geometry。
+
+Prepare阶段：
+
+```text
+Candidate Config
+      │
+      ▼
+Geometry Validate / Build
+      │
+      ▼
+Prepared Geometry
+```
+
+不得直接覆盖Active Geometry。
+
+只有Config Safe Point成立后，Prepared Geometry才与Active Config一起正式发布。
+
+---
+
+## 8.4.5 Canonical Resource与Target Expansion
+
+Geometry统一产生：
+
+```text
+Device
+PSD
+BG
+BA
+Resource Index
+Row / Column Range
+Target Set Membership
+```
+
+等Canonical信息。
+
+REF_DIST、RFM_DIST、PRE及其他多Resource操作的Target Expansion均应由Geometry统一提供。
+
+各功能模块不得维护第二套独立的：
+
+```text
+Logical Target
+    ->
+Physical Resource Set
+```
+
+映射关系。
+
+1p12等尚未获得正式Mapping的Topology继续保持Fail Closed。
+
+---
+
+# 8.5 Config与Geometry原子发布
+
+## 8.5.1 Safe Point
+
+配置切换不能仅根据：
+
+```text
+Command FIFO Empty
+```
+
+判断安全。
+
+Safe Point至少需要保证与Old Config相关的功能状态已经退出，例如：
+
+a) Old HIF/TE Transaction已经退休；
+
+b) CC/OS/GS不存在Old Candidate或Committed Bundle；
+
+c) PI/DFI输出路径不存在Old Command残留；
+
+d) Read/Write Old Context已经关闭；
+
+e) Retry旧Attempt已经关闭；
+
+f) Refresh/RFM/MR等Old Service不再引用旧配置；
+
+g) OpenRow不存在需要继续按照旧Geometry解释的有效状态；
+
+h) BSM及Timing已达到配置切换要求的安全状态；
+
+i) 旧Timing Reservation已经退出或按照切换合同处理。
+
+Config Resolver不需要重新复制这些Owner的状态，而只接收Integration形成的：
+
+```text
+cfg_commit_safe
+```
+
+或等价Safe Point结果。
+
+---
+
+## 8.5.2 Atomic Publish
+
+Config和Geometry必须在同一逻辑Publication Point更新。
+
+Publish前：
+
+```text
+Active Config   = OLD
+Active Geometry = OLD
+```
+
+Publish后：
+
+```text
+Active Config   = NEW
+Active Geometry = NEW
+```
+
+不得出现：
+
+```text
+NEW Config + OLD Geometry
+```
+
+或：
+
+```text
+OLD Config + NEW Geometry
+```
+
+被Normal MC使用。
+
+---
+
+# 8.6 MR Service设计
+
+## 8.6.1 功能职责
+
+MR Manager负责MRR、MRW以及相关Mode状态管理。
+
+主要职责包括：
+
+a) 接收已经验证的MR Service Request；
+
+b) 检查MR Address、Field及Access Legality；
+
+c) 形成MR Command Candidate；
+
+d) 经GS完成Admission并通过标准DFI输出；
+
+e) 等待对应Registered-equivalent Event；
+
+f) 管理Pre-wait和Post-wait；
+
+g) 处理需要的MRUPDATE过程；
+
+h) 完成MRR Readback；
+
+i) 维护Programmed及Effective状态；
+
+j) 返回Service Result。
+
+MR不拥有BSM、OpenRow或Timing Truth。
+
+---
+
+## 8.6.2 基本序列
+
+现有DDR5 MR控制中的：
+
+```text
+Pre-wait
+   ↓
+Command
+   ↓
+Post-wait
+```
+
+基本结构继续保留。
+
+DDR6重点增加：
+
+```text
+Context
+Programmed / Effective分离
+FSP关联
+MRUPDATE
+Readback Correlation
+PHY/Timing后置条件
+```
+
+---
+
+## 8.6.3 Programmed与Effective
+
+必须区分：
+
+```text
+Programmed
+```
+
+和：
+
+```text
+Effective
+```
+
+典型MRW过程为：
+
+```text
+Requested Value
+      │
+      ▼
+MR Service
+      │
+      ▼
+MRW DFI Commit
+      │
+      ▼
+Standard DFI Presentation
+      │
+      ▼
+MRW Registered-equivalent Event
+      │
+      ▼
+Programmed State确认
+      │
+      ▼
+Post-wait /
+MRUPDATE /
+PHY / Feature Condition
+      │
+      ▼
+Effective State
+```
+
+因此：
+
+```text
+MRW Event
+!=
+所有MR Field立即Effective
+```
+
+普通Field可在协议规定条件满足后发布Effective。
+
+影响FSP、Timing、PHY或Training的Field，则必须等待对应Owner完成其后置条件。
+
+---
+
+## 8.6.4 MRUPDATE
+
+需要MRUPDATE的配置，采用独立Sequence进行管理：
+
+```text
+MR Programming
+      │
+      ▼
+Required Shadow Prepared
+      │
+      ▼
+Barrier / Preconditions
+      │
+      ▼
+MRUPDATE Sequence
+      │
+      ▼
+Post-condition
+      │
+      ▼
+Effective Publish
+```
+
+MRUPDATE Context只保存完成该序列真正需要的状态。
+
+不预先要求为每次MRUPDATE建立复杂Generation体系；只有Service实例可能复用且存在Late Result风险时，才增加对应Identity机制。
+
+---
+
+## 8.6.5 MRR
+
+MRR通过标准DFI Command Path发出。
+
+返回关联遵循第9章Read Correlation原则，不新增：
+
+```text
+mrr_done
+mrr_tag
+mrr_actual
+```
+
+等私有DFI端口。
+
+逻辑关系为：
+
+```text
+MRR Service
+     │
+     ▼
+GS / PI / Standard DFI
+     │
+     ▼
+MRR Registered-equivalent Event
+     │
+     ▼
+Expected Readback Context
+     │
+     ▼
+Standard DFI Read Return
+     │
+     ▼
+PI / MR Internal Correlation
+     │
+     ▼
+Readback Result
+```
+
+Undefined Readback Bit不得被伪装成有效值。
+
+具体MRR Return Carrier及Ordering由最终DFI/PHY ICD关闭。
+
+---
+
+# 8.7 FSP及工作点切换
+
+## 8.7.1 功能定位
+
+FSP切换不是一个单纯MR Bit修改，而是涉及：
+
+```text
+MR
+Timing
+PHY
+必要Training
+Normal Traffic Barrier
+```
+
+的Workpoint Switch。
+
+至少区分：
+
+```text
+FSP_WR
+FSP_OP
+Target FSP
+Effective FSP
+Switch In Progress
+```
+
+---
+
+## 8.7.2 FSP_WR与FSP_OP
+
+FSP_WR描述相关MR编程当前指向哪个FSP。
+
+FSP_OP描述器件当前真正运行的Operating FSP。
+
+因此允许：
+
+```text
+FSP_WR = Target FSP
+FSP_OP = Current FSP
+```
+
+表示目标工作点正在准备，但器件尚未切换。
+
+不得因为FSP_WR已经改变，就提前使用目标FSP的Timing或PHY状态。
+
+---
+
+## 8.7.3 FSP切换Barrier
+
+切换前必须阻止新的不兼容工作进入。
+
+原则上包括：
+
+a) Fresh Normal Command；
+
+b) Fresh Read/Write Admission；
+
+c) 与切换冲突的Maintenance；
+
+d) 新MR Service；
+
+e) 与Workpoint切换冲突的ALPG操作。
+
+已有工作排空后形成：
+
+```text
+BLOCK_NEW
+    │
+    ▼
+DRAIN
+    │
+    ▼
+SAFE
+```
+
+再进入Workpoint Switch。
+
+---
+
+## 8.7.4 FSP完整流程
+
+典型流程为：
+
+```text
+Prepare Target FSP
+       │
+       ▼
+Program Target-FSP MR
+       │
+       ▼
+Target MR Prepared
+       │
+       ▼
+Quiesce / Drain
+       │
+       ▼
+FSP_OP Switch Command
+       │
+       ▼
+Registered-equivalent Switch Event
+       │
+       ▼
+Standard DFI / PHY Workpoint Change
+       │
+       ├── Required Calibration
+       └── Required Training
+       │
+       ▼
+New Timing Parameters Ready
+       │
+       ▼
+Effective FSP Publish
+       │
+       ▼
+Traffic Reopen
+```
+
+只有全部必要后置条件成立后才能：
+
+```text
+Effective FSP = Target FSP
+```
+
+---
+
+## 8.7.5 FSP与标准DFI
+
+MC↔PHY仍严格采用第2章定义的标准DFI子集。
+
+如果所采用DFI版本及目标PHY需要并支持：
+
+```text
+dfi_frequency
+dfi_freq_fsp
+dfi_freq_ratio
+ctrlupd / phyupd
+```
+
+等标准Feature，则在Simplified DFI中保留相应成员。
+
+如果本Product不使用某项Feature，则裁剪。
+
+不得为了FSP流程新增私有：
+
+```text
+fsp_switch_req
+fsp_switch_done
+phy_freq_done
+```
+
+并把它们称为DFI接口。
+
+如果真实PHY确有标准DFI之外的控制需求，应单独定义为Non-DFI Sideband并进行接口评审。
+
+---
+
+## 8.7.6 FSP与Timing
+
+工作点切换可能改变Timing参数。
+
+因此必须保证：
+
+```text
+Effective FSP
+```
+
+与：
+
+```text
+Active Timing Parameters
+```
+
+属于同一工作点。
+
+禁止出现：
+
+```text
+DRAM仍处于Old FSP
++
+Timing已经切换到New FSP
+```
+
+以及：
+
+```text
+Effective FSP已变成New
++
+Normal Traffic已恢复
++
+Timing仍使用Old参数
+```
+
+第一版可以通过全局Quiesce和Atomic Publication保证一致性，不强制设置独立TDBV。
+
+只有需要旧/新Timing Image同时存在时，才增加Timing Version机制。
+
+---
+
+# 8.8 Power控制设计
+
+## 8.8.1 功能边界
+
+Power控制负责低功耗Entry/Exit序列，不建立第二套Bank或Timing Truth。
+
+职责关系为：
+
+```text
+Power Service
+    -> Entry / Exit Sequence
+
+Power Gate
+    -> 阻止不兼容Normal Admission
+
+BSM
+    -> Bank Truth
+
+Timing
+    -> Entry / Exit Timing
+
+Refresh
+    -> Maintenance Feasibility / Catch-up
+
+DFI / PHY
+    -> Physical Low-power行为
+```
+
+Power不通过：
+
+```text
+BSM = BLOCKED_POWER
+```
+
+表达低功耗占用。
+
+---
+
+## 8.8.2 Entry Barrier
+
+进入低功耗状态前至少应确认：
+
+a) Fresh不兼容Traffic已经Block；
+
+b) Outstanding工作已经达到规定Safe Point；
+
+c) DFI输出不存在需要继续处理的旧Command；
+
+d) Read/Write返回及数据状态满足Entry条件；
+
+e) Bank状态满足目标Power Mode要求；
+
+f) Refresh/Maintenance Deadline不会被破坏；
+
+g) Entry Timing满足；
+
+h) PHY/DFI满足对应低功耗Entry条件。
+
+不能仅根据：
+
+```text
+Queue Empty
+```
+
+判断Power Entry安全。
+
+---
+
+## 8.8.3 Power与BSM
+
+如果目标Power Mode要求Bank处于Closed：
+
+```text
+BSM = CLOSED
+AND
+OpenRow.Valid = 0
+AND
+Entry Timing Pass
+```
+
+后才允许继续Entry。
+
+进入低功耗期间：
+
+```text
+Power Gate = BLOCK
+```
+
+但BSM仍维护Bank Truth。
+
+Power Exit后，如果能够证明Bank状态连续可信，则保持原Bank Truth。
+
+如果无法证明：
+
+```text
+BSM -> INACCESSIBLE
+```
+
+并经过恢复流程重新建立可访问状态。
+
+---
+
+## 8.8.4 标准DFI低功耗接口
+
+若目标PHY启用标准DFI Low-power能力，则优先采用所采用DFI版本中保留的标准接口，例如对应的：
+
+```text
+lp control/data
+PHY master
+dram clock disable
+```
+
+等Feature。
+
+具体Signal Set由最终DFI版本和PHY ICD确定。
+
+未使用的Feature从Simplified DFI中裁剪。
+
+不得以自定义：
+
+```text
+power_done
+phy_sleep_ack
+```
+
+等信号替代已有标准DFI机制。
+
+---
+
+## 8.8.5 Power Down
+
+典型流程为：
+
+```text
+Power Request
+     │
+     ▼
+Block New Traffic
+     │
+     ▼
+Drain
+     │
+     ▼
+Bank / Timing /
+Maintenance / DFI Safe
+     │
+     ▼
+Entry Sequence
+     │
+     ▼
+LOW POWER
+     │
+     ▼
+Exit Sequence
+     │
+     ▼
+Exit Timing
+     │
+     ▼
+PHY / DFI Ready
+     │
+     ▼
+Normal Reopen
+```
+
+不同Command Class的Exit Timing由Timing Engine提供，不通过一个通用Done位提前全部放开。
+
+---
+
+## 8.8.6 Self Refresh
+
+Self Refresh处理原则为：
+
+```text
+Self Refresh Request
+       │
+       ▼
+Block New Traffic
+       │
+       ▼
+Drain
+       │
+       ▼
+Maintenance / Bank Safety
+       │
+       ▼
+SRE DFI Commit
+       │
+       ▼
+SRE Registered-equivalent Event
+       │
+       ▼
+SELF REFRESH
+       │
+       ▼
+SRX Sequence
+       │
+       ▼
+SRX Registered-equivalent Event
+       │
+       ▼
+Exit Timing
+       │
+       ▼
+Required Refresh Catch-up
+       │
+       ▼
+PHY / Timing Ready
+       │
+       ▼
+Normal Reopen
+```
+
+因此：
+
+```text
+SRX Event
++
+Exit Timing Complete
+```
+
+也不必然等于Traffic立即恢复。
+
+若Refresh仍存在必须完成的Catch-up义务，则继续保持Power/Admission Gate。
+
+---
+
+# 8.9 Training Orchestrator设计
+
+## 8.9.1 功能边界
+
+Training必须区分：
+
+```text
+MC Training Orchestration
+```
+
+和：
+
+```text
+PHY Training Algorithm
+```
+
+MC负责：
+
+a) 判断何时需要Training；
+
+b) 检查Training Prerequisite；
+
+c) 阻止不兼容Traffic；
+
+d) 确定需要执行的Training Phase/Sequence；
+
+e) 通过所采用DFI/PHY接口启动对应Training操作；
+
+f) 获取Training Result；
+
+g) 判断Pass/Fail；
+
+h) 根据Policy决定Retry、Contain或继续下一阶段；
+
+i) 在全部必要条件满足后发布Training Completion。
+
+MC不实现：
+
+```text
+Tap Sweep
+Eye Search
+Vref Search
+Per-lane Deskew
+PHY Delay Search
+TC/X5IO Analog Tuning
+```
+
+等PHY算法。
+
+---
+
+## 8.9.2 Training Carrier
+
+Training控制优先使用目标DFI版本和PHY已经支持的标准：
+
+```text
+Initialization
+Update
+PHY-master
+Frequency
+```
+
+等相关机制。
+
+具体哪些标准DFI Feature用于Training，由PHY ICD确定。
+
+不得因为MC需要Training Result就自行增加：
+
+```text
+training_req
+training_done
+training_pass
+```
+
+并将其作为自定义DFI信号。
+
+若PHY必须提供标准DFI之外的Training Control，则应作为正式Non-DFI Sideband单独定义。
+
+---
+
+## 8.9.3 Training Context
+
+Training需要能够区分：
+
+```text
+当前Training Operation
+当前Training Phase
+当前Retry Attempt（若存在）
+Target Workpoint
+```
+
+但不要求默认携带：
+
+```text
+ACV
+GMV
+TDBV
+PHY Context Generation
+Reset Epoch
+```
+
+等全部字段。
+
+具体Identity只保留防止实际Stale Result误匹配所需的最小集合。
+
+例如，如果Training期间：
+
+```text
+不允许并发第二个Training
++
+Reset/FSP切换会强制取消当前Training并关闭Result接收
+```
+
+则可能不需要额外复杂Generation。
+
+如果同一Phase发生Retry，而Old Result可能晚到，则需要Attempt Identity或等价隔离机制。
+
+---
+
+## 8.9.4 Phase Dependency
+
+每个Training Phase开始前检查真正必要的Prerequisite，例如：
+
+```text
+Active Config Ready
+Active Geometry Ready
+Target FSP Ready
+Required MR Effective
+Power Active
+Timing Ready
+PHY Ready
+Previous Required Phase Complete
+```
+
+具体Dependency集合由目标PHY Training Sequence确定。
+
+实现可以使用：
+
+```text
+dependency_mask
+```
+
+也可以采用简单FSM/条件逻辑。
+
+不将Dependency Bitmap规定为必须的RTL结构。
+
+---
+
+## 8.9.5 Training流程
+
+```text
+Training Required
+       │
+       ▼
+Check Prerequisite
+       │
+       ▼
+Block Incompatible Traffic
+       │
+       ▼
+Start Required PHY Training
+       │
+       ▼
+Wait Result
+       │
+       ├── PASS -> Next Required Phase
+       │
+       └── FAIL -> Retry / Recovery
+       │
+       ▼
+All Required Training Complete
+       │
+       ▼
+Workpoint / Timing一致性检查
+       │
+       ▼
+Training Effective
+```
+
+---
+
+## 8.9.6 Retry与Late Result
+
+如果Training支持Retry：
+
+```text
+Phase N / Attempt 1
+        │
+        ▼
+Fail / Timeout
+        │
+        ▼
+Phase N / Attempt 2
+```
+
+则Old Attempt 1的Late Result不得结束Attempt 2。
+
+是否需要显式Attempt ID，取决于PHY Result是否可能晚到以及接口是否已经提供足够区分信息。
+
+Timeout只说明：
+
+```text
+预期Result没有按期观察到
+```
+
+不能推导：
+
+```text
+PHY一定没有执行
+PHY一定已经失败
+```
+
+---
+
+# 8.10 Effective State与Traffic Reopen
+
+## 8.10.1 Publication原则
+
+所有影响Normal MC解释或PHY工作点的状态，都必须具有明确Publication Point。
+
+典型关系为：
+
+```text
+Software Written
+!=
+Active Config
+
+MR Programmed
+!=
+MR Effective
+
+FSP Switch Requested
+!=
+Effective FSP
+
+Training PASS
+!=
+MC Ready
+
+Power Exit
+!=
+Normal Traffic Reopen
+```
+
+---
+
+## 8.10.2 Reopen条件
+
+经历Config、FSP、Power、Training或其他全局状态切换后，重新允许Normal Traffic前，应确认真正必要的条件已经成立，例如：
+
+a) Active Config有效；
+
+b) Active Geometry有效；
+
+c) 当前Timing参数与Effective Workpoint一致；
+
+d) 必要MR状态已经Effective；
+
+e) Effective FSP与PHY实际Workpoint一致；
+
+f) Required Training已经完成；
+
+g) PHY/DFI处于可工作状态；
+
+h) Refresh/Maintenance不存在阻止Reopen的义务；
+
+i) BSM/OpenRow已经重新建立可信状态或能够证明连续有效；
+
+j) Old Context反馈不能再修改Fresh State。
+
+最终统一形成：
+
+```text
+mc_ready / traffic_reopen
+```
+
+而不是由任何单一模块自行放开Normal Admission。
+
+---
+
+# 8.11 Reset及重新建立有效状态
+
+Destructive Reset只能清除MC内部旧状态，不能直接证明：
+
+```text
+DRAM已经初始化
+PHY已经Ready
+Bank已经Closed
+Training已经完成
+```
+
+典型恢复流程为：
+
+```text
+Reset
+  │
+  ▼
+Config / Geometry Ready
+  │
+  ▼
+DFI / PHY Initialization
+  │
+  ▼
+DRAM Initialization
+  │
+  ▼
+Required MR Programming
+  │
+  ▼
+Target Workpoint Ready
+  │
+  ▼
+Required Training
+  │
+  ▼
+Timing Ready
+  │
+  ▼
+BSM Accessibility Ready
+  │
+  ▼
+Refresh / Maintenance Ready
+  │
+  ▼
+MC Ready
+```
+
+因此：
+
+```text
+Reset Deassert
+!=
+MC Ready
+```
+
+具体Reset/Re-init及Old Feedback隔离在第10章统一说明。
+
+---
+
+# 8.12 主要接口
+
+**表8-1 配置及运行状态控制主要逻辑接口**
+
+| 序号 | 接口 | 主要内容 | 要求 |
+|---|---|---|---|
+| 1 | Software/APB → Config | Candidate Config、Apply Request | 只修改Shadow/Candidate |
+| 2 | Config → Geometry | Resolved Candidate | Prepare不修改Active |
+| 3 | Geometry → Config | Prepared Geometry、Pass/Reject | 在Safe Point前保持 |
+| 4 | Integration → Config | Config Safe Point | 未满足不得Publish |
+| 5 | Config/Geometry → MC | Active Config、Active Geometry | 原子发布 |
+| 6 | MR → GS | MR Command Candidate | 仍需GS Final Admission |
+| 7 | PI内部Event → MR | MR Registered-equivalent Event | 来自标准DFI Mapping |
+| 8 | MRR Return → MR | Standard DFI Readback +内部Correlation | 不增加私有MRR Tag |
+| 9 | FSP → MR/Timing/Training | Target Workpoint及Sequence State | Workpoint一致 |
+| 10 | Power → GS | Admission Gate / Entry Sequence | 不修改BSM Truth |
+| 11 | Refresh → Power | Maintenance Feasibility/Catch-up | Reopen条件之一 |
+| 12 | DFI/PHY → Training | 标准DFI/正式PHY Result | Carrier由ICD确认 |
+| 13 | Timing → MR/FSP/Power | Wait/Timing Ready | Timing为唯一Timing Owner |
+| 14 | Control → Normal MC | Block / Reopen | 全部条件满足后解除 |
+
+MC↔PHY外部接口仍以第2章冻结的标准DFI子集为准。
+
+---
+
+# 8.13 主要内部状态
+
+**表8-2 配置及运行状态主要内部状态**
+
+| 对象 | 主要内容 | 说明 |
+|---|---|---|
+| Config Candidate | Shadow Config、Apply状态 | Software Apply期间 |
+| Active Config | 当前正式Config | Normal MC使用 |
+| Prepared Geometry | Candidate Resource Mapping | Publish前不可见于Normal MC |
+| Active Geometry | 当前Canonical Resource定义 | Normal MC使用 |
+| MR Service State | MR Command、Pre/Post Condition | Service内部 |
+| MR Programmed/Effective | 当前Mode状态 | 两者明确分离 |
+| FSP State | Current/Target FSP、Progress | Workpoint切换 |
+| Power State | Mode、Entry/Exit Progress | 不复制Bank Truth |
+| Training State | Current Phase、必要Attempt/Result | 只保留必要Identity |
+
+上述为逻辑状态，不要求一一实现为独立RAM。
+
+---
+
+# 8.14 Same-cycle、Backpressure与异常处理
+
+## 8.14.1 Config
+
+Config Publish与Reset、Fault等同时发生时，Destructive Reset/Containment优先于Fresh Publication。
+
+不得产生：
+
+```text
+Reset已经成立
++
+Config Apply Success
+```
+
+的矛盾状态。
+
+---
+
+## 8.14.2 MR/FSP
+
+MR Programmed、MR Effective、FSP Switch以及Timing参数切换如果在相邻或同一周期发生，必须由共同Workpoint Context判断其是否合法。
+
+不得因为某一MR Event完成就提前发布Effective FSP。
+
+---
+
+## 8.14.3 Power/Maintenance
+
+Power Entry与Refresh/RFM Mandatory Deadline冲突时，应根据Maintenance Feasibility决定是否允许Entry。
+
+不能依赖两个FSM的RTL书写顺序决定谁优先。
+
+---
+
+## 8.14.4 Training Stale Result
+
+Training Result如果无法证明属于当前有效Training Operation：
+
+```text
+Functional Write Enable = 0
+```
+
+若实现存在Retry/Late Result风险，应使用必要的Attempt Context进一步隔离。
+
+---
+
+## 8.14.5 Timeout
+
+Config、MR、FSP、Power及Training中的Timeout均只表示：
+
+> 预期事件没有在规定时间内观察到。
+
+Timeout本身不能伪造：
+
+```text
+Command未执行
+PHY已经完成
+Power已经退出
+Training已经成功或失败
+```
+
+物理状态无法确定时进入第10章Recovery/Containment路径。
+
+---
+
+# 8.15 标准DFI子集在本章中的使用原则
+
+本章所有MC↔PHY交互继续遵循：
+
+```text
+Standard DFI first
+```
+
+原则。
+
+当前功能分类如下。
+
+**表8-3 本章DFI功能使用原则**
+
+| 功能 | 处理原则 |
+|---|---|
+| Command/Address | MR、FSP相关DRAM Command继续经标准DFI Command Path |
+| Initialization | 保留当前Build初始化所需标准DFI机制 |
+| Frequency/FSP | 若目标PHY使用，则保留对应标准DFI Frequency类Feature |
+| Update | 根据PHY要求保留ctrlupd/phyupd等标准Feature |
+| Low Power | 根据目标Power方案保留标准DFI Low-power相关Feature |
+| PHY Master | 仅在目标PHY/DFI流程实际需要时保留 |
+| Training | 优先使用DFI/PHY已有标准机制；具体Carrier由ICD关闭 |
+| ALERT | `dfi_alert_n`继续独立保留，由第7章Maintenance/Recovery处理 |
+| 自定义Done/Actual/Tag | 不作为DFI端口使用 |
+
+如果某项控制能力不属于最终保留的标准DFI子集，又确实是PHY集成必需，则必须明确标记为：
+
+```text
+NON_DFI_SIDEBAND
+```
+
+并单独评审。
+
+---
+
+# 8.16 DDR5继承与DDR6修改关系
+
+**表8-4 配置及运行状态控制演进关系**
+
+| DDR5设计内容 | DDR6处理 | 收敛后的变化 |
+|---|---|---|
+| APB Slave/CSR | KEEP | 继续作为Software配置入口 |
+| APB/Core CDC | KEEP | 保留现有控制跨域框架 |
+| Software写后直接生效 | REPLACE | Candidate→Prepare→Safe Publish |
+| Active Config | KEEP/MODIFY | 与Geometry统一发布 |
+| Config Version Pool | CONDITIONAL | 仅Old/New Context并存时需要 |
+| Geometry Mapping | REFACTOR | 建立统一Geometry Owner |
+| GMV | CONDITIONAL | 仅存在多Geometry Context并存时需要 |
+| Config/Geometry独立切换 | PROHIBITED | 必须原子Publication |
+| DDR5 MR FSM | KEEP/MODIFY | 保留Pre-wait/Command/Post-wait |
+| 单一MR Mirror | MODIFY | 区分Programmed与Effective |
+| MRR | KEEP/MODIFY | 返回通过标准DFI/内部Correlation |
+| MRUPDATE | MODIFY | 建立明确Sequence及Post-condition |
+| FSP字段更新 | MAJOR MODIFY | 演进为完整Workpoint Switch |
+| 独立TDBV | CONDITIONAL | 第一版可通过Quiesce+Atomic Publish替代 |
+| DDR5 Power Sequence | KEEP/MODIFY | 增加Barrier及Reopen条件 |
+| BSM Power State | DELETE | 使用独立Power Gate |
+| Training FSM骨架 | KEEP | MC继续做Orchestration |
+| PHY训练算法 | NOT IN MC | PHY/TC负责 |
+| Training复杂Identity | CONDITIONAL | 仅真实Retry/Late Result风险需要 |
+| 自定义PHY Done接口 | NOT USED AS DFI | 优先使用标准DFI/正式PHY接口 |
+
+---
+
+# 8.17 本章收敛结论及待闭合项
+
+经过预评审，本章以下内容作为当前设计结论：
+
+a) Software Written不等于Active Config；
+
+b) Config采用Candidate→Validate/Prepare→Safe Publish生命周期；
+
+c) Config与Geometry必须原子发布；
+
+d) Geometry是Canonical Resource及Target Expansion的唯一Owner；
+
+e) 第一版不强制建立ACV、GMV、TDBV等复杂Version Pool，只有存在新旧Context并存风险时再引入；
+
+f) MR Programmed与Effective明确分离；
+
+g) MRW Registered-equivalent Event不等于所有MR功能立即Effective；
+
+h) MRR经标准DFI Read Path返回，不增加私有MRR Tag/Done接口；
+
+i) FSP_WR与FSP_OP保持不同语义；
+
+j) FSP切换作为完整Workpoint Switch处理，而不是单一MR写操作；
+
+k) Effective FSP、Timing参数、PHY Workpoint及Required Training必须一致后才能Reopen Traffic；
+
+l) Power Entry必须先Block/Drain并检查Maintenance、Bank、Timing及DFI/PHY条件；
+
+m) Power占用不编码为BSM State，而使用独立Power Gate；
+
+n) Self Refresh Exit不等于Normal Traffic立即恢复；
+
+o) MC负责Training Orchestration，PHY负责Training Algorithm；
+
+p) Training Identity只保留隔离真实Retry/Late Result所必要的信息，不预先建立复杂全局Version体系；
+
+q) FSP、Power、Training优先使用最终Simplified DFI中保留的标准DFI Feature；
+
+r) 不增加私有`fsp_done`、`power_done`、`training_done`等信号并冒充DFI接口；
+
+s) Reset Deassert不等于MC Ready；
+
+t) Normal Traffic Reopen由多个Owner共同证明，不由某一单独Done信号决定。
+
+**表8-5 本章待闭合项**
+
+| 类别 | 待闭合内容 | 关闭方式 |
+|---|---|---|
+| Product Topology | 最终Topology、Density、1p12 Mapping | Product/DDR6配置 |
+| Config | 最终Software字段及合法组合 | Product |
+| Version | 是否确需ACV/GMV等并存版本机制 | 实际Pipeline/Context分析 |
+| MR | 最终MR Field Database、Scope及Effective条件 | DDR6规范 |
+| MRR | 标准DFI下Readback Carrier、Ordering及Latency | DFI/PHY ICD |
+| MRUPDATE | 最终Sequence及Physical Post-condition | DDR6规范/PHY |
+| FSP | 相关MR字段及FSP_WR/FSP_OP具体序列 | DDR6规范 |
+| DFI Frequency | Frequency/FSP/Update标准信号子集 | DFI/PHY ICD |
+| Workpoint | Workpoint-specific Timing和Read/Write Latency | DDR6规范/PHY |
+| Training | Required Phase、Sequence及Result Carrier | PHY ICD |
+| Training Retry | Retry次数及Failure/Recovery Policy | Product/PHY |
+| Power | 支持的Power Mode及Entry/Exit Policy | Product |
+| DFI Low Power | lp/phymstr/clock/frequency等实际保留Feature | DFI/PHY ICD |
+| Self Refresh | Entry/Exit及Refresh Catch-up规则 | DDR6规范 |
+| Reopen | PHY Ready、Training、Timing等最终完成证明 | PHY ICD/Integration |
+| Finite Latency | FSP/Power/Training等切换最大时延 | RTL/PHY验证 |
+
+上述开放项主要影响具体DDR6协议序列、Product Policy及DFI/PHY实现，不重新打开“Config/Geometry安全发布、MR Programmed/Effective分离、FSP Workpoint Switch、Power Barrier及Training职责边界”等已经收敛的设计原则。
