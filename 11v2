@@ -1,0 +1,1504 @@
+# 11 验证方案
+
+## 11.1 验证目标与范围
+
+验证工作的目标是证明DDR6 MC在Normal Access、Maintenance、配置及工作点切换、异常、Retry和Reset/Re-init等场景下满足前述章节定义的功能合同，并证明这些合同在FPGA实现条件下仍然成立。
+
+验证范围包括：
+
+a) HIF、IH及TE前端请求处理；
+
+b) CC、OS及GS命令构造、选择和最终准入；
+
+c) BSM、OpenRow及Timing；
+
+d) Refresh、PRAC/BAT及RFM；
+
+e) Config、Geometry、MR、FSP、Power及Training；
+
+f) Read及Write数据通路；
+
+g) Error、Containment、Retry及Reset/Re-init；
+
+h) PI及1:8 Simplified DFI；
+
+i) ALPG与Normal MC Ownership切换；
+
+j) FPGA Storage、CDC/RDC、资源、Fmax及硬件Bring-up。
+
+验证不应只判断最终Read Data或Write结果是否正确，还需要验证内部生命周期是否在正确边界推进。
+
+核心事件关系为：
+
+```text
+Candidate
+    !=
+Selection
+    !=
+Admission
+    !=
+MC Internal Commit
+    !=
+DFI Presentation
+    !=
+Registered-equivalent Event
+    !=
+Result
+    !=
+Reclaim
+```
+
+即使最终Data Compare正确，如果Bank State、Timing、Resource或Transaction在错误阶段提前推进，同样属于设计缺陷。
+
+---
+
+# 11.2 验证总体策略
+
+整体验证采用分层方式：
+
+```text
+                 Design Contract
+                       │
+                       ▼
+              Module Verification
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+    Assertion       Directed       Boundary /
+                     Test          Same-cycle
+        │              │              │
+        └──────────────┼──────────────┘
+                       ▼
+             Subsystem Integration
+                       │
+                       ▼
+              End-to-End MC Flow
+                       │
+                       ▼
+         Error / Retry / Reset Stress
+                       │
+                       ▼
+              FPGA Implementation
+                       │
+         ┌─────────────┼─────────────┐
+         ▼             ▼             ▼
+     Synthesis        P&R         CDC/RDC
+         │             │             │
+         └─────────────┼─────────────┘
+                       ▼
+                Hardware Bring-up
+                       │
+                       ▼
+               Stress / Margin
+```
+
+**图11-1 DDR6 MC验证总体流程**
+
+验证分为三个维度：
+
+a) **功能正确性**：状态、命令、数据及资源生命周期符合设计；
+
+b) **边界正确性**：Backpressure、Full、Same-cycle、Stale、Timeout、Retry和Reset等边界安全；
+
+c) **实现正确性**：RTL映射至FPGA后，RAM、CDC/RDC、Placement、Fmax和DFI/PHY接口不破坏原功能假设。
+
+---
+
+# 11.3 验证阶段划分
+
+**表11-1 DDR6 MC验证阶段**
+
+| 阶段 | 主要目标 | 主要输出 |
+|---|---|---|
+| 模块级验证 | 验证单一Owner内部逻辑及接口 | Assertion、Directed Test |
+| 子系统验证 | 验证相邻Owner间接口和生命周期 | Interface/Scenario结果 |
+| MC集成验证 | 验证Host→MC→DFI→MC→Host流程 | End-to-End结果 |
+| 异常恢复验证 | 验证Timeout、Retry、Reset、Containment | Fault Injection结果 |
+| FPGA实现验证 | 验证Storage、CDC、资源及Fmax | Synthesis/P&R结果 |
+| Hardware Bring-up | 验证DFI/PHY及基础DRAM功能 | 板级测试记录 |
+| Stress/Margin | 验证长时间运行及物理边界 | Stress/Margin报告 |
+
+本文档不绑定UVM或其他具体DV方法学。
+
+具体工具和验证框架可由DV环境选择，但被验证的设计合同和通过标准不得改变。
+
+---
+
+# 11.4 验证基本原则
+
+验证应遵循：
+
+a) 每个Authoritative State只验证一个Functional Owner；
+
+b) 每个State Mutation都能够追溯到明确Functional Event；
+
+c) Full只能阻止Fresh Allocation/Admission，不能阻止Existing Progress和Release；
+
+d) 不可反压Return必须在不可逆Command Commit前保证接收容量；
+
+e) Same-cycle多个Update必须从统一Pre-state得到确定Next State；
+
+f) **如果某对象使用Generation、Attempt ID、Version或Epoch，则必须验证其Stale隔离；未使用时不为验证需要强行增加该字段；**
+
+g) valid/ready接口在Stall时保持Whole Record稳定；
+
+h) Reset前Old Feedback不得写入Reset后Fresh State；
+
+i) Mandatory Maintenance验证的不只是Priority，还包括Latest-safe-start和最终Deadline；
+
+j) Open Gate未关闭前，对应Positive Path保持Fail Closed；
+
+k) Testbench不得通过假定未知PHY或DDR6行为，使尚未闭合的Positive Path“看起来通过”；
+
+l) 验证应优先检查设计合同，而不是把某一种内部FSM编码或Storage实现当成架构要求。
+
+---
+
+# 11.5 验证可追踪性
+
+**表11-2 设计对象与主要验证重点**
+
+| 对象 | 对应章节 | 验证重点 |
+|---|---|---|
+| HIF/IH/TE | 第4章 | Logical Transaction、Address Mapping、Dependency、Ordering |
+| CC/OS/GS | 第5章 | Candidate、Multi-Class Head、Bundle、Commit |
+| BSM/OpenRow/Timing | 第6章 | State Owner、Registered-equivalent Event、Reservation、Phase Mask |
+| Refresh/RFM | 第7章 | Debt、Coverage、BAT、Shared PRE、Deadline、Accounting |
+| Config/Geometry | 第8章 | Candidate、Prepare、Safe Publish、Atomicity |
+| MR/FSP/Power/Training | 第8章 | Programmed/Effective、Barrier、DFI/PHY结果、Reopen |
+| Read | 第9章 | Expected、Correlation、Assembly、Result、Reclaim |
+| Write | 第9章 | Payload、Attempt、PI Join、Completion、Reclaim |
+| Retry/Error | 第10章 | Fence、Old-safe Proof、Fresh Permit、Containment |
+| Reset/Re-init | 第10章 | Joint Boundary、Old-feedback隔离、Re-init、MC Ready |
+| PI/DFI | 第2/5/9/10章 | 1:8、标准DFI子集、Presentation、Return |
+| ALPG | 总体设计 | Takeover、Ownership、公共后端及State Resync |
+
+设计发生修改时，应同步检查对应Verification Contract。
+
+---
+
+# 11.6 Assertion验证
+
+## 11.6.1 Assertion定位
+
+Assertion重点用于发现违反设计合同的第一个时钟沿。
+
+主要覆盖：
+
+a) 非法状态转换；
+
+b) Interface Stability；
+
+c) Resource Capacity；
+
+d) Owner写入合法性；
+
+e) Same-cycle冲突；
+
+f) Retry和Reset边界；
+
+g) DFI接口边界；
+
+h) Stale Feedback隔离。
+
+---
+
+## 11.6.2 公共Assertion
+
+**表11-3 公共关键Assertion**
+
+| 序号 | Assertion | 预期条件 |
+|---|---|---|
+| 1 | Full仅阻Fresh Work | Existing Progress/Release不受阻 |
+| 2 | 不可反压Event有Capacity | Event到达时必有合法接收路径 |
+| 3 | 多Intent统一归约 | 同一Functional State不存在未定义多写 |
+| 4 | valid且!ready时Record稳定 | Payload/Identity/Context不变化 |
+| 5 | Stale Context Functional WE=0 | Old Feedback不能修改Fresh State |
+| 6 | Wrong Attempt Functional WE=0 | Old/Fresh Attempt隔离 |
+| 7 | Reset前反馈不能写Fresh Session | Old Feedback被Drain/隔离/分类 |
+| 8 | RAM Same-address行为明确 | Forward/Block/Stage，不依赖Undefined模式 |
+| 9 | Admission资源All-or-none | 不产生Partial Commit |
+| 10 | Registered-equivalent Event前不写Committed DRAM Truth | BSM/OpenRow/Timing边界正确 |
+| 11 | Timeout不得产生Fake Completion | 进入Error/Containment |
+| 12 | W1C不得产生Recovery Complete | Software状态与Functional Recovery分离 |
+| 13 | ALPG Ownership期间Normal Issue=0 | 物理命令Owner唯一 |
+| 14 | 未冻结Positive Path不得意外Enable | Open Gate保持Fail Closed |
+
+如果某设计对象实际采用Generation、Epoch或Version，应额外增加：
+
+```text
+Stale Generation WE = 0
+Old Epoch WE = 0
+Version Mismatch PASS = 0
+```
+
+等Assertion，但不将这些字段作为所有模块的通用必选实现。
+
+---
+
+# 11.7 前端及调度验证
+
+## 11.7.1 HIF/IH/TE
+
+至少验证：
+
+a) 一个Host Request默认形成一个Logical Transaction；
+
+b) `HAS_CHILD_SPLIT=0`时不存在Child资源依赖；
+
+c) Parent/Child启用配置下再验证Split及Completion Aggregation；
+
+d) IH地址Mapping唯一；
+
+e) Illegal Address形成Typed Reject；
+
+f) IH Whole Record在Stall期间稳定；
+
+g) donor当前FIFO Depth实现下无覆盖和丢请求；
+
+h) Dependency Capacity不足时不错误接受Transaction；
+
+i) RAW/WAR/WAW与Bank Conflict正确区分；
+
+j) PRE和ACT不直接Retire Transaction；
+
+k) Stale Dependency Release不得修改Current Transaction。
+
+---
+
+## 11.7.2 CC/OS/GS
+
+至少验证：
+
+a) CLOSED Bank结构上形成ACT；
+
+b) Row Hit形成RD/WR；
+
+c) Row Miss形成PRE；
+
+d) CC不拥有OpenRow或Timing Truth；
+
+e) OS同时允许多个Class Head存在；
+
+f) 某Class被Stall不应无条件阻塞其他Class；
+
+g) Class Head未消费且未失效时保持稳定；
+
+h) Fairness只在对应Head真正Commit后更新；
+
+i) GS使用Multi-Class Head构造Bundle；
+
+j) 不合法Phase/Span组合不能Commit；
+
+k) Bundle资源All-or-none；
+
+l) 未Commit Candidate不建立正式Timing Reservation；
+
+m) GS Commit以后PI不得重新选择Phase或重新调度Command。
+
+---
+
+# 11.8 BSM、OpenRow及Timing验证
+
+## 11.8.1 BSM/OpenRow
+
+至少验证：
+
+a) BSM只存在当前设计规定的Bank Truth状态；
+
+b) CLOSED时OpenRow不得Valid；
+
+c) OPEN时必须存在合法OpenRow；
+
+d) ACT Registered-equivalent Event是OpenRow Set的合法来源；
+
+e) Qualified Close是OpenRow Clear的合法来源；
+
+f) PRE Event后BSM立即进入CLOSED；
+
+g) tRP未结束时虽然BSM=CLOSED，ACT仍被Timing阻止；
+
+h) Maintenance或Power Block不改变BSM为伪Block状态；
+
+i) Reset后BSM进入INACCESSIBLE而非CLOSED。
+
+---
+
+## 11.8.2 Timing
+
+至少验证：
+
+a) Timing Query观察Committed History；
+
+b) Timing Query同时观察已Commit但尚未Promote的Reservation；
+
+c) Reservation只由MC Internal Commit创建；
+
+d) Registered-equivalent Event正确完成Reservation→History转换；
+
+e) Reservation Promote不产生Double Count；
+
+f) Legal Phase Mask符合Timing约束；
+
+g) GS选择的Phase必须属于Legal Phase Mask；
+
+h) Same-cycle Event采用统一Reducer；
+
+i) tFAW等Window约束正确；
+
+j) 尚未冻结的DDR6 Timing Rule对应Positive Test保持Gated。
+
+如果实际实现使用Timing Version或Sequence，再验证Stale Query隔离；若通过Block/Replay实现Freshness，则验证对应Block/Replay合同。
+
+---
+
+# 11.9 Read/Write数据通路验证
+
+## 11.9.1 Read
+
+至少验证：
+
+a) RD Commit之前存在足够Expected、Assembly及Return Capacity；
+
+b) Expected和Assembly职责边界正确；
+
+c) PI能够根据正式Return合同恢复对应Logical Read；
+
+d) Correlation失败时Assembly Functional WE=0；
+
+e) Old Attempt Return不得写Fresh Attempt；
+
+f) Required Position完成条件正确；
+
+g) Extra Position不会被误计入正常Completion；
+
+h) Duplicate/Conflict Return按设计处理；
+
+i) 多Lane Return统一归约；
+
+j) Result Hold在Backpressure期间稳定；
+
+k) Result Transfer不自动意味着所有内部Read资源已经安全复用。
+
+如果实现需要显式：
+
+```text
+Allocated -> Matchable
+```
+
+边界，则增加Return-before-Matchable测试。
+
+如果PI在RD Commit时已同步建立Correlation，则不要求为了验证而加入ARM状态。
+
+---
+
+## 11.9.2 Write
+
+至少验证：
+
+a) Payload Allocation与Payload Complete语义分离；
+
+b) WDATA只写Current Payload；
+
+c) READY Payload保持Immutable；
+
+d) Retry继续引用同一Payload；
+
+e) WR Commit前PI Join资源可用；
+
+f) Command/Data Join使用明确Attempt Context；
+
+g) Old Attempt Command/Data不能与Fresh Attempt交叉Join；
+
+h) 标准DFI Write Data与WR Command时序匹配；
+
+i) Write Completion仅依据正式可证明的DFI/PHY边界形成；
+
+j) UNKNOWN_VISIBLE不能被自动分类为Retryable；
+
+k) Result、Attempt Release和Payload Free语义分离；
+
+l) Host Write Response不直接作为Payload Free的唯一条件。
+
+不强制验证：
+
+```text
+Result Fire后必须隔一个周期才能Release
+```
+
+这类具体实现。
+
+如果设计选择同周期Release，则验证其Pre-state已满足全部No-reference条件。
+
+---
+
+# 11.10 Retry、Error及Reset验证
+
+## 11.10.1 Retry
+
+至少验证：
+
+a) Fence以后Old Attempt不能建立Fresh Command；
+
+b) Fence不会丢弃已经在途的合法Old Progress；
+
+c) Old-safe Proof必须对应当前Old Attempt；
+
+d) Proof未覆盖Same-cycle Old Progress时不能提前成立；
+
+e) Fresh Permit只在Old不会污染Fresh以后产生；
+
+f) Fresh Permit不直接分配Read/Write资源；
+
+g) Fresh Attempt仍需重新经过CC/OS/GS；
+
+h) Read Retry重新建立Physical Correlation；
+
+i) Write Retry复用原Payload；
+
+j) Timeout不自动产生Old-safe Proof；
+
+k) Attempt ID有限时不得在Old Reference存在期间Blind Reuse。
+
+Proof与Fresh Authorization可以选择注册分拍实现，也可以由经过证明的组合条件优化。
+
+验证关注的是：
+
+```text
+Fresh不能早于Old-safe
+```
+
+而不是固定要求多一个周期。
+
+---
+
+## 11.10.2 Error/Containment
+
+至少验证：
+
+a) Local Safe Action不依赖Error Logger Ready；
+
+b) Error Detail Store Full不阻止Containment；
+
+c) Telemetry Full不阻止Functional Safety；
+
+d) W1C只影响Software-visible状态；
+
+e) BSM/OpenRow矛盾后Normal Command停止；
+
+f) Timing Deadline Miss保持Sticky；
+
+g) PI无法关联Return时不进行猜测关联；
+
+h) Recovery Complete必须有对应Functional Postcondition；
+
+i) 无法建立可信状态时升级Fatal/Reset。
+
+---
+
+## 11.10.3 Reset/Re-init
+
+至少验证：
+
+a) Idle Reset；
+
+b) TE Pending时Reset；
+
+c) GS已Commit Command存在时Reset；
+
+d) Read Return In-flight时Reset；
+
+e) Write执行中Reset；
+
+f) Refresh/RFM执行中Reset；
+
+g) MR/FSP/Training执行中Reset；
+
+h) Low Power状态Reset；
+
+i) Reset前Old `dfi_rddata_valid`晚到；
+
+j) Old ALERT或其他反馈晚到；
+
+k) Config Publish与Reset同拍；
+
+l) CDC/RDC单域Reset；
+
+m) DFI/PHY Initialization长期不完成；
+
+n) Re-init或Training阶段Timeout；
+
+o) Reset后OpenRow Invalid但Bank仍INACCESSIBLE；
+
+p) 所有Reopen条件满足前`mc_ready=0`；
+
+q) Fresh Fatal与最后一个Ready条件同拍时不得拉高`mc_ready`。
+
+如果具体RTL采用Reset Epoch，则增加Old Epoch相关测试；如果采用Full Drain/PHY Reset隔离，则验证No-old-feedback Barrier本身。
+
+---
+
+# 11.11 Maintenance验证
+
+## 11.11.1 Refresh
+
+至少验证：
+
+a) REF_AB；
+
+b) REF_DIST；
+
+c) Geometry Target Expansion；
+
+d) Selector及Coverage；
+
+e) Due、Debt及Credit；
+
+f) Shared PRE；
+
+g) Bank已CLOSED但tRP未完成时不重复PRE；
+
+h) REF Registered-equivalent Event触发Refresh Accounting；
+
+i) tRFC期间相关访问被正确阻止；
+
+j) Latest-safe-start；
+
+k) Deadline Miss Sticky；
+
+l) Refresh与RFM同时存在；
+
+m) RFM不得修改Refresh Debt。
+
+具体Debt/Credit规则在规范尚未闭合前不由Testbench自行定义Positive Expected。
+
+---
+
+## 11.11.2 PRAC/BAT/RFM
+
+至少验证：
+
+a) ACT Lifetime能够唯一关联当前Activation；
+
+b) Qualified Close只能作用于当前合法Activation；
+
+c) 如果实现采用Generation，则Old Generation Close不能更新Fresh Activation；
+
+d) BAT Contribution；
+
+e) PRFM Obligation；
+
+f) RFM Candidate及Shared PRE；
+
+g) RFM Registered-equivalent Event；
+
+h) BAT/PRFM Accounting；
+
+i) tRFM；
+
+j) REF不得修改BAT；
+
+k) RFM不得修改普通Refresh Debt；
+
+l) Feature Disable路径。
+
+不再强制ACT Lifetime必须采用某一固定：
+
+```text
+EMPTY -> RESERVED -> LIVE
+```
+
+FSM编码。
+
+验证对象是ACT Commit、ACT Registered-equivalent Event及Qualified Close之间的生命周期关系。
+
+---
+
+## 11.11.3 ALERT
+
+`dfi_alert_n`至少验证：
+
+a) 正常Alert Capture；
+
+b) 异步/同步配置下的Capture行为；
+
+c) ALERT事件能够进入Maintenance/Recovery逻辑；
+
+d) ALERT与Refresh/RFM Command Event保持独立；
+
+e) Reset/Re-init边界前后的Old ALERT不能修改Fresh状态；
+
+f) ABO/PRAC/RFM相关Deadline在规范关闭后按照正式关系验证。
+
+---
+
+# 11.12 Config、MR、FSP、Power及Training验证
+
+## 11.12.1 Config/Geometry
+
+至少验证：
+
+a) Legal Candidate；
+
+b) Illegal Profile/Density；
+
+c) Address Mapping错误；
+
+d) Geometry Prepare Pass/Reject；
+
+e) Prepare期间Active状态不变化；
+
+f) Safe Point未成立时不得Publish；
+
+g) Config和Geometry原子Publication；
+
+h) Reset与Publication同拍；
+
+i) 未支持Topology Positive Path保持Fail Closed。
+
+如果实际实现采用ACV/GMV，则验证Old Version隔离和Reuse；第一版采用Single Active Snapshot时，不人为构造“Version Pool必须工作”的检查。
+
+---
+
+## 11.12.2 MR
+
+至少验证：
+
+a) MRR；
+
+b) MRW；
+
+c) Pre/Post Wait；
+
+d) Programmed与Effective不同步场景；
+
+e) MRUPDATE；
+
+f) MRR通过标准DFI Read路径返回；
+
+g) Stale/Unexpected MRR Return；
+
+h) MR执行过程中Reset；
+
+i) 影响FSP/PHY的MR不得提前发布Effective。
+
+---
+
+## 11.12.3 FSP
+
+至少验证：
+
+a) FSP_WR和FSP_OP不同；
+
+b) Target FSP准备；
+
+c) Quiesce/Drain；
+
+d) 标准DFI Frequency/Update相关Feature启用配置；
+
+e) 对应Feature裁剪配置仍能正常Compile；
+
+f) PHY Workpoint切换；
+
+g) Required Training；
+
+h) Timing参数切换；
+
+i) Effective FSP发布；
+
+j) Traffic在所有必要条件闭合前保持Block；
+
+k) FSP Fail/Timeout；
+
+l) FSP与Power/Maintenance冲突。
+
+---
+
+## 11.12.4 Power
+
+至少验证：
+
+a) Idle Power Down；
+
+b) Busy状态Power Request；
+
+c) OPEN Bank进入Power前的处理；
+
+d) CLOSED但Entry Timing未满足；
+
+e) Mandatory Maintenance接近Deadline；
+
+f) 标准DFI Low-power Feature启用路径；
+
+g) Feature裁剪路径；
+
+h) Self Refresh Entry；
+
+i) Self Refresh Exit；
+
+j) Post-SRX Refresh Catch-up；
+
+k) PHY Exit Stall；
+
+l) Reset during Low Power；
+
+m)无法证明Bank连续状态时退出后进入INACCESSIBLE。
+
+---
+
+## 11.12.5 Training
+
+至少验证：
+
+a) Required Phase顺序；
+
+b) Prerequisite未满足时不能启动；
+
+c) PASS；
+
+d) FAIL；
+
+e) Retry；
+
+f) Old Attempt Result晚到；
+
+g) Wrong Workpoint Result；
+
+h) Timeout；
+
+i) Training完成但Timing/PHY Context未Ready时不得Reopen；
+
+j) MC不参与PHY内部Tap/Vref算法；
+
+k) 标准DFI/正式PHY Carrier与内部Training State正确关联。
+
+仅当实际PHY接口允许Late Result与Fresh Attempt并存时，才要求Attempt Identity相关Stale测试。
+
+---
+
+# 11.13 ALPG验证
+
+ALPG验证至少包括：
+
+a) Normal MC运行；
+
+b) 发起Takeover；
+
+c) Block Fresh Normal Traffic；
+
+d) Outstanding Drain；
+
+e) ALPG Ownership建立；
+
+f) ALPG Command进入公共Command/DFI后端；
+
+g) ALPG WDATA；
+
+h) ALPG Read Checker；
+
+i) ALPG Ownership期间Normal Issue=0；
+
+j) ALPG退出；
+
+k) BSM/OpenRow/Timing Cleanup或Resync；
+
+l) Normal Ownership恢复；
+
+m) Reset during ALPG；
+
+n) Maintenance与ALPG的既定边界；
+
+o) `EXACT_COMPLIANT / AUTO_LEGAL / RAW_MARGIN`等实际启用模式按各自Timing权限验证。
+
+RAW_MARGIN仅验证被明确允许的Timing Override，不允许绕过：
+
+```text
+Command Encoding
+Ownership
+Reset/Re-init
+Correlation
+PHY Hard Constraint
+```
+
+---
+
+# 11.14 Storage及FPGA结构验证
+
+所有主要Storage均应进行独立Review。
+
+**表11-4 Storage Review项目**
+
+| 项目 | 验证内容 |
+|---|---|
+| Owner | 是否只有一个Authoritative Writer |
+| Depth | 是否覆盖当前Build需求 |
+| Width | 是否只包含必要功能字段 |
+| Read Intent | 每周期最大读取需求 |
+| Write Intent | 每周期最大写入需求 |
+| Primitive | FF/LUTRAM/BRAM/URAM推断 |
+| Same-address | Forward/Block/Stage策略 |
+| Full | 是否仅阻Fresh工作 |
+| Reclaim | 是否基于真实No-reference条件 |
+| Reset | 清Valid还是需要清Data |
+| CDC | 是否跨Clock Domain |
+| Fmax | Comparator/MUX/Fanout风险 |
+
+如果某Storage当前沿用donor Depth，例如IH 2-deep，应重点验证现有Depth是否满足功能和性能，而不是先假设必须增加。
+
+不得依赖FPGA RAM未定义的Read-during-write行为实现功能正确性。
+
+---
+
+# 11.15 CDC/RDC验证
+
+CDC/RDC至少验证：
+
+a) Whole Record跨域；
+
+b) Payload和Identity不被拆散；
+
+c) Async FIFO Full/Empty；
+
+d) 单侧Reset；
+
+e) Reset Barrier；
+
+f) Old Domain Event晚到；
+
+g) Output Prefetch不被当作额外Capacity；
+
+h) CDC不会导致Command/Data或Return/Identity重新排序；
+
+i) Fresh Session开放前Old跨域Record已Drain、隔离或失去Functional Matchability。
+
+如果具体设计使用Epoch/Generation辅助CDC隔离，则验证对应字段。
+
+不要求为了CDC Verification强制在所有Record中增加Epoch。
+
+---
+
+# 11.16 PI及1:8 Simplified DFI验证
+
+PI/DFI验证必须同时证明：
+
+```text
+1:8 Packing正确
++
+标准DFI接口正确
++
+不存在私造DFI端口
+```
+
+---
+
+## 11.16.1 Command/Phase
+
+至少覆盖：
+
+a) P0～P7所有允许的Start Phase；
+
+b) 各Command实际Span；
+
+c) Cross-word Continuation；
+
+d) 同一Issue Word多个Command组合；
+
+e) 非法Phase Occupancy冲突；
+
+f) GS Commit后PI保持Command Type、Phase及Placement不变；
+
+g) PI不得再次调用Timing/GS逻辑重新选择Command。
+
+Command Span和合法Placement尚未由正式DDR6/PHY定义关闭的部分保持Gated。
+
+---
+
+## 11.16.2 Standard DFI Command/Data
+
+验证：
+
+```text
+Command / Address标准成员
+```
+
+以及：
+
+```text
+dfi_wrdata
+dfi_wrdata_en
+dfi_wrdata_mask
+```
+
+等Write成员正确对齐。
+
+Read验证：
+
+```text
+dfi_rddata_en
+dfi_rddata_valid
+dfi_rddata
+```
+
+及最终Build保留的其他标准成员。
+
+---
+
+## 11.16.3 Registered-equivalent Event
+
+验证：
+
+```text
+DFI Presentation
+      │
+      ▼
+Signed PI/PHY Mapping
+      │
+      ▼
+Registered-equivalent Event
+```
+
+并确认：
+
+a) DFI Presentation本身不直接更新BSM/OpenRow/Committed Timing；
+
+b) `cmd_actual_internal`若存在，只由正式映射产生；
+
+c) 外部不存在私有`cmd_actual`端口。
+
+---
+
+## 11.16.4 Read Correlation
+
+验证：
+
+a) Logical Read ID不进入DFI外部端口；
+
+b) Attempt/Correlation Journal位于PI/Read内部；
+
+c) Ordered/Fixed-route合同成立时能够恢复正确Logical Read；
+
+d) Old `dfi_rddata_valid`不会写Fresh Read；
+
+e) Return合同未关闭时Positive Path保持Fail Closed；
+
+f) 不允许通过增加`rd_token`或`physical_return_tag`私有DFI端口绕过Gate。
+
+---
+
+## 11.16.5 DFI Lifecycle Feature
+
+根据Build实际保留的DFI Feature验证：
+
+```text
+dfi_reset_n
+dfi_init_start / dfi_init_complete
+
+ctrlupd / phyupd
+lp
+phymstr
+frequency
+```
+
+Feature未启用时，相应端口和RTL逻辑应能够被正确裁剪，而不是留下悬空的伪功能路径。
+
+---
+
+## 11.16.6 ALERT
+
+验证：
+
+```text
+dfi_alert_n
+```
+
+为独立PHY→MC标准通路。
+
+它不能被：
+
+```text
+training_done
+op_done
+phy_fatal
+```
+
+等内部概念替代。
+
+---
+
+## 11.16.7 接口Lint
+
+对最终MC↔PHY External Port List执行接口检查：
+
+> 所有被标记为DFI的外部端口必须来自项目签署的DFI Signal List。
+
+明确禁止出现未经批准的：
+
+```text
+cmd_ready
+cmd_accept
+cmd_actual
+reserve_token
+rd_token
+physical_return_tag
+flush_done
+session_epoch
+write_done
+training_done
+```
+
+等“DFI”端口。
+
+如果未来确实增加非DFI接口，应明确标记：
+
+```text
+NON_DFI_SIDEBAND
+```
+
+并单独验证。
+
+---
+
+# 11.17 FPGA实现验证
+
+## 11.17.1 Compile Closure
+
+至少检查：
+
+a) 无语法和类型错误；
+
+b) 参数化Width合法；
+
+c) 非2幂Depth不存在Hole访问；
+
+d) Feature Enable/Disable配置均能Compile；
+
+e) Storage推断正确；
+
+f) CDC结构完整；
+
+g) Simplified DFI Signal Subset裁剪配置一致。
+
+---
+
+## 11.17.2 Functional RTL Closure
+
+进入Synthesis前至少完成：
+
+```text
+Directed Test
+Assertion
+Backpressure
+Same-cycle
+Reset
+Error / Retry
+DFI Interface Lint
+```
+
+以及当前阶段可执行的Open Gate Negative/Fail-closed验证。
+
+---
+
+## 11.17.3 Synthesis Closure
+
+检查：
+
+a) FF、LUTRAM、BRAM、URAM使用；
+
+b) RAM复制；
+
+c) Resource Utilization；
+
+d) High Fanout；
+
+e) Comparator/MUX深度；
+
+f) 1:8 Bundle/Phase Packer Critical Path；
+
+g) Timing Query Critical Path；
+
+h) Read Correlation和Write Data MUX；
+
+i)意外寄存器膨胀；
+
+j) Early Fmax。
+
+---
+
+## 11.17.4 Place and Route
+
+检查：
+
+a) WNS/TNS；
+
+b) Congestion；
+
+c) SLR/Clock Region Crossing；
+
+d) High Fanout；
+
+e) PI/PHY Placement；
+
+f) P0～P7相关物理路径；
+
+g) Timing/State RAM位置；
+
+h) Read/Write高带宽路径。
+
+---
+
+## 11.17.5 Post-route
+
+重新确认：
+
+a) Clock Constraint满足；
+
+b) CDC/RDC约束成立；
+
+c) Pipeline变化未破坏功能边界；
+
+d) RAM Same-address行为符合验证假设；
+
+e) PI/DFI关键路径满足接口Timing要求。
+
+---
+
+# 11.18 FPGA硬件Bring-up
+
+建议按以下顺序进行。
+
+**表11-5 FPGA硬件Bring-up顺序**
+
+| 阶段 | 验证内容 | 主要通过条件 |
+|---|---|---|
+| Clock/Reset | Clock、Reset、Domain状态 | 稳定且与Reset合同一致 |
+| DFI/PHY基本接口 | 标准DFI子集 | 信号及生命周期正确 |
+| Command Capture | ACT/PRE/RD/WR | Encoding及Phase正确 |
+| Initialization | DFI Init、MR、Training | 建立可信MC Ready |
+| Basic Write | 单次Write | Command/Data时序正确 |
+| Basic Read | 单次Read | Return Correlation及Data正确 |
+| Read/Write Loop | 连续读写 | 无Data/Correlation错误 |
+| Timing/Bank | Row-hit/Row-miss | 命令及Timing正确 |
+| Maintenance | Refresh/RFM | Deadline及Accounting正确 |
+| FSP/Power | 工作点及低功耗 | Reopen正确 |
+| Reset/Recovery | 不同生命周期点Reset | Old反馈隔离、Re-init成功 |
+| ALPG | Takeover/Pattern/Return | Ownership正确 |
+| Stress/Margin | 长时间及边界条件 | 无未解释错误 |
+
+具体DDR6 PHY Training、Margin和Protocol Checker能力依赖最终PHY/TC实现，不在本章自行假设。
+
+---
+
+# 11.19 FPGA Debug与可观测性
+
+ILA及Debug信号应优先选择能够定位Functional Boundary的状态，而不是完整复制所有内部Record。
+
+建议观察：
+
+```text
+Command:
+CC Candidate
+OS Class Heads
+GS Committed Bundle
+Selected Phase
+DFI Presentation
+Registered-equivalent Event
+```
+
+```text
+State/Timing:
+BSM
+OpenRow
+Timing Block Reason
+Legal Phase Mask
+Timing Reservation
+```
+
+```text
+Read/Write:
+Expected Valid
+PI Correlation State
+Assembly Progress
+Payload State
+Attempt State
+Result Status
+```
+
+```text
+Maintenance:
+Refresh Debt
+Refresh Selector
+PRFM/RFM Obligation
+Maintenance Deadline
+dfi_alert_n Event
+```
+
+```text
+Recovery:
+Containment State
+Retry State
+Reset/Re-init State
+mc_ready
+```
+
+如果实际实现采用Generation、Epoch或Version，再选择性加入对应字段。
+
+不因为Debug方便而让这些字段成为Functional Design必选项。
+
+Telemetry适合长时间低带宽记录，ILA适合短窗口波形定位。
+
+二者均不得参与Functional Decision。
+
+---
+
+# 11.20 Coverage
+
+Coverage至少应覆盖：
+
+```text
+Legal / Illegal
+Backpressure
+Full
+Same-cycle
+Stale
+Duplicate
+Timeout
+Retry
+Reset
+Containment / Recovery
+Maintenance Deadline
+Config / Publication
+FSP / Power / Training
+DFI Feature Enable / Disable
+ALPG Ownership
+```
+
+建议建立关键Cross，例如：
+
+a) Command Type × Row Hit/Miss；
+
+b) Command Type × P0～P7；
+
+c) Command Class × Bundle Combination；
+
+d) Timing Block Reason × Resource Relation；
+
+e) Full Resource × Existing Progress；
+
+f) Read Return × Correlation Match结果；
+
+g) Write Visibility × Retry Policy；
+
+h) Maintenance Type × Deadline Region；
+
+i) Reset Point × Active Subsystem；
+
+j) Error Visibility × Recovery Policy；
+
+k) DFI Feature × Enable/Disable Build；
+
+l) ALPG Ownership × Normal Issue。
+
+具体Coverage Bin数量由DV环境和最终功能配置决定。
+
+---
+
+# 11.21 Regression及Stress
+
+Directed Test完成后，应开展长时间Regression，重点包括：
+
+a) Read/Write混合；
+
+b) Row-hit/Row-miss混合；
+
+c) 多Bank冲突；
+
+d) Random Backpressure；
+
+e) Near-full Storage；
+
+f) Refresh/RFM与Normal Traffic交错；
+
+g) FSP/Power操作插入；
+
+h) Training及Recovery；
+
+i) Retry与Late Feedback；
+
+j) 不同生命周期点Reset；
+
+k) ALPG Takeover/Return；
+
+l) Error Injection；
+
+m) DFI ALERT及Maintenance交错。
+
+除Data Compare外，还应长期监控：
+
+```text
+No Deadlock
+No Permanent Full
+No Lost Functional Event
+No Stale Functional Write
+No Unexpected Resource Leak
+No Maintenance Deadline Miss
+No Illegal DFI Port Behavior
+```
+
+只有实际采用Version/Generation机制的模块，再监控对应Alias/Reuse错误。
+
+---
+
+# 11.22 重点设计攻击项
+
+进入后续专家评审和RTL Signoff前，建议重点攻击以下问题：
+
+a) Parent/Child关闭时是否仍残留无意义Child状态或资源依赖；
+
+b) IH当前FIFO Depth是否确实满足目标Backpressure；
+
+c) TE是否错误地把Bank Conflict当成Data Dependency；
+
+d) OS是否被实现成了Single Global Winner；
+
+e) GS是否被Single Admitted Hold限制Production能力；
+
+f) GS Commit后PI是否仍可能重新选择Phase；
+
+g) Timing Query是否同时观察History和Reservation；
+
+h) PRE后BSM是否错误等待tRP才进入CLOSED；
+
+i) OpenRow是否存在第二Truth；
+
+j) Auto-precharge是否被过早视为Close；
+
+k) Refresh Debt与BAT/PRFM是否混账；
+
+l) Shared PRE是否重复PRE已经CLOSED的Bank；
+
+m) Read Correlation是否意外依赖私有PHY Tag；
+
+n) Old Read Return是否可能写Fresh Expected；
+
+o) Write Payload和Attempt是否仍被耦合；
+
+p) UNKNOWN_VISIBLE Write是否可能被直接Retry；
+
+q) Config/Geometry是否可能半套Publication；
+
+r) Reset是否只清Local Valid而缺少PHY Old-feedback证明；
+
+s) W1C是否可能错误释放Containment；
+
+t) Storage Full是否可能反向堵死Existing Progress；
+
+u) MC↔PHY是否存在未经签署的私有“DFI”信号。
+
+这些Attack Item应优先由内部预评审和DV关闭，避免把已经可以在项目内部证明的问题继续提交外部专家裁决。
+
+---
+
+# 11.23 验证通过准则及待闭合项
+
+## 11.23.1 阶段通过准则
+
+**表11-6 验证主要通过准则**
+
+| 项目 | 通过要求 |
+|---|---|
+| RTL Review | Owner及Boundary与设计文档一致 |
+| Simulation | 已定义可执行场景无未解释Functional Failure |
+| Assertion | Required Assertion Clean |
+| Coverage | 当前已开放功能的Required Bin闭合 |
+| X/Unknown | 无未解释Functional X传播 |
+| Capacity | 无未解释Overflow/Underflow |
+| Open Gate | Positive Path未关闭时保持Fail Closed |
+| DFI Lint | 外部仅存在签署的标准DFI信号 |
+| CDC/RDC | Closure完成 |
+| Synthesis | Storage/Resource推断符合预期 |
+| P&R | 满足阶段Timing目标 |
+| Resource | 具有接受的Margin |
+| Hardware Bring-up | 当前授权Physical Path通过 |
+| Reset/Recovery | Old/Fresh隔离和Re-init通过 |
+| Maintenance | Mandatory Service及Deadline通过 |
+| Stress | 长时间运行无未解释错误 |
+
+当前工程状态仍为：
+
+```text
+ENGINEERING_CANDIDATE
+```
+
+验证阶段通过不自动意味着Whole-MC Production Ready。
+
+对于Open Gate Positive Case应记录：
+
+```text
+当前缺失什么；
+为什么不能执行Positive Verification；
+RTL当前如何Fail Closed；
+关闭Gate需要什么证据；
+Gate关闭后补充哪些Test/Assertion。
+```
+
+不得把未验证的Positive Path统计为Pass。
+
+---
+
+## 11.23.2 主要验证交付物
+
+应形成：
+
+a) Module Verification Checklist；
+
+b) Interface/Contract Checklist；
+
+c) Assertion清单及结果；
+
+d) Directed Test清单及结果；
+
+e) Coverage Report；
+
+f) Fault Injection及Retry/Reset结果；
+
+g) DFI External Interface Lint结果；
+
+h) CDC/RDC结果；
+
+i) Synthesis Resource Report；
+
+j) P&R Timing Report；
+
+k) Hardware Bring-up记录；
+
+l) Stress/Margin结果；
+
+m) Open Gate Verification Status；
+
+n) Production Blocking Issue清单。
+
+---
+
+## 11.23.3 本章待闭合项
+
+**表11-7 验证环境及外部待闭合项**
+
+| 类别 | 待闭合内容 | 关闭来源 |
+|---|---|---|
+| DV环境 | 最终Simulator/UVM或其他Framework | DV Team |
+| Protocol | DDR6 Reference Model/Checker | Spec/DV |
+| DFI | 最终DFI Signal Subset及Checker | DFI/PHY ICD |
+| Read | Ordered/Fixed-route Return及Earliest Return | PHY ICD |
+| Write | Physical Visibility/Completion证据 | PHY ICD |
+| Training | Result Carrier及Sequence | PHY ICD |
+| Reset | DFI/PHY Old-feedback Drain证明 | PHY ICD |
+| Topology | Product Profile及1p12 Expected Result | Product |
+| Storage | 最终Depth、Port及Bandwidth | RTL/P&R |
+| Coverage | Required Bin/Cross清单 | DV Signoff |
+| Formal | 适用于Formal Proof的Assertion集合 | DV/Formal |
+| Fault Injection | 最终Error Injection接口 | RTL/DV |
+| Debug | ILA及Telemetry资源预算 | FPGA Integration |
+| Hardware | Protocol Checker及Margin能力 | PHY/FPGA |
+| Signoff | 各Gate最终责任Owner | Project Review |
+
+上述开放项主要决定验证环境、Physical Positive Path以及最终Signoff证据，不重新打开第4～10章已经完成内部收敛的功能Owner和生命周期边界。
