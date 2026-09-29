@@ -1,490 +1,851 @@
-# 附录A MC/PHY标准DFI接口检查表
+# 附录C DDR5 Donor到DDR6 RTL Delta矩阵
 
-## A.1 目的
+## C.1 目的
 
-本附录用于DDR6 MC与PHY接口设计、RTL Review、DV及集成阶段的统一检查。
+本附录记录DDR5 donor源码与DDR6目标MC之间的对应关系，用于指导RTL复用、修改范围、Coding Review及后续donor实读。
 
-其核心原则为：
-
-```text
-MC ↔ PHY External Interface
-        =
-Standard DFI Signal Subset
-```
-
-即：
-
-> 所采用DFI版本已经定义的信号可以根据Product和PHY需求保留或裁剪，但不得为了实现MC内部状态、Identity或Proof重新定义一套私有“DFI协议”。
-
-以下对象原则上属于MC/PI内部：
+其基本原则为：
 
 ```text
-Phase Placement
-Legal Phase Mask
-Timing Reservation
-Logical Transaction ID
-Attempt Context
-Read Correlation Journal
-Payload Reference
-Registered-equivalent Event
-Reset/Session Context
-No-old-feedback Proof
+先确认DDR5 donor真实存在什么
+        │
+        ▼
+再确认DDR6真正改变什么
+        │
+        ▼
+最后确定
+KEEP / MODIFY / REPLACE / NEW / DELETE
 ```
 
-除非所采用标准DFI版本本身已有对应标准Carrier，否则不得直接映射为新的MC↔PHY端口。
+不得因为DDR6增加了新功能而默认重写整个模块。
+
+同样不得因为DDR5已有某结构，就默认其状态、参数和接口语义可以原样用于DDR6。
 
 ---
 
-## A.2 标准DFI信号分类
+# C.2 Donor基线
 
-**表A-1 DFI信号分类原则**
+当前donor基线为：
 
-| 类别 | 处理 | 设计原则 |
-|---|---|---|
-| Command/Address | RETAIN | DDR6 Command通过标准DFI Command/Address成员输出 |
-| Write Data | RETAIN | 使用标准`dfi_wrdata`、`dfi_wrdata_en`、Mask等 |
-| Read Data | RETAIN | 使用标准`dfi_rddata`、`dfi_rddata_valid`、`dfi_rddata_en`等 |
-| `dfi_alert_n` | MANDATORY RETAIN | 独立PHY→MC ALERT通路 |
-| Initialization | RETAIN | 保留当前Build需要的标准初始化生命周期 |
-| Update | FEATURE-GATED | `ctrlupd/phyupd`等按PHY需求启用 |
-| Frequency | FEATURE-GATED | FSP/频率切换实际使用时保留 |
-| Low Power | FEATURE-GATED | Power方案实际需要时保留 |
-| PHY Master | FEATURE-GATED | 仅在目标PHY流程要求时保留 |
-| Training相关标准机制 | FEATURE-GATED | 根据DFI版本及PHY ICD确定 |
-| 自定义Command Ready/Accept | DELETE AS DFI PORT | 如需Resource Ready，仅留在MC内部 |
-| 自定义`cmd_actual` | DELETE AS DFI PORT | 仅保留内部Registered-equivalent Event |
-| 自定义Read Tag | DELETE AS DFI PORT | Read Correlation留PI内部 |
-| 自定义Flush/Session/Epoch | DELETE AS DFI PORT | Reset隔离属于内部状态或正式PHY合同 |
-| 自定义`phy_fatal/op_done` | DELETE AS DFI PORT | 不替代标准DFI已有能力 |
+```text
+Root:
+D:\sunrui\DDR5\ddr54_src\i_DWC_ddrctl_ddr54
+
+Component:
+DWC_ddrctl_ddr54
+
+Version:
+1.21a-lca00
+```
+
+当前已确认DDR5主Command路径采用PAS_CPE，因此：
+
+```text
+src/pas/*
+```
+
+作为BSM、Timing、CC、OS、GS等模块的Primary DDR5 Donor。
+
+`src/ts/*`仅作为历史/legacy参考，不替代PAS直接证据。
 
 ---
 
-## A.3 1:8 Command接口检查
+# C.3 证据等级
 
-MC内部采用：
-
-```text
-P0 P1 P2 P3 P4 P5 P6 P7
-```
-
-作为逻辑Phase Placement空间。
-
-内部Command可以描述为：
+采用三档证据等级：
 
 ```text
-Command Type
-Target
-Start Phase
-Span
-Continuation
-Context
+E2 DIRECT-READ
+    已直接实读目标RTL文件和关键行为
+    可以形成file-level Delta
+
+E1 ARCH-EVIDENCE
+    已有架构材料或间接证据
+    但目标RTL文件尚未完成直接实读
+
+E0 NEED-RTL-READ
+    当前缺少足够源码证据
 ```
 
-其中：
+必须严格区分：
 
 ```text
-Start Phase
-Span
-Continuation
-Legal Phase Mask
+Donor Fact
 ```
 
-均属于MC内部调度字段。
-
-PI负责将已经Commit的Command按照正式DFI定义转换为标准Command/Address信号。
-
-检查项：
+与：
 
 ```text
-[ ] GS确定的Start Phase属于Timing Legal Phase Mask
-[ ] 同一Issue Word不存在Phase/Span冲突
-[ ] Cross-word Continuation完整
-[ ] GS Commit以后PI不重新选择Phase
-[ ] PI不重新进行OS/GS Arbitration
-[ ] P0～P7最终编码来自正式DFI/PHY Mapping
+DDR6 Design Decision
 ```
+
+以及：
+
+```text
+Open Gate
+```
+
+三类内容。
 
 ---
 
-## A.4 MC Internal Commit检查
+# C.4 当前E2模块
 
-MC Internal Commit定义为：
-
-> Command已经完成Timing、Phase Occupancy、数据资源及PI/DFI输出条件检查，并被不可逆地插入标准DFI输出流水线。
-
-逻辑关系为：
-
-```text
-Candidate
-   │
-   ▼
-OS Class Head
-   │
-   ▼
-GS Bundle
-   │
-   ▼
-Resource Prepare
-   │
-   ▼
-MC Internal Commit
-   │
-   ▼
-Standard DFI Presentation
-```
-
-Commit之后：
-
-a) Command Type不得因普通Backpressure改变；
-
-b) Start Phase不得重新选择；
-
-c) Bundle内部顺序不得重新调度；
-
-d) 正式Timing Reservation已经生效。
-
-内部可以存在：
-
-```text
-Output Hold
-Credit
-Reservation
-Occupancy
-```
-
-等实现。
-
-但不得因此增加外部：
-
-```text
-cmd_ready
-cmd_accept
-cmd_launch
-reserve_token
-```
-
-私有DFI握手。
-
----
-
-## A.5 Registered-equivalent Event检查
-
-标准DFI Presentation不直接等价于DRAM Committed Truth更新。
-
-统一采用：
-
-```text
-Standard DFI Presentation
-          │
-          ▼
-Signed PI / PHY Mapping
-          │
-          ▼
-Registered-equivalent Event
-```
-
-Registered-equivalent Event可在MC内部称为：
-
-```text
-cmd_actual_internal
-```
-
-但不得成为外部DFI端口。
-
-其主要Consumer包括：
+当前已有较强E2直接实读基础的六类功能为：
 
 ```text
 BSM
+OpenRow相关donor状态
+Timing
+CC
+OS
+GS
+```
+
+**表C-1 六模块DDR5→DDR6 Delta**
+
+| DDR6 Owner | DDR5 Primary Donor | Donor事实 | DDR6处理 |
+|---|---|---|---|
+| BSM | `pasds_bsm.sv`、`pasds.sv` | 7态per-bank FSM；Bank Lifecycle与多项Timing Counter/OK耦合 | MAJOR REFACTOR |
+| OpenRow | `te_rd_entry.sv`、`te_wr_entry.sv`、`te_assertions.sv` | 无独立OpenRow Owner；TE Entry保存Page-open Shadow | REPLACE / NEW OWNER |
+| Timing | `pasds_bsm.sv`、`pasds_lrsm.sv`、`pasds_prsm.sv`、`pasds_tfaw_ctrl.sv`等 | Timing分散于Bank/Rank/Window逻辑 | MAJOR REFACTOR |
+| CC | `pascc.sv`、`pascc_bankctrl.sv`、`pascc_rankctrl.sv`、`pascc_rdwr_switch.sv` | Per-resource ACT/PRE/RW Candidate，同时混合Timing/Page/Policy | MODIFY / DECOUPLE |
+| OS | `pasos.sv` | ACT/PRE/RW、高低优先级分Class选择；不是单Global Winner | MODIFY |
+| GS | `pasgs.sv`及1N/2N动态Scheduler | Phase-aware Multi-command Scheduling并支持Extension | MAJOR REFACTOR |
+
+Whole-MC donor审计状态仍为：
+
+```text
+PARTIAL_CLOSED
+```
+
+不能把这六个模块的E2结论扩大解释为Whole-MC donor实读完成。
+
+---
+
+# C.5 BSM Delta
+
+## C.5.1 Donor Fact
+
+DDR5 donor BSM包含：
+
+```text
+INIT
+IDLE
+ACTIVATING
+ACTIVE
+PRECHARGING
+RD
+WR
+```
+
+等状态，并把：
+
+```text
+tRCD
+tRC
+tRAS
+tRP
+tRTP
+tWTP
+tCCD
+```
+
+等Timing Counter/Eligibility与Bank Lifecycle耦合。
+
+---
+
+## C.5.2 DDR6 Design Decision
+
+DDR6将其拆为：
+
+```text
+BSM
+    -> Bank Truth
+
+Timing Engine
+    -> Timing Truth
+
 OpenRow
-Timing History
-Refresh / RFM Accounting
-PRAC / BAT
-Read / Write Physical Progress
+    -> Row Truth
+
+Maintenance / Power
+    -> Access Gate
 ```
 
-检查项：
+BSM只保留：
 
 ```text
-[ ] Presentation→Event关系有正式PHY ICD依据
-[ ] BSM不在Presentation时提前更新
-[ ] OpenRow不在Presentation时提前更新
-[ ] Committed Timing History不在Presentation时提前更新
-[ ] 外部不存在cmd_actual私有端口
+INACCESSIBLE
+CLOSED
+OPEN
+ERROR_CONTAIN
+```
+
+处理类型：
+
+```text
+MAJOR REFACTOR
+```
+
+明确不保留：
+
+```text
+ACTIVATING
+PRECHARGING
+CLOSED_PENDING
+```
+
+作为Timing等待状态。
+
+---
+
+# C.6 OpenRow Delta
+
+## C.6.1 Donor Fact
+
+DDR5 TE Read/Write Entry维护各自的：
+
+```text
+r_page_open
+```
+
+并响应ACT、PRE及Auto-precharge等事件。
+
+Assertion环境还维护独立Page Table进行一致性检查。
+
+因此Page-open事实存在多份Shadow。
+
+---
+
+## C.6.2 DDR6 Design Decision
+
+DDR6建立：
+
+```text
+Per-resource OpenRow Owner
+```
+
+最低逻辑内容：
+
+```text
+Valid
+Row Address
+必要Geometry Context
+```
+
+TE中的Page Hit只能作为：
+
+```text
+Query Result
+或
+Invalidatable Cache
+```
+
+不能拥有更新权限。
+
+处理类型：
+
+```text
+REPLACE / NEW OWNER
 ```
 
 ---
 
-## A.6 Read接口及Correlation检查
+# C.7 Timing Delta
 
-外部Read Path使用标准DFI成员，例如：
+## C.7.1 Donor Fact
+
+DDR5 Timing分散在：
 
 ```text
-MC -> PHY:
-dfi_rddata_en
-
-PHY -> MC:
-dfi_rddata_valid
-dfi_rddata
-
-Optional:
-dfi_rddata_dbi
-dfi_rddata_cs
+Per-bank BSM
+Logical Rank State
+Physical Rank State
+tFAW Window
+其他PAS_DS逻辑
 ```
 
-具体成员及Width以最终DFI版本和PHY ICD为准。
-
-以下对象留在PI/Read内部：
+并向CC输出：
 
 ```text
-Logical Read Identity
-Execution Attempt
-Expected Reference
-Assembly Reference
-Issue Journal
-Correlation Context
+*_ok
+phase
 ```
 
-如果标准DFI Read Return没有Tag，则必须证明：
+等结果。
+
+---
+
+## C.7.2 DDR6 Design Decision
+
+DDR6建立统一Timing Owner：
 
 ```text
-Issue Order
+Committed History
 +
-Ordered / Fixed-route Return
+Live Reservation
 +
-Known Return Layout
+Active Timing Rule
+        │
+        ▼
+Timing Query
+        │
+        ▼
+Legal Phase Mask
 ```
 
-能够唯一恢复Logical Read。
-
-检查项：
+可以复用DDR5：
 
 ```text
-[ ] Logical Read ID没有出现在DFI端口
-[ ] Attempt ID没有出现在DFI端口
-[ ] 不存在rd_token
-[ ] 不存在physical_return_tag
-[ ] Return Ordering合同已签署或Positive Path保持Gated
-[ ] Earliest Return已定义
-[ ] Old Return不会写Fresh Attempt
-```
-
----
-
-## A.7 Write接口检查
-
-外部Write Path使用标准成员：
-
-```text
-dfi_wrdata
-dfi_wrdata_en
-dfi_wrdata_mask
-```
-
-以及最终Build要求的其他标准Write成员。
-
-PI内部负责：
-
-```text
-WR Command
-+
-Write Attempt
-+
-Payload Reference
-```
-
-的正确Join。
-
-检查项：
-
-```text
-[ ] Payload Reference不暴露至PHY
-[ ] Attempt ID不暴露至PHY
-[ ] Command/Data Join在PI内部明确建立
-[ ] Write Data Timing符合DFI合同
-[ ] 不存在write_accept私有DFI端口
-[ ] 不存在write_drain私有DFI端口
-[ ] 不存在write_done私有DFI端口
-```
-
-如果PHY没有独立Accept/Drain/Status Carrier，则MC内部Write Completion必须根据实际可证明的标准DFI/PHY边界重新定义，不能虚构反馈。
-
----
-
-## A.8 Reset及Reopen检查
-
-外部优先采用正式DFI生命周期，例如：
-
-```text
-dfi_reset_n
-dfi_init_start
-dfi_init_complete
-```
-
-以及Build实际保留的：
-
-```text
-ctrlupd
-phyupd
-lp
-phymstr
-frequency
-```
-
-等标准Feature。
-
-MC内部可以维护：
-
-```text
-Reset/Re-init State
-Local Matchability
-CDC/RDC Barrier
-Retry Context
-Optional Reset Epoch
-```
-
-但不得将以下内部概念作为DFI外部信号：
-
-```text
-flush_req
-flush_done
-no_old_return_done
-session_epoch
-```
-
-Traffic Reopen至少需要证明：
-
-```text
-Host/HIF Boundary Complete
-AND MC Local Clear Complete
-AND CDC/RDC Safe
-AND DFI/PHY Initialization Complete
-AND Old Feedback Cannot Pollute Fresh State
-AND DRAM Initialization Complete
-AND Required MR Effective
-AND Required Training Complete
-AND Config/Geometry/Timing Ready
-AND Bank State Known
-AND Maintenance Ready
-AND !Fatal
-```
-
-因此：
-
-```text
-Reset Deassert
-!=
-mc_ready
-```
-
-并且：
-
-```text
-dfi_init_complete
-!=
-mc_ready
-```
-
----
-
-## A.9 ALERT检查
-
-必须保留：
-
-```text
-PHY -> MC : dfi_alert_n
-```
-
-内部路径为：
-
-```text
-dfi_alert_n
-     │
-     ▼
-Capture
-     │
-     ├── Timing / Deadline
-     ├── PRAC / RFM / Recovery
-     ├── GS Maintenance Gate
-     └── Trace / Error
-```
-
-检查项：
-
-```text
-[ ] ALERT不会被普通Command/Data路径吞掉
-[ ] ALERT与REF/RFM Command Event相互独立
-[ ] Old ALERT不得修改Fresh Recovery State
-[ ] Reset过程中不会Silent Lose尚未处理的ALERT
-[ ] 不使用phy_fatal替代dfi_alert_n
-```
-
----
-
-## A.10 External Port Lint
-
-每次MC↔PHY接口修改后，应自动或人工执行：
-
-```text
-RTL External Port List
-          │
-          ▼
+Counter
+Window
 Compare
-          │
-          ▼
-Signed DFI Signal Master List
 ```
 
-允许结果：
+算法思想。
+
+但不继续让多个donor模块分别拥有Authoritative Timing Truth。
+
+处理类型：
 
 ```text
-STANDARD_DFI_RETAIN
-STANDARD_DFI_FEATURE_GATED
-APPROVED_NON_DFI_SIDEBAND
+MAJOR REFACTOR
 ```
 
-禁止存在未经批准的：
-
-```text
-cmd_ready
-cmd_accept
-cmd_actual
-reserve_token
-rd_token
-physical_return_tag
-flush_done
-session_epoch
-write_done
-training_done
-phy_fatal
-```
-
-等“DFI”信号。
+DDR6具体Rule/Scope/Value仍由第13章SPEC Gate关闭。
 
 ---
 
-## A.11 PHY Integration前检查表
+# C.8 CC Delta
 
-真实PHY Positive Path接入前至少确认：
+## C.8.1 Donor Fact
+
+DDR5 CC根据每个Bank状态形成：
 
 ```text
-[ ] 最终DFI版本已确定
-[ ] Standard DFI Signal Master List已签署
-[ ] Command/Address Width已关闭
-[ ] P0～P7 Physical Mapping已关闭
-[ ] Presentation→Registered-equivalent Mapping已关闭
-[ ] DFI Output Timing具有Finite/Deterministic合同
-[ ] Read Return Ordering已关闭
-[ ] Earliest Read Return已关闭
-[ ] Write Command/Data关系已关闭
-[ ] Write Visibility/Completion合同已关闭
-[ ] dfi_alert_n行为已关闭
-[ ] Reset/Init生命周期已关闭
-[ ] FSP/Power/Update标准Feature已确定
-[ ] Training Carrier已确定
-[ ] CDC/RDC已Review
-[ ] 外部Interface Lint通过
+ACT
+PRE
+RW
 ```
 
-未关闭项目继续由第13章Open Gate管理。
+Candidate。
 
-本附录仅作为接口检查和集成准入依据，不建立第二套MC/PHY协议定义。
+同时消费：
+
+```text
+DS Timing OK / Phase
+TE Page Hit
+```
+
+并混合：
+
+```text
+Page-close Policy
+Refresh/CI PRE
+RD/WR Mode Policy
+```
+
+等功能。
+
+---
+
+## C.8.2 DDR6 Design Decision
+
+DDR6保留：
+
+```text
+Per-resource Structural Candidate
+```
+
+思想。
+
+但Owner拆分为：
+
+```text
+Timing Truth
+    -> Timing Engine
+
+Row Truth
+    -> OpenRow
+
+Maintenance PRE
+    -> Maintenance / Shared PRE
+
+Final Bundle Packing
+    -> GS
+```
+
+CC只负责：
+
+```text
+CLOSED -> ACT
+OPEN + Row Hit -> RD/WR
+OPEN + Row Miss -> PRE
+```
+
+处理类型：
+
+```text
+MODIFY / DECOUPLE
+```
+
+---
+
+# C.9 OS Delta
+
+## C.9.1 Donor Fact
+
+DDR5 OS并非一个Global Winner。
+
+源码结构显示：
+
+```text
+ACT Class
+PRE Class
+RW Class
+High / Low Priority
+Phase-aware Selection
+```
+
+可以同时向GS保留多个Class Candidate。
+
+---
+
+## C.9.2 DDR6 Design Decision
+
+DDR6继续采用：
+
+```text
+Multi-Class Heads
+```
+
+并增加：
+
+```text
+Head Stability
+Freshness
+Fairness-on-Commit
+```
+
+等Backpressure要求。
+
+删除旧设计中的：
+
+```text
+Single Global Selected Hold
+```
+
+处理类型：
+
+```text
+MODIFY
+```
+
+---
+
+# C.10 GS Delta
+
+## C.10.1 Donor Fact
+
+DDR5 PAS GS已经具备：
+
+```text
+Phase-aware Arbitration
+Dynamic Scheduling
+RW / ACT / PRE / REF Composition
+Cross-word Extension
+```
+
+其基础是1:4 Phase Scheduler，而不是单条Command透传。
+
+---
+
+## C.10.2 DDR6 Design Decision
+
+DDR6目标结构为：
+
+```text
+Multi-Class Heads
+        │
+        ▼
+Bundle Builder
+        │
+        ▼
+8-phase Occupancy
+        │
+        ▼
+Phase / Span / Conflict
+        │
+        ▼
+Resource Prepare
+        │
+        ▼
+MC Internal Commit
+```
+
+删除：
+
+```text
+Single Admitted Hold
+```
+
+作为Production结构。
+
+处理类型：
+
+```text
+MAJOR REFACTOR
+```
+
+Bring-up允许：
+
+```text
+ISSUE_LANES = 1
+```
+
+但不改变GS Bundle Builder边界。
+
+---
+
+# C.11 其余模块Donor状态
+
+以下模块仍需继续实读：
+
+```text
+HIF
+IH
+TE
+PI
+Read
+Write
+Refresh
+RFM
+Config
+MR
+Power
+Training
+Retry
+Reset
+ALPG
+```
+
+在获得新的E2源码证据前，应描述为：
+
+```text
+E0 / E1
+```
+
+或：
+
+```text
+Donor Audit Pending
+```
+
+而不是直接写成“DDR5现有RTL就是某结构”。
+
+---
+
+# C.12 当前设计方向矩阵
+
+**表C-2 Whole-MC当前Delta方向**
+
+| 模块 | 当前DDR6方向 | Donor状态 |
+|---|---|---|
+| HIF | MODIFY | E0/E1，继续实读 |
+| Parent/Child | NEW / OPTIONAL | DDR6设计扩展，非默认 |
+| IH | MODIFY | E0/E1 |
+| TE | MODIFY | Entry结构可参考，需继续实读 |
+| BSM | MAJOR REFACTOR | E2 |
+| OpenRow | NEW OWNER | E2支持 |
+| Timing | MAJOR REFACTOR | E2 |
+| CC | MODIFY/DECOUPLE | E2 |
+| OS | MODIFY | E2 |
+| GS | MAJOR REFACTOR | E2 |
+| Refresh | KEEP/MODIFY | E0/E1 |
+| Shared PRE | NEW/REFACTOR | 由DDR6 Maintenance架构引入 |
+| PRAC/BAT/RFM | MODIFY/NEW | E0/E1 + Spec Gate |
+| PI | MODIFY | E0/E1 |
+| Read | KEEP/MODIFY | E0/E1 |
+| Write | KEEP/MODIFY | E0/E1 |
+| Config | MODIFY | E0/E1 |
+| Geometry | REFACTOR/NEW OWNER | 继续donor确认 |
+| MR | KEEP/MODIFY | E0/E1 |
+| FSP | MAJOR MODIFY | E0/E1 + PHY Gate |
+| Power | KEEP/MODIFY | E0/E1 |
+| Training | KEEP ORCHESTRATION / PHY ALGORITHM EXTERNAL | E0/E1 |
+| Retry | MODIFY | E0/E1 |
+| Reset/Re-init | MAJOR MODIFY | E0/E1 + PHY Gate |
+| ALPG | MODIFY/INTEGRATE | E0/E1 |
+
+---
+
+# C.13 Donor实读模板
+
+后续每实读一个模块，统一记录：
+
+```text
+Module:
+DDR5 File:
+Evidence Level:
+
+1. Donor Fact
+   - State
+   - Interface
+   - Storage
+   - Pipeline
+   - Owner
+   - Reset
+   - Backpressure
+
+2. DDR6 Requirement
+   - 真正新增协议要求
+   - Owner变化
+   - Interface变化
+   - Timing/Topology变化
+
+3. Delta Decision
+   KEEP
+   MODIFY
+   REPLACE
+   NEW
+   DELETE
+
+4. RTL Modification Point
+
+5. Verification Impact
+
+6. Residual Open Gate
+```
+
+禁止使用：
+
+```text
+“DDR6应该一般这样设计”
+```
+
+代替donor直接证据。
+
+---
+
+# C.14 Coding状态建议
+
+原第17章的授权规则不再单独作为正文，而在此保留为工程提示。
+
+当前建议使用：
+
+```text
+RTL_IMPLEMENTATION_READY
+SEMANTIC_RTL_ALLOWED
+FEATURE_GATED
+STUB_ONLY
+PHYSICAL_INTEGRATION_BLOCKED
+```
+
+这些状态可以组合使用。
+
+它们描述的是：
+
+```text
+当前允许开展什么工作
+```
+
+而不是：
+
+```text
+模块已经完成Production Signoff
+```
+
+---
+
+## C.14.1 当前六模块建议状态
+
+**表C-3 E2模块当前实施状态建议**
+
+| 模块 | RTL状态 | Physical Integration | 说明 |
+|---|---|---|---|
+| BSM | RTL_IMPLEMENTATION_READY | BLOCKED until Event Mapping | 四态Owner及核心语义已收敛 |
+| OpenRow | RTL_IMPLEMENTATION_READY | BLOCKED until Event Mapping | 唯一Row Truth已收敛 |
+| Timing | SEMANTIC_RTL_ALLOWED / FEATURE_GATED | BLOCKED | Framework可写，正式Rule仍受SPEC Gate |
+| CC | SEMANTIC_RTL_ALLOWED | N/A | Structural Candidate职责已收敛 |
+| OS | SEMANTIC_RTL_ALLOWED | N/A | Multi-Class结构已在第5章重新收敛 |
+| GS | SEMANTIC_RTL_ALLOWED / FEATURE_GATED | BLOCKED | Bundle Builder已收敛，Span/PHY/吞吐仍需Gate |
+
+这里不再保留旧版：
+
+```text
+OS = ARCH_REWORK_REQUIRED
+GS = ARCH_REWORK_REQUIRED
+```
+
+因为第5章已经完成相应架构重构。
+
+但这也不意味着：
+
+```text
+OS/GS Production Signoff Complete
+```
+
+---
+
+# C.15 Coding Gate
+
+模块进入正式RTL前至少回答：
+
+```text
+[ ] Donor Evidence Level是什么
+[ ] Owner是否唯一
+[ ] DDR6 Delta是否明确
+[ ] 哪些结构KEEP
+[ ] 哪些结构MODIFY
+[ ] 哪些结构DELETE
+[ ] 新增状态是否确有需求
+[ ] Interface是否稳定
+[ ] Backpressure是否定义
+[ ] Same-cycle是否定义
+[ ] Reset是否定义
+[ ] Error是否定义
+[ ] Storage/Port是否评估
+[ ] Assertion/Directed Test是否存在
+[ ] G-CODE Gate是否关闭
+```
+
+---
+
+# C.16 Physical Integration Gate
+
+即使模块RTL可以实施，如果依赖：
+
+```text
+DFI Physical Mapping
+Read Return
+Write Visibility
+Training Carrier
+Reset Old-feedback Drain
+```
+
+等尚未签署的PHY行为，则仍保持：
+
+```text
+PHYSICAL_INTEGRATION_BLOCKED
+```
+
+因此必须区分：
+
+```text
+Semantic RTL Ready
+```
+
+与：
+
+```text
+Physical Positive Path Ready
+```
+
+两者不能互相替代。
+
+---
+
+# C.17 Donor审计完成条件
+
+Whole-MC Donor Audit只有在所有计划复用模块完成至少以下记录后，才能由：
+
+```text
+PARTIAL_CLOSED
+```
+
+升级。
+
+要求：
+
+```text
+[ ] 目标RTL File已定位
+[ ] Primary Path已确认
+[ ] State/FSM已实读
+[ ] Interface已实读
+[ ] Storage已实读
+[ ] Backpressure已实读
+[ ] Reset已实读
+[ ] 关键Pipeline已实读
+[ ] DDR6 Delta已形成
+[ ] KEEP/MODIFY/REPLACE/NEW/DELETE已Review
+```
+
+未达到时不得将架构推断写成donor源码事实。
+
+---
+
+# C.18 附录结论
+
+当前donor证据已经足以支持以下核心判断：
+
+```text
+BSM
+    DDR5 Bank/Timing耦合
+    -> DDR6 Bank Truth与Timing拆分
+
+OpenRow
+    DDR5 TE Entry Page Shadow
+    -> DDR6建立唯一Row Owner
+
+Timing
+    DDR5分散Timing
+    -> DDR6统一Timing Owner
+
+CC
+    保留Structural Candidate
+    -> 拆除Timing/Row/Service混合Owner
+
+OS
+    DDR5本身就是Multi-Class
+    -> DDR6继续Multi-Class
+
+GS
+    DDR5本身支持Phase-aware Multi-command
+    -> DDR6演进为1:8 Bundle Builder
+```
+
+其余模块继续遵循：
+
+```text
+Donor实读
+        │
+        ▼
+Delta确认
+        │
+        ▼
+RTL Coding
+```
+
+而不是：
+
+```text
+先假定DDR5结构
+        │
+        ▼
+直接开始DDR6重构
+```
+
+Whole-MC donor审计当前仍应描述为：
+
+```text
+PARTIAL_CLOSED
+```
+
+整个DDR6 MC工程状态仍保持：
+
+```text
+ENGINEERING_CANDIDATE
+```
+
+本附录中的模块实施状态只用于指导Coding和Review，不等同于：
+
+```text
+WHOLE_MC_PRODUCTION_RTL_AUTHORIZED
+```
+
+或：
+
+```text
+PRODUCTION_READY
+```
