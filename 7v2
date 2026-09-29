@@ -1,0 +1,1617 @@
+# 7 维护类服务设计
+
+## 7.1 功能范围与设计目标
+
+维护类服务负责处理不直接来源于普通Host Read/Write、但必须按照DDR6协议要求在规定范围和时间内完成的维护操作。
+
+本章主要包括：
+
+a) 普通Refresh；
+
+b) PRAC/BAT及PRFM相关Accounting；
+
+c) RFM；
+
+d) Maintenance Resource Claim；
+
+e) Shared PRE Preparation；
+
+f) Maintenance Arbitration；
+
+g) Maintenance Deadline及Latest-safe-start；
+
+h) `dfi_alert_n`相关维护/恢复事件；
+
+i) Maintenance Accounting、Timing Completion及Service Release。
+
+MR、FSP、Power和Training虽然同样属于Side-plane Control，但其生命周期和Refresh/RFM不同，在第8章单独说明。
+
+普通Refresh和RFM保持独立的Service Owner及Accounting State。
+
+二者可以共享：
+
+```text
+Shared PRE
+Maintenance Arbitration
+GS
+PI / Standard DFI
+Timing Engine
+```
+
+但不得共享：
+
+```text
+Refresh Debt
+Refresh Coverage
+Refresh Selector
+PRAC / BAT State
+PRFM Obligation
+RFM Accounting
+```
+
+因此，本章所述“统一维护路径”仅表示共享后端Preparation、Scheduling及Command Issue能力，不表示将Refresh和RFM合并为同一个Maintenance Controller。
+
+---
+
+## 7.2 总体结构
+
+维护类服务总体结构如下。
+
+```text
+             Refresh Due / Deadline
+                       │
+                       ▼
+              ┌────────────────┐
+              │Refresh Manager │
+              │Debt / Coverage │
+              └───────┬────────┘
+                      │
+                      │
+                      │             ACT / Close Event
+                      │                    │
+                      │                    ▼
+                      │             PRAC / BAT
+                      │                    │
+                      │                    ▼
+                      │             PRFM Obligation
+                      │                    │
+                      │                    ▼
+                      │              RFM Manager
+                      │                    │
+                      └─────────┬──────────┘
+                                ▼
+                       Maintenance Claim
+                                │
+                                ▼
+                         Shared PRE
+                                │
+                                ▼
+                            PREPARED
+                                │
+                ┌───────────────┴──────────────┐
+                ▼                              ▼
+        Refresh Candidate               RFM Candidate
+                │                              │
+                └──────────────┬───────────────┘
+                               ▼
+                   Maintenance Arbitration
+                               │
+                               ▼
+                              GS
+                               │
+                               ▼
+                        PI / Standard DFI
+                               │
+                               ▼
+                  Registered-equivalent Event
+                        │               │
+                        ▼               ▼
+                   Accounting        Timing
+                        │               │
+                        └───────┬───────┘
+                                ▼
+                         Service Release
+```
+
+**图7-1 维护类服务总体结构**
+
+维护服务生命周期为：
+
+```text
+Obligation
+   ->
+Target Planning
+   ->
+Resource Claim
+   ->
+Shared PRE Preparation
+   ->
+Service Candidate
+   ->
+GS Admission / DFI Commit
+   ->
+Standard DFI Presentation
+   ->
+Registered-equivalent Event
+   ->
+Accounting / Timing
+   ->
+Service Release
+```
+
+上述阶段不得互相替代。
+
+---
+
+# 7.3 公共设计原则
+
+## 7.3.1 Obligation与Command分离
+
+Refresh Due、Refresh Debt及PRFM Obligation表示：
+
+> MC当前存在必须完成的维护义务。
+
+它们不是DDR Command。
+
+只有确定：
+
+```text
+Target
+Resource State
+Timing
+Preparation
+```
+
+后，才能形成具体REF或RFM Candidate。
+
+因此：
+
+```text
+Maintenance Obligation
+!=
+Maintenance Command
+```
+
+---
+
+## 7.3.2 Preparation与Command Execution分离
+
+Refresh和RFM在发出实际Maintenance Command前，通常要求目标Bank满足对应前置条件。
+
+Shared PRE只完成：
+
+```text
+Target Resource
+     │
+     ▼
+达到Maintenance所需Bank State
+```
+
+因此：
+
+```text
+PREPARED
+!=
+REF / RFM Executed
+!=
+Service Complete
+```
+
+---
+
+## 7.3.3 Command Event与Service Release分离
+
+REF或RFM达到Registered-equivalent Event后，表示对应Maintenance Command已经达到MC可以确认的执行边界。
+
+但后续仍可能存在：
+
+```text
+tRFC
+tRFM
+Accounting
+Required Completion Condition
+```
+
+因此：
+
+```text
+REF Event
+!=
+Refresh Service Release
+```
+
+以及：
+
+```text
+RFM Event
+!=
+RFM Service Release
+```
+
+---
+
+## 7.3.4 Service Identity
+
+正在执行的Maintenance Service必须能够被唯一识别。
+
+至少需要区分：
+
+```text
+Service Type
+Target Set
+Current Service Instance
+Context
+```
+
+实现可以采用：
+
+```text
+Service Slot
+```
+
+或：
+
+```text
+Service Slot + Generation
+```
+
+等形式。
+
+但Generation仅在确实存在：
+
+```text
+Service Slot已经复用
++
+Old Feedback仍可能返回
+```
+
+的风险时才需要。
+
+本章不将`Slot + Generation`规定为所有Maintenance Service的固定硬件形式。
+
+---
+
+# 7.4 Maintenance Resource Claim
+
+## 7.4.1 Claim目的
+
+Maintenance Service执行期间，需要阻止新的冲突Normal Traffic进入其目标范围。
+
+因此建立：
+
+```text
+Maintenance Claim
+```
+
+表示该目标资源正在被维护流程占用。
+
+Claim至少描述：
+
+```text
+Service Reference
+Service Type
+Exact Target Set
+Deadline / Urgency
+Context
+```
+
+---
+
+## 7.4.2 Claim与BSM分离
+
+Maintenance Claim表示：
+
+```text
+谁当前拥有该Resource的访问权限
+```
+
+BSM表示：
+
+```text
+Bank当前是OPEN还是CLOSED
+```
+
+二者不得混合。
+
+例如：
+
+```text
+BSM = CLOSED
+Maintenance Claim = ACTIVE
+```
+
+表示：
+
+> Bank已经关闭，但仍处于Maintenance占用期间，因此Normal访问继续被阻止。
+
+不使用：
+
+```text
+BSM = BLOCKED_SERVICE
+```
+
+表达上述状态。
+
+---
+
+## 7.4.3 Exact Target Set
+
+Maintenance必须使用可以明确恢复Membership的Target Set。
+
+可以使用：
+
+a) Resource Mask；
+
+b) Geometry产生的Set ID；
+
+c) Target List；
+
+d) 其他能够恢复Exact Membership的表示。
+
+不得仅用不能恢复目标成员的Hash代替功能Target Set。
+
+Topology或Geometry尚未确定时，对应Maintenance Positive Path保持关闭。
+
+---
+
+# 7.5 Shared PRE Preparation
+
+## 7.5.1 功能职责
+
+Refresh、RFM及其他需要Bank先关闭的Maintenance功能共享PRE Preparation。
+
+Shared PRE只回答：
+
+> 当前Maintenance Target中的所有Required Member是否已经满足Command执行所需的Bank State前提？
+
+它不拥有：
+
+```text
+Refresh Debt
+Refresh Coverage
+BAT
+PRFM Obligation
+RFM Accounting
+Timing History
+OpenRow Truth
+```
+
+---
+
+## 7.5.2 Target Member处理
+
+对于每个Target Resource：
+
+### CLOSED
+
+如果：
+
+```text
+BSM = CLOSED
+```
+
+且相关Close Timing已经满足，则该Member可直接认为Prepared。
+
+如果：
+
+```text
+BSM = CLOSED
+```
+
+但tRP等已有Close Timing仍未满足，则：
+
+```text
+等待Timing
+```
+
+不得重复发送PRE。
+
+### OPEN
+
+如果：
+
+```text
+BSM = OPEN
+```
+
+则形成Maintenance PRE Candidate。
+
+PRE达到Registered-equivalent Event后：
+
+```text
+BSM -> CLOSED
+OpenRow -> Invalid
+Timing -> 建立tRP等约束
+```
+
+随后等待Timing满足。
+
+### INACCESSIBLE / ERROR_CONTAIN
+
+不执行普通Preparation，按照Recovery/Error流程处理。
+
+---
+
+## 7.5.3 不重复PRE
+
+当Bank已经CLOSED、只是tRP仍未结束时，不能再次发送PRE。
+
+因此：
+
+```text
+Bank Closed
+AND
+Timing Not Ready
+```
+
+的处理方式是：
+
+```text
+Wait
+```
+
+而不是：
+
+```text
+Issue another PRE
+```
+
+这一规则同时避免重复：
+
+```text
+PRE Timing Update
+OpenRow Close
+PRAC/BAT Accounting
+```
+
+---
+
+## 7.5.4 Maintenance PRE路径
+
+Maintenance PRE与普通PRE共用：
+
+```text
+GS
+PI
+Standard DFI
+Registered-equivalent Event
+BSM / OpenRow / Timing Update
+```
+
+不建立Maintenance专用Bank State或独立Command Issue路径。
+
+---
+
+# 7.6 Qualified Close与Accounting Target
+
+对于多Bank PRE或其他Close行为，需要区分几个逻辑集合。
+
+```text
+COMMAND_TARGET_SET
+
+TIMING_TARGET_SET
+
+ACTUAL_CLOSE_MEMBER_SET
+
+ACCOUNTING_MEMBER_SET
+```
+
+其中：
+
+### Command Target Set
+
+表示Command编码实际覆盖的Resource。
+
+### Timing Target Set
+
+表示需要更新PRE相关Timing关系的Resource。
+
+### Actual Close Member Set
+
+表示该Command实际使哪些OPEN Bank发生关闭。
+
+只有该集合成员执行：
+
+```text
+OpenRow.Valid = 0
+BSM -> CLOSED
+```
+
+### Accounting Member Set
+
+表示当前Close中哪些Resource需要参与PRAC/BAT等Accounting。
+
+不同集合不能简单合并为一个Bank Mask。
+
+各集合的最终展开规则依赖DDR6规范和Geometry定义。
+
+---
+
+# 7.7 Activation Lifetime
+
+## 7.7.1 设计目的
+
+PRAC/BAT Accounting需要能够区分：
+
+> 当前Close对应的是哪一次有效Activation。
+
+因此DDR6目标设计保留Activation Lifetime概念。
+
+其核心目标是避免：
+
+```text
+Old Close
+```
+
+错误作用于：
+
+```text
+Fresh ACT
+```
+
+以及避免同一次Activation被重复Accounting。
+
+---
+
+## 7.7.2 最小生命周期
+
+每个Resource在逻辑上至少区分：
+
+```text
+NO_ACTIVE
+ACT_PENDING
+ACTIVE
+```
+
+其关系为：
+
+```text
+NO_ACTIVE
+   │
+   │ ACT Commit
+   ▼
+ACT_PENDING
+   │
+   │ ACT Registered-equivalent Event
+   ▼
+ACTIVE
+   │
+   │ Qualified Close
+   ▼
+NO_ACTIVE
+```
+
+其中ACT_PENDING表示Command已经Commit但尚未形成Bank OPEN Truth。
+
+此时：
+
+```text
+BSM仍然不是因为该ACT而OPEN
+OpenRow仍未写入Target Row
+```
+
+---
+
+## 7.7.3 Activation Identity
+
+如果系统能够通过：
+
+```text
+每个Resource任一时刻最多只有一个未退休Activation
++
+严格的Close/Reclaim边界
+```
+
+保证旧Close不可能作用于Fresh ACT，则可以不增加额外Generation。
+
+如果实现允许：
+
+```text
+Fresh ACT开始
+```
+
+时仍存在旧Close、Accounting或其他Late Reference，则必须增加：
+
+```text
+Activation Generation
+```
+
+或等价Identity机制。
+
+因此，本章要求的是：
+
+> Close必须唯一对应当前有效Activation。
+
+不强制所有实现固定采用某一Generation位宽。
+
+---
+
+## 7.7.4 Qualified Close
+
+只有能够证明Close对应当前ACTIVE Activation时，才：
+
+```text
+Close Accepted
+```
+
+并进一步触发：
+
+```text
+OpenRow Close
+BSM Close
+Timing Update
+PRAC/BAT Accounting
+```
+
+无法匹配当前Activation的Old Close不得更新Fresh State。
+
+---
+
+# 7.8 Refresh设计
+
+## 7.8.1 Refresh Owner
+
+普通Refresh继续由独立Refresh Manager负责。
+
+主要职责包括：
+
+a) 接收Timing产生的Refresh Due及Deadline；
+
+b) 维护Refresh Obligation和Debt；
+
+c) 选择Refresh Form；
+
+d) 维护Distributed Refresh的Selector和Coverage；
+
+e) 建立Maintenance Claim；
+
+f) 请求Shared PRE；
+
+g) 形成Refresh Candidate；
+
+h) 在REF Registered-equivalent Event后更新Refresh Accounting；
+
+i) 等待tRFC及其他必要条件后释放Service。
+
+Timing Engine负责Refresh Timing，不拥有Refresh Debt及Coverage。
+
+---
+
+## 7.8.2 Refresh Form
+
+当前设计将普通Refresh控制抽象为：
+
+```text
+REF_AB
+REF_DIST
+```
+
+具体DDR6 Command Variant及各Profile下Target Membership由正式协议和Geometry确定。
+
+不同Distributed Refresh形式可以共享基本Service Control，不要求复制多套功能相同的FSM。
+
+---
+
+## 7.8.3 Due、Debt及Deadline
+
+必须区分：
+
+```text
+Due
+Debt
+Deadline
+Latest-safe-start
+Urgency
+```
+
+Due表示Refresh义务产生。
+
+Debt表示尚未完成的Refresh负担。
+
+Deadline表示必须完成的时间边界。
+
+Latest-safe-start表示为了满足Deadline，最迟必须开始Maintenance Preparation的时间。
+
+这些概念不能合并为一个`refresh_req`状态。
+
+---
+
+## 7.8.4 REF_DIST Selector及Coverage
+
+Distributed Refresh还需要记录：
+
+```text
+Selector
+Coverage
+```
+
+其中Selector表示当前要服务的Distributed Target。
+
+Coverage表示当前Sweep已经覆盖的目标范围。
+
+因此：
+
+```text
+Debt
+!=
+Selector
+!=
+Coverage
+```
+
+最终Selector数量、Sweep规则和Credit方式仍需DDR6规范关闭。
+
+---
+
+## 7.8.5 Refresh处理流程
+
+```text
+Refresh Due
+    │
+    ▼
+Obligation / Debt
+    │
+    ▼
+Select REF Form
+    │
+    ▼
+Build Exact Target Set
+    │
+    ▼
+Maintenance Claim
+    │
+    ▼
+Shared PRE
+    │
+    ▼
+PREPARED
+    │
+    ▼
+Refresh Candidate
+    │
+    ▼
+GS Admission / DFI Commit
+    │
+    ▼
+Standard DFI
+    │
+    ▼
+REF Registered-equivalent Event
+    │
+    ├── Refresh Accounting
+    └── Timing tRFC
+            │
+            ▼
+       tRFC Complete
+            │
+            ▼
+       Service Release
+```
+
+---
+
+## 7.8.6 Refresh Accounting Point
+
+Refresh Debt和Coverage不得在：
+
+```text
+Candidate生成
+OS/GS选择
+GS Admission
+DFI Presentation
+```
+
+时提前更新。
+
+其Accounting Trigger为：
+
+```text
+REF Registered-equivalent Event
+```
+
+这表示Refresh命令已经达到MC认可的执行边界。
+
+---
+
+## 7.8.7 Refresh Accounting未闭合项
+
+当前已经确定：
+
+```text
+Refresh Manager owns:
+Debt
+Coverage
+Selector
+```
+
+但以下内容仍未闭合：
+
+```text
+Debt的精确计量单位
+REF_AB与REF_DIST如何Credit
+Distributed Sweep如何减少Debt
+Postpone / Pull-in规则
+```
+
+因此本章不自行选择某一种Accounting公式。
+
+对应规则必须由DDR6规范及Product配置确认后写入RTL。
+
+---
+
+# 7.9 Refresh Deadline
+
+## 7.9.1 Deadline语义
+
+设计目标为：
+
+```text
+Qualified REF Event <= Deadline
+```
+
+而不是：
+
+```text
+Deadline错过以后
+再补一个Refresh即可消除违规
+```
+
+超过Deadline应记录Violation。
+
+---
+
+## 7.9.2 Latest-safe-start
+
+GS不能仅依赖Maintenance Priority保证Deadline。
+
+需要根据：
+
+```text
+Shared PRE Worst-case
+Timing Wait
+GS等待
+DFI Command Latency
+```
+
+等因素形成Maintenance Budget。
+
+基本关系为：
+
+```text
+Latest-safe-start
+    =
+Deadline
+-
+Worst-case Remaining Service Latency
+```
+
+进入该时间区域后，GS必须停止接受会导致Maintenance Deadline无法满足的冲突Normal Command。
+
+具体Worst-case Latency Bound由后续Timing和实现验证关闭。
+
+---
+
+# 7.10 PRAC、BAT及PRFM
+
+## 7.10.1 功能边界
+
+PRAC/BAT属于Activation上的Accounting机制。
+
+它们不拥有：
+
+```text
+BSM
+OpenRow
+Timing
+```
+
+也不决定Bank当前是否ACTIVE。
+
+其输入来自已经确认的：
+
+```text
+ACT / Qualified Close
+```
+
+等Activation事件。
+
+---
+
+## 7.10.2 BAT State
+
+BAT State保存：
+
+```text
+Current BAT Value
+PRFM Trigger / Obligation State
+必要的Error / Overflow状态
+```
+
+具体：
+
+```text
+Contribution
+Threshold
+Subtraction
+Window
+```
+
+均依赖正式DDR6规范和Product配置，本章不推定具体数值。
+
+---
+
+## 7.10.3 Feature Disable
+
+如果Product关闭PRAC/BAT：
+
+```text
+BAT Arithmetic Disabled
+PRFM Trigger Disabled
+```
+
+但Bank、OpenRow及Timing等基础MC功能保持正常运行。
+
+如果Activation Identity仅为PRAC/BAT服务且对应产品完全不启用该功能，则其实现复杂度可以随Feature裁剪；若其他功能同样需要区分Old/Fresh Activation，则保留必要Identity能力。
+
+---
+
+## 7.10.4 Qualified Close Accounting
+
+Qualified Close发生后，只有满足当前有效PRAC/BAT Rule的Resource才产生Accounting Contribution：
+
+```text
+Qualified Close
+      │
+      ▼
+PRAC / BAT Rule
+      │
+      ▼
+BAT Update
+```
+
+同一Close不得被重复Accounting。
+
+---
+
+## 7.10.5 PRFM Obligation
+
+BAT达到相应条件后形成PRFM Obligation。
+
+它至少需要描述：
+
+```text
+Target Resource / Set
+Due / Deadline
+必要的Coverage / Credit状态
+Context
+```
+
+PRFM Obligation独立于Refresh Debt。
+
+---
+
+# 7.11 RFM设计
+
+## 7.11.1 RFM Owner
+
+RFM继续由独立RFM Manager负责。
+
+职责包括：
+
+a) 接收PRFM Obligation；
+
+b) 选择RFM Form；
+
+c) 构造Exact Target Set；
+
+d) 建立Maintenance Claim；
+
+e) 请求Shared PRE；
+
+f) 形成RFM Candidate；
+
+g) 通过GS进行最终Admission；
+
+h) 在RFM Registered-equivalent Event后更新RFM相关Accounting；
+
+i) 等待tRFM；
+
+j) 最终释放Service。
+
+---
+
+## 7.11.2 RFM Form
+
+主控制层可以抽象为：
+
+```text
+RFM_AB
+RFM_DIST
+RFM_PB
+```
+
+具体Command Encoding和不同Profile下的Distributed Variant由DDR6规范及Geometry确定。
+
+---
+
+## 7.11.3 RFM流程
+
+```text
+PRFM Obligation
+       │
+       ▼
+RFM Target / Form
+       │
+       ▼
+Maintenance Claim
+       │
+       ▼
+Shared PRE
+       │
+       ▼
+PREPARED
+       │
+       ▼
+RFM Candidate
+       │
+       ▼
+GS Admission / DFI Commit
+       │
+       ▼
+Standard DFI
+       │
+       ▼
+RFM Registered-equivalent Event
+       │
+       ├── BAT Accounting
+       ├── PRFM Credit
+       └── Timing tRFM
+                 │
+                 ▼
+          Completion Conditions
+                 │
+                 ▼
+          Service Release
+```
+
+---
+
+## 7.11.4 RFM Accounting Point
+
+与Refresh相同：
+
+```text
+GS Admission
+!=
+RFM Accounting
+```
+
+BAT Subtraction及PRFM Credit只能在：
+
+```text
+RFM Registered-equivalent Event
+```
+
+后更新。
+
+不能在Candidate或Commit阶段提前进行。
+
+---
+
+# 7.12 Refresh与RFM Accounting隔离
+
+普通REF Event：
+
+```text
+Refresh Debt / Coverage
+        -> 更新
+
+Timing tRFC
+        -> 更新
+
+BAT
+        -> 不更新
+
+PRFM Credit
+        -> 不更新
+```
+
+RFM Event：
+
+```text
+BAT / PRFM
+        -> 更新
+
+Timing tRFM
+        -> 更新
+
+Ordinary Refresh Debt
+        -> 不更新
+```
+
+因此禁止：
+
+```text
+REF -> BAT Credit
+
+REF -> PRFM Credit
+
+RFM -> Refresh Debt Credit
+```
+
+Refresh和RFM共享的是：
+
+```text
+Command Execution Infrastructure
+```
+
+而不是：
+
+```text
+Accounting Truth
+```
+
+---
+
+# 7.13 DFI ALERT通路
+
+## 7.13.1 标准接口
+
+本设计保留标准DFI：
+
+```text
+PHY -> MC : dfi_alert_n
+```
+
+作为独立异常/维护反馈通道。
+
+不得使用：
+
+```text
+phy_fatal
+```
+
+或其他自定义DFI信号替代。
+
+---
+
+## 7.13.2 Alert Capture
+
+`dfi_alert_n`进入MC后形成独立Alert Event。
+
+逻辑路径为：
+
+```text
+dfi_alert_n
+     │
+     ▼
+Synchronization / Capture
+     │
+     ▼
+Alert Event
+     │
+     ├── Timing / Deadline
+     ├── PRAC / RFM / Recovery
+     ├── GS Maintenance Gate
+     └── Trace / Error Status
+```
+
+具体是否需要同步、去毛刺以及如何确定Alert Occurrence Time，由最终PHY/DFI接口定义确定。
+
+---
+
+## 7.13.3 ALERT与Maintenance Command分离
+
+必须保持：
+
+```text
+ALERT Event
+!=
+RFM Command Event
+```
+
+以及：
+
+```text
+ALERT Event
+!=
+Refresh Event
+```
+
+ALERT可能触发或影响维护/恢复流程，但不能直接被当作某一Maintenance Command已经执行。
+
+Old Session ALERT也不得更新Fresh Session状态。
+
+---
+
+# 7.14 Maintenance Arbitration
+
+## 7.14.1 功能职责
+
+Maintenance Arbitration只在已经具备相应Preparation条件的Maintenance Candidate之间进行选择。
+
+例如：
+
+```text
+Refresh Candidate
+RFM Candidate
+其他已定义Maintenance Candidate
+```
+
+它不修改各Service Owner的Accounting。
+
+---
+
+## 7.14.2 Arbitration与GS
+
+应保持：
+
+```text
+Maintenance Arbitration Winner
+!=
+GS Admission
+```
+
+Maintenance Candidate进入GS后仍需检查：
+
+```text
+Timing
+Phase / Span
+DFI Output Capacity
+Resource Conflict
+Target Claim
+Mandatory Service Feasibility
+```
+
+才能真正Commit。
+
+---
+
+## 7.14.3 与Normal Traffic关系
+
+Normal Multi-Class Heads和Maintenance Candidate最终在GS汇合。
+
+当Maintenance进入Latest-safe-start区域时，GS限制可能破坏其Deadline的Normal Traffic。
+
+但Maintenance仍不能绕过：
+
+```text
+Timing
+Bank State
+Resource Conflict
+DFI规则
+```
+
+---
+
+# 7.15 Same-cycle Accounting
+
+## 7.15.1 Refresh
+
+典型Same-cycle情况包括：
+
+```text
+Refresh Due + REF Event
+
+Old tRFC Complete + Fresh REF
+
+Refresh Event + Fresh Due
+```
+
+Debt/Credit必须从统一Pre-state计算Next State。
+
+不能因为同拍Credit而吞掉Fresh Due。
+
+---
+
+## 7.15.2 BAT
+
+同一Resource可能同时出现：
+
+```text
+Qualified Close Contribution
++
+RFM BAT Subtraction
+```
+
+如果协议允许二者同周期生效，则统一计算Next BAT。
+
+如果不允许，则阻止Normal BAT Update并进入异常处理。
+
+不能依赖RTL赋值顺序决定结果。
+
+---
+
+## 7.15.3 Storage Port不足
+
+不同Resource上的合法Accounting可以并行。
+
+如果物理RAM写端口不足，应：
+
+```text
+在GS / Service Scheduling阶段限流
+```
+
+而不是：
+
+```text
+Command已经实际发生
+以后丢弃Accounting Update
+```
+
+---
+
+# 7.16 Reset与异常处理
+
+## 7.16.1 Reset
+
+Destructive Reset后：
+
+a) Fresh Maintenance Admission停止；
+
+b) Refresh/RFM当前Service State按照Reset合同失效或进入Recovery；
+
+c) Maintenance Claim失效或重建；
+
+d) Shared PRE Progress失效；
+
+e) Old Session REF/RFM/PRE反馈不得更新Fresh State；
+
+f) `dfi_alert_n`相关Old Session Event不得写入Fresh Maintenance State。
+
+---
+
+## 7.16.2 已物理可见Maintenance
+
+如果REF、RFM或Maintenance PRE已经达到Registered-equivalent Event或物理可见性无法排除，则不能通过局部Reset简单认为其“未发生”。
+
+需要进入第10章定义的Recovery/Re-init边界。
+
+---
+
+## 7.16.3 Late Feedback
+
+如果实现存在Maintenance Slot复用，且Old Feedback可能晚到，则必须通过：
+
+```text
+Service Identity
+Context
+必要的Generation
+```
+
+区分Old/Fresh Service。
+
+不匹配事件：
+
+```text
+Functional Write Enable = 0
+```
+
+---
+
+## 7.16.4 Deadline Violation
+
+如果Maintenance真正达到执行边界的时间已经超过Mandatory Deadline，应记录Sticky Violation。
+
+后续Maintenance成功执行不能自动抹去已经发生的Deadline违规。
+
+---
+
+# 7.17 主要接口
+
+**表7-1 维护类服务主要逻辑接口**
+
+| 序号 | 接口 | 主要内容 | 要求 |
+|---|---|---|---|
+| 1 | Timing → Refresh | Due、Deadline、Latest-safe-start | 与Refresh Accounting分离 |
+| 2 | PRAC/BAT → RFM | PRFM Obligation、Target、Deadline | 不进入Refresh Debt |
+| 3 | Service → Claim | Service Reference、Target Set | Claim与Service对应 |
+| 4 | Service → Shared PRE | Target Set、Context | Preparation请求 |
+| 5 | Shared PRE → Service | Prepared、Blocked、Error | Prepared不等于Complete |
+| 6 | Service → Maintenance Arb | Candidate、Urgency、Deadline | Service Owner保持状态 |
+| 7 | Maintenance Arb → GS | Maintenance Candidate | GS最终Admission |
+| 8 | PI内部 Event → Service | REF/RFM/PRE Registered-equivalent Event | 来自标准DFI Mapping |
+| 9 | Event → Accounting | Target、Service Reference | 同一Event最多Account一次 |
+| 10 | Timing → Service | tRFC/tRFM Completion | Service Release条件之一 |
+| 11 | PHY → MC | `dfi_alert_n` | 标准DFI独立ALERT通路 |
+
+表中不存在自定义：
+
+```text
+maintenance_actual
+phy_fatal
+op_done
+```
+
+等MC↔PHY DFI端口。
+
+---
+
+# 7.18 主要内部状态
+
+**表7-2 维护类服务主要内部状态**
+
+| 对象 | 主要内容 | Owner |
+|---|---|---|
+| Refresh Obligation/Debt | Due、Debt、Deadline | Refresh |
+| Refresh Selector/Coverage | Distributed Refresh Progress | Refresh |
+| Refresh Service State | Form、Target、Preparation、Completion | Refresh |
+| Maintenance Claim | Target Set、Owner | Claim |
+| Shared PRE Progress | Target Preparation进度 | Shared PRE |
+| Activation Lifetime | Current Activation关联 | ACT Lifetime |
+| BAT State | BAT及PRFM触发状态 | PRAC/BAT |
+| PRFM Obligation | Target、Deadline、Credit/Coverage | PRFM |
+| RFM Service State | Form、Target、Completion | RFM |
+| Alert State | Captured ALERT及相关Timing Context | Alert/Recovery |
+
+上述是逻辑Owner关系，不要求分别实现为十个独立RAM或模块。
+
+---
+
+# 7.19 典型流程
+
+## 7.19.1 REF_DIST
+
+```text
+Refresh Due
+   │
+   ▼
+Refresh Debt
+   │
+   ▼
+Select REF_DIST
+   │
+   ▼
+Geometry Target Set
+   │
+   ▼
+Maintenance Claim
+   │
+   ▼
+Shared PRE
+   │
+   ├── CLOSED + Timing Ready -> Ready
+   ├── CLOSED + Timing Wait  -> Wait
+   └── OPEN -> PRE
+   │
+   ▼
+PREPARED
+   │
+   ▼
+GS Admission / DFI Commit
+   │
+   ▼
+REF Registered-equivalent Event
+   │
+   ├── Refresh Accounting
+   └── tRFC
+   │
+   ▼
+tRFC Complete
+   │
+   ▼
+Service Release
+```
+
+---
+
+## 7.19.2 RFM
+
+```text
+BAT / PRFM Trigger
+   │
+   ▼
+RFM Obligation
+   │
+   ▼
+Target Set
+   │
+   ▼
+Maintenance Claim
+   │
+   ▼
+Shared PRE
+   │
+   ▼
+PREPARED
+   │
+   ▼
+GS Admission / DFI Commit
+   │
+   ▼
+RFM Registered-equivalent Event
+   │
+   ├── BAT Update
+   ├── PRFM Credit
+   └── tRFM
+   │
+   ▼
+Completion
+   │
+   ▼
+Service Release
+```
+
+---
+
+# 7.20 DDR5继承与DDR6修改关系
+
+**表7-3 维护类服务演进关系**
+
+| DDR5设计内容 | DDR6处理 | 收敛后的变化 |
+|---|---|---|
+| PAS_RC Refresh结构 | KEEP/MODIFY | 继续作为普通Refresh Owner |
+| tREFI Timer思想 | KEEP/MODIFY | 统一进入Timing Calendar/Deadline |
+| Refresh Debt | KEEP/MODIFY | Refresh继续独立拥有 |
+| REFsb相关Selection | REPLACE | 演进为REF_AB/REF_DIST |
+| Refresh Coverage | MODIFY | 支持Distributed Selector/Coverage |
+| Local tRFC Counter | MOVE | Timing统一管理 |
+| Grant即Refresh Credit | DELETE | Registered-equivalent REF Event后Accounting |
+| PAS_RFMC独立结构 | KEEP | RFM继续独立Owner |
+| DDR5 RAA类Accounting | MODIFY | 演进为PRAC/BAT/PRFM |
+| Refresh/RFM各自PRE | MERGE BACKEND | Shared PRE |
+| PRE Target=Close Target | DELETE ASSUMPTION | 区分Command/Timing/Actual Close/Accounting集合 |
+| ACT身份隐式关联 | MODIFY | 建立必要Activation Lifetime |
+| 固定ACT Generation | CONDITIONAL | 仅Late Close/ABA风险存在时需要 |
+| Refresh/RFM共用Accounting | PROHIBITED | Accounting继续完全独立 |
+| 私有Maintenance Actual接口 | NOT USED | 由标准DFI Mapping形成内部Event |
+| PHY异常汇总信号 | MODIFY | 保留标准`dfi_alert_n` |
+
+---
+
+# 7.21 本章收敛结论及待闭合项
+
+经预评审，本章以下内容作为当前设计结论：
+
+a) Refresh与RFM保持独立Service Owner和Accounting Truth；
+
+b) Shared PRE只负责Preparation，不拥有Refresh/RFM Accounting；
+
+c) Maintenance Claim与BSM Bank State分离；
+
+d) CLOSED但tRP尚未完成时等待Timing，不重复发送PRE；
+
+e) Maintenance Candidate最终通过GS和标准DFI路径执行；
+
+f) GS Admission/DFI Commit不等于Maintenance Command已经执行；
+
+g) Maintenance Accounting由对应Registered-equivalent Event触发；
+
+h) REF Event更新Refresh Debt/Coverage，不更新BAT/PRFM；
+
+i) RFM Event更新BAT/PRFM，不更新普通Refresh Debt；
+
+j) REF/RFM Event与tRFC/tRFM Service Release分离；
+
+k) Mandatory Service通过Latest-safe-start及Future Feasibility保证，而不是只依赖Priority；
+
+l) Activation Lifetime用于确保Close能够关联正确Activation；
+
+m) Activation Generation只在存在真实Late Close/ABA风险时启用，不作为固定模板；
+
+n) `dfi_alert_n`作为标准PHY→MC ALERT接口保留；
+
+o) ALERT Event与REF/RFM Command Event相互独立；
+
+p) Maintenance Reset不能把已经物理可见的Command静默视为取消。
+
+**表7-4 本章待闭合项**
+
+| 类别 | 待闭合内容 | 关闭方式 |
+|---|---|---|
+| Refresh Accounting | Debt计量、REF_AB/REF_DIST Credit、Postpone规则 | DDR6规范 |
+| REF_DIST | Selector、Coverage及Target Expansion | DDR6规范/Geometry |
+| Refresh Timing | tREFI、tRFC及高温Rate等参数 | DDR6规范/Product |
+| PRAC/BAT | Enable条件、Contribution、Threshold、Subtraction | DDR6规范/Product |
+| PRFM | Window、Due、Deadline、Credit | DDR6规范/Product |
+| RFM | AB/DIST/PB Encoding及Target Expansion | DDR6规范/Geometry |
+| RFM Timing | tRFM及相关Timing | DDR6规范 |
+| ALERT | Cause、Timing、Capture及与ABO/RFM/PRAC的精确关系 | DDR6规范/PHY ICD |
+| Activation Identity | 是否需要Generation以及位宽 | 根据真实Late Feedback风险确定 |
+| Shared PRE | 最大Target Set及物理实现 | RTL/FPGA资源 |
+| Service并发 | Claim及Service最大并发量 | Traffic/Product |
+| Maintenance Deadline | Worst-case Preparation/Execution Bound | Timing/RTL/P&R |
+| Registered-equivalent Event | REF/RFM/PRE的DFI Presentation→内部Event映射 | PHY ICD |
+| Reset/Recovery | Device-visible Maintenance恢复方式 | 第10章 + PHY ICD |
+
+上述开放项主要影响DDR6协议参数、Product Policy、DFI/PHY映射和物理实现，不重新打开Refresh/RFM Accounting Owner分离、Shared PRE职责以及Maintenance生命周期边界。
