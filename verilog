@@ -77,3 +77,9 @@ if {$check_net ne $new_net} {
 
 puts "AXI Debug Hub clock successfully connected to ctrl_clk"
 puts "========================================"
+
+set_property STEPS.OPT_DESIGN.TCL.PRE \
+{D:/bender_2802/bender_2802/pre_opt_debug.tcl} \
+[get_runs impl_1]
+
+get_property STEPS.OPT_DESIGN.TCL.PRE [get_runs impl_1]
