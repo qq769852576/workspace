@@ -11,3 +11,13 @@ ila_frontend_wr ila_frontend_wr_inst (
     .probe7(imem_wr_data),        // 64 bit
     .probe8(h2c_tdata_0[63:0])    // 64 bit
 );
+
+get_nets -of_objects [get_debug_ports dbg_hub/clk]
+
+get_debug_cores *dbg_hub*
+
+get_nets -of_objects [get_debug_ports -of_objects [get_debug_cores *dbg_hub*] -filter {PORT_NAME == clk}]
+
+get_nets -hier *sys_clk*
+
+get_nets -hier *dbg_hub*
