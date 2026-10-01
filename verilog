@@ -31,3 +31,11 @@ get_nets -of_objects [get_pins -hier *axi_dbg_hub*/aclk]
 get_pins -hier *dbg_hub*
 
 get_cells -hier *dbg_hub*
+
+disconnect_net \
+    -net [get_nets core_ddrc_core_clk] \
+    [get_pins axi_dbg_hub/aclk]
+
+connect_net \
+    -net [get_nets ctrl_clk] \
+    [get_pins axi_dbg_hub/aclk]
