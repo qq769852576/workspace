@@ -21,3 +21,5 @@ get_nets -of_objects [get_debug_ports -of_objects [get_debug_cores *dbg_hub*] -f
 get_nets -hier *sys_clk*
 
 get_nets -hier *dbg_hub*
+
+get_nets -of_objects [get_debug_ports axi_dbg_hub/aclk]
