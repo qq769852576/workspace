@@ -39,3 +39,41 @@ disconnect_net \
 connect_net \
     -net [get_nets ctrl_clk] \
     [get_pins axi_dbg_hub/aclk]
+
+
+puts "========================================"
+puts "Fixing Versal AXI Debug Hub clock..."
+puts "========================================"
+
+set hub_pin [get_pins -hier -quiet *axi_dbg_hub*/aclk]
+
+if {[llength $hub_pin] == 0} {
+    error "ERROR: Cannot find axi_dbg_hub/aclk"
+}
+
+set old_net [get_nets -quiet -of_objects $hub_pin]
+set new_net [get_nets -quiet ctrl_clk]
+
+if {[llength $new_net] == 0} {
+    error "ERROR: Cannot find ctrl_clk"
+}
+
+puts "Old debug hub clock = $old_net"
+puts "New debug hub clock = $new_net"
+
+if {[llength $old_net] > 0} {
+    disconnect_net -net $old_net -pinlist $hub_pin
+}
+
+connect_net -net $new_net -objects $hub_pin
+
+set check_net [get_nets -quiet -of_objects $hub_pin]
+
+puts "Debug hub clock after reconnect = $check_net"
+
+if {$check_net ne $new_net} {
+    error "ERROR: Failed to reconnect AXI Debug Hub clock"
+}
+
+puts "AXI Debug Hub clock successfully connected to ctrl_clk"
+puts "========================================"
