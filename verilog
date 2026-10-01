@@ -83,3 +83,5 @@ set_property STEPS.OPT_DESIGN.TCL.PRE \
 [get_runs impl_1]
 
 get_property STEPS.OPT_DESIGN.TCL.PRE [get_runs impl_1]
+
+Get-Content "D:\bender_2802\bender_2802\bender_2802.runs\impl_1\runme.log" -Tail 50
