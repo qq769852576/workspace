@@ -1,0 +1,13 @@
+ila_frontend_wr ila_frontend_wr_inst (
+    .clk(clk),
+
+    .probe0(h2c_tvalid_0),        // 1 bit
+    .probe1(h2c_tready_0),        // 1 bit
+    .probe2(h2c_tlast_0),         // 1 bit
+    .probe3(state_r),             // 2 bit
+    .probe4(xfer_ctr_r),          // 11 bit
+    .probe5(imem_wr_en),          // 1 bit
+    .probe6(imem_addr),           // 11 bit
+    .probe7(imem_wr_data),        // 64 bit
+    .probe8(h2c_tdata_0[63:0])    // 64 bit
+);
