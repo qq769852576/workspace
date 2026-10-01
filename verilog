@@ -23,3 +23,11 @@ get_nets -hier *sys_clk*
 get_nets -hier *dbg_hub*
 
 get_nets -of_objects [get_debug_ports axi_dbg_hub/aclk]
+
+get_pins -hier *axi_dbg_hub*/aclk
+
+get_nets -of_objects [get_pins -hier *axi_dbg_hub*/aclk]
+
+get_pins -hier *dbg_hub*
+
+get_cells -hier *dbg_hub*
