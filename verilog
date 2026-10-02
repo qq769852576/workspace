@@ -124,3 +124,4 @@ set_false_path \
 set_false_path \
     -from [get_pins u_bypass/u_xpio_drv/core_rstn_rel_reg/Q] \
     -to   [get_pins {u_bypass/u_xpio_drv/core_rstn_sync_ff_reg[0]/D}]
+report_cdc -from [get_clocks inst_n_1] -to [get_clocks clkout2_primitive] -details -file D:/bender_2802/cdc_core_to_ctrl.rpt
