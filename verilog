@@ -90,3 +90,14 @@ report_timing_summary \
     -delay_type min_max \
     -max_paths 20 \
     -file D:/bender_2802/timing_summary.rpt
+
+
+report_timing \
+    -delay_type max \
+    -max_paths 20 \
+    -file D:/bender_2802/setup_timing.rpt
+
+report_timing \
+    -delay_type min \
+    -max_paths 20 \
+    -file D:/bender_2802/hold_timing.rpt
