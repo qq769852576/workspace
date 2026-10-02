@@ -132,3 +132,12 @@ foreach f [get_files -all -filter {NAME =~ "*advanced_io_wizard_0*.xdc"}] {
     puts "  USED_IN_SYNTHESIS=[get_property USED_IN_SYNTHESIS $f]"
     puts "  USED_IN_IMPLEMENTATION=[get_property USED_IN_IMPLEMENTATION $f]"
 }
+set xdc_path "d:/bender_2802/bender_2802/BYPASS_800.gen/sources_1/ip/advanced_io_wizard_0/advanced_io_wizard_0.xdc"
+set fp [open $xdc_path r]
+set xdc_txt [read $fp]
+close $fp
+foreach line [split $xdc_txt "\n"] {
+    if {[regexp -nocase {phy_rden|phy_wren|false_path|max_delay|clock_groups|set_bus_skew} $line]} {
+        puts $line
+    }
+}
