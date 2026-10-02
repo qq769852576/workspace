@@ -141,3 +141,12 @@ foreach line [split $xdc_txt "\n"] {
         puts $line
     }
 }
+
+
+foreach p [list_property [get_ips advanced_io_wizard_0]] {
+    if {[string match "CONFIG.*" $p]} {
+        puts "$p = [get_property $p [get_ips advanced_io_wizard_0]]"
+    }
+}
+
+report_io -ports [get_ports {sys_clk_p sys_clk_n}]
