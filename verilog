@@ -101,3 +101,26 @@ report_timing \
     -delay_type min \
     -max_paths 20 \
     -file D:/bender_2802/hold_timing.rpt
+
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+logic [1:0] core_rstn_sync_ff;
+
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+logic [1:0] pwr_start_sync;
+
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+logic [1:0] pll_locked_sync;
+
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+logic [1:0] intf_rdy_sync;
+
+(* ASYNC_REG = "TRUE", SHREG_EXTRACT = "NO" *)
+logic [1:0] dfi_init_start_sync;
+
+set_false_path \
+    -from [get_pins u_bypass/u_xpio_drv/pwr_start_ref_reg/Q] \
+    -to   [get_pins {u_bypass/u_xpio_drv/pwr_start_sync_reg[0]/D}]
+
+set_false_path \
+    -from [get_pins u_bypass/u_xpio_drv/core_rstn_rel_reg/Q] \
+    -to   [get_pins {u_bypass/u_xpio_drv/core_rstn_sync_ff_reg[0]/D}]
