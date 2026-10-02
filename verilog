@@ -85,3 +85,8 @@ set_property STEPS.OPT_DESIGN.TCL.PRE \
 get_property STEPS.OPT_DESIGN.TCL.PRE [get_runs impl_1]
 
 Get-Content "D:\bender_2802\bender_2802\bender_2802.runs\impl_1\runme.log" -Tail 50
+
+report_timing_summary \
+    -delay_type min_max \
+    -max_paths 20 \
+    -file D:/bender_2802/timing_summary.rpt
