@@ -1,12 +1,8 @@
-validate_bd_design
-save_bd_design
+set hub_clk [get_pins axi_dbg_hub_0/aclk]
 
-generate_target all \
-    [get_files */cpm_qdma_ep_part.bd]
+get_nets -of_objects $hub_clk
 
-reset_run synth_1
-launch_runs synth_1 -jobs 8
-wait_on_run synth_1
+all_fanin -flat -startpoints_only -to $hub_clk
 
-launch_runs impl_1 -to_step write_device_image -jobs 8
-wait_on_run impl_1
+all_fanin -flat -startpoints_only \
+    -to [get_pins proc_sys_reset_1/slowest_sync_clk]
