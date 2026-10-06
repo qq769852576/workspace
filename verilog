@@ -1,2 +1,302 @@
-get_bd_pins -of_objects [get_bd_cells versal_cips_0]
-get_bd_intf_pins -of_objects [get_bd_cells versal_cips_0]
+# ============================================================
+# Versal AXI Debug Hub independent clock/reset connection
+#
+# Existing:
+#   versal_cips_0
+#   proc_sys_reset_1
+#   axi_dbg_hub_0
+#
+# New:
+#   axi_noc_dbg
+#
+# Debug Hub clock:
+#   versal_cips_0/pl0_ref_clk
+#
+# PMC access:
+#   PMC_NOC_AXI_0
+#       -> axi_noc_dbg/S00_AXI
+#       -> axi_noc_dbg/M00_AXI
+#       -> axi_dbg_hub_0/S_AXI
+# ============================================================
+
+puts "============================================================"
+puts "Step 0 : Check current BD"
+puts "============================================================"
+
+puts "Current BD = [current_bd_design]"
+
+if {[llength [get_bd_cells -quiet versal_cips_0]] == 0} {
+    error "versal_cips_0 not found"
+}
+
+if {[llength [get_bd_cells -quiet proc_sys_reset_1]] == 0} {
+    error "proc_sys_reset_1 not found"
+}
+
+if {[llength [get_bd_cells -quiet axi_dbg_hub_0]] == 0} {
+    error "axi_dbg_hub_0 not found"
+}
+
+
+# ============================================================
+# Step 1 : Enable CIPS PL clock/reset and PMC -> NoC AXI
+# ============================================================
+
+puts "============================================================"
+puts "Step 1 : Configure CIPS"
+puts "============================================================"
+
+set_property -dict [list \
+    CONFIG.PS_USE_PMCPL_CLK0       {1} \
+    CONFIG.PS_NUM_FABRIC_RESETS   {1} \
+    CONFIG.PMC_USE_PMC_NOC_AXI0   {1} \
+] [get_bd_cells versal_cips_0]
+
+puts "CIPS configuration updated."
+
+
+# ============================================================
+# Step 2 : Check required CIPS pins
+# ============================================================
+
+puts "============================================================"
+puts "Step 2 : Check CIPS ports"
+puts "============================================================"
+
+foreach p {
+    pl0_ref_clk
+    pl0_resetn
+    pmc_axi_noc_axi0_clk
+} {
+    if {[llength [get_bd_pins -quiet versal_cips_0/$p]] == 0} {
+        error "Missing CIPS pin: versal_cips_0/$p"
+    } else {
+        puts "FOUND: versal_cips_0/$p"
+    }
+}
+
+if {[llength [get_bd_intf_pins -quiet versal_cips_0/PMC_NOC_AXI_0]] == 0} {
+    error "PMC_NOC_AXI_0 not found. Check CIPS PMC to NoC configuration."
+}
+
+puts "FOUND: versal_cips_0/PMC_NOC_AXI_0"
+
+
+# ============================================================
+# Step 3 : Create dedicated AXI NoC for Debug Hub
+# ============================================================
+
+puts "============================================================"
+puts "Step 3 : Create/configure axi_noc_dbg"
+puts "============================================================"
+
+if {[llength [get_bd_cells -quiet axi_noc_dbg]] == 0} {
+
+    create_bd_cell \
+        -type ip \
+        -vlnv xilinx.com:ip:axi_noc:1.0 \
+        axi_noc_dbg
+
+    puts "Created axi_noc_dbg"
+
+} else {
+
+    puts "axi_noc_dbg already exists, reuse it"
+}
+
+# Two independent clocks:
+#   aclk0 = PMC side
+#   aclk1 = PL / Debug Hub side
+set_property -dict [list \
+    CONFIG.NUM_CLKS {2} \
+] [get_bd_cells axi_noc_dbg]
+
+# PMC side interface category
+set_property -dict [list \
+    CONFIG.CATEGORY {ps_pmc} \
+] [get_bd_intf_pins axi_noc_dbg/S00_AXI]
+
+# Clock association
+set_property -dict [list \
+    CONFIG.ASSOCIATED_BUSIF {S00_AXI} \
+] [get_bd_pins axi_noc_dbg/aclk0]
+
+set_property -dict [list \
+    CONFIG.ASSOCIATED_BUSIF {M00_AXI} \
+] [get_bd_pins axi_noc_dbg/aclk1]
+
+
+# ============================================================
+# Step 4 : Connect PMC AXI path
+# ============================================================
+
+puts "============================================================"
+puts "Step 4 : Connect PMC -> NoC -> Debug Hub"
+puts "============================================================"
+
+connect_bd_intf_net \
+    [get_bd_intf_pins versal_cips_0/PMC_NOC_AXI_0] \
+    [get_bd_intf_pins axi_noc_dbg/S00_AXI]
+
+connect_bd_intf_net \
+    [get_bd_intf_pins axi_noc_dbg/M00_AXI] \
+    [get_bd_intf_pins axi_dbg_hub_0/S_AXI]
+
+puts "PMC AXI path connected."
+
+
+# ============================================================
+# Step 5 : Connect NoC clocks
+#
+# PMC side:
+#   pmc_axi_noc_axi0_clk -> aclk0
+#
+# PL side:
+#   pl0_ref_clk -> aclk1
+# ============================================================
+
+puts "============================================================"
+puts "Step 5 : Connect NoC clocks"
+puts "============================================================"
+
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pmc_axi_noc_axi0_clk] \
+    [get_bd_pins axi_noc_dbg/aclk0]
+
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pl0_ref_clk] \
+    [get_bd_pins axi_noc_dbg/aclk1]
+
+puts "NoC clocks connected."
+
+
+# ============================================================
+# Step 6 : Debug Hub clock
+#
+# IMPORTANT:
+# Debug Hub is now independent from:
+#   core_ddrc_core_clk
+#   XPLL
+#   LP6
+# ============================================================
+
+puts "============================================================"
+puts "Step 6 : Connect Debug Hub clock"
+puts "============================================================"
+
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pl0_ref_clk] \
+    [get_bd_pins axi_dbg_hub_0/aclk]
+
+puts "axi_dbg_hub_0/aclk <- pl0_ref_clk"
+
+
+# ============================================================
+# Step 7 : Dedicated Debug Hub reset
+#
+# pl0_resetn
+#    -> proc_sys_reset_1/ext_reset_in
+#
+# pl0_ref_clk
+#    -> proc_sys_reset_1/slowest_sync_clk
+#
+# peripheral_aresetn
+#    -> axi_dbg_hub_0/aresetn
+# ============================================================
+
+puts "============================================================"
+puts "Step 7 : Connect Debug Hub reset"
+puts "============================================================"
+
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pl0_resetn] \
+    [get_bd_pins proc_sys_reset_1/ext_reset_in]
+
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pl0_ref_clk] \
+    [get_bd_pins proc_sys_reset_1/slowest_sync_clk]
+
+connect_bd_net \
+    [get_bd_pins proc_sys_reset_1/peripheral_aresetn] \
+    [get_bd_pins axi_dbg_hub_0/aresetn]
+
+puts "Debug Hub reset path connected."
+
+
+# ============================================================
+# Step 8 : Validate Block Design
+# ============================================================
+
+puts "============================================================"
+puts "Step 8 : Validate BD"
+puts "============================================================"
+
+validate_bd_design
+
+
+# ============================================================
+# Step 9 : Assign Debug Hub address into PMC address space
+# ============================================================
+
+puts "============================================================"
+puts "Step 9 : Assign PMC address"
+puts "============================================================"
+
+set dbg_seg \
+    [get_bd_addr_segs -quiet axi_dbg_hub_0/S_AXI_DBG_HUB/Mem0]
+
+if {[llength $dbg_seg] == 0} {
+
+    puts "WARNING: axi_dbg_hub_0 address segment not found."
+    puts "Run: get_bd_addr_segs -of_objects [get_bd_cells axi_dbg_hub_0]"
+
+} else {
+
+    assign_bd_address \
+        -target_address_space /versal_cips_0/DATA_PMC \
+        $dbg_seg \
+        -force
+
+    puts "Debug Hub address assigned to DATA_PMC."
+}
+
+
+# ============================================================
+# Step 10 : Validate again and save
+# ============================================================
+
+puts "============================================================"
+puts "Step 10 : Final validate/save"
+puts "============================================================"
+
+validate_bd_design
+save_bd_design
+
+puts ""
+puts "============================================================"
+puts "DEBUG HUB CONNECTION COMPLETE"
+puts ""
+puts "Expected structure:"
+puts ""
+puts "PMC_NOC_AXI_0"
+puts "       |"
+puts "       v"
+puts "axi_noc_dbg/S00_AXI"
+puts "       |"
+puts "       v"
+puts "axi_noc_dbg/M00_AXI"
+puts "       |"
+puts "       v"
+puts "axi_dbg_hub_0/S_AXI"
+puts ""
+puts "pl0_ref_clk"
+puts "   +--> axi_noc_dbg/aclk1"
+puts "   +--> axi_dbg_hub_0/aclk"
+puts "   +--> proc_sys_reset_1/slowest_sync_clk"
+puts ""
+puts "pl0_resetn"
+puts "   --> proc_sys_reset_1"
+puts "   --> peripheral_aresetn"
+puts "   --> axi_dbg_hub_0/aresetn"
+puts ""
+puts "============================================================"
