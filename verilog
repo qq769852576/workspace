@@ -1,3 +1,12 @@
+get_bd_addr_spaces
+
+get_bd_addr_spaces -of_objects \
+    [get_bd_intf_pins versal_cips_0/PMC_NOC_AXI_0]
+
+get_bd_addr_segs -of_objects \
+    [get_bd_intf_pins axi_dbg_hub_0/S_AXI]
+
+
 # ============================================================
 # VE2802 AXI Debug Hub dedicated path
 #
