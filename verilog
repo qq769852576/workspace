@@ -1,19 +1,14 @@
-puts "===== XPLL CLKIN ====="
-set clkin [get_pins $pll/CLKIN]
-puts "NET = [get_nets -of_objects $clkin]"
-puts "SOURCE:"
-all_fanin -flat -startpoints_only -to $clkin
+puts "IS_RST_INVERTED = [get_property IS_RST_INVERTED $pll]"
 
-puts ""
-puts "===== XPLL RESET ====="
-set prst [get_pins $pll/RST]
-puts "NET = [get_nets -of_objects $prst]"
-puts "SOURCE:"
-all_fanin -flat -startpoints_only -to $prst
+report_timing \
+    -from [get_ports sys_rstn] \
+    -to [get_pins $pll/RST] \
+    -max_paths 1 \
+    -path_type full
 
-puts ""
-puts "===== XPLL LOCKED ====="
-set plock [get_pins $pll/LOCKED]
-puts "NET = [get_nets -of_objects $plock]"
-puts "ENDPOINTS:"
-all_fanout -flat -endpoints_only -from $plock
+puts "===== XPLL RST CONE ====="
+all_fanin -flat -to [get_pins $pll/RST]
+
+get_property IS_RST_INVERTED $pll
+
+report_timing -from [get_ports sys_rstn] -to [get_pins $pll/RST] -max_paths 1 -path_type full
