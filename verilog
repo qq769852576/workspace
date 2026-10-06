@@ -1,30 +1,13 @@
-puts "===== 1. DEBUG CORE OBJECTS ====="
-set hubs [get_debug_cores -quiet *dbg_hub*]
-puts "HUBS = $hubs"
+set hub_clk_pin \
+    [lindex [get_pins -hier -filter {NAME =~ *dbg_hub*/*aclk*}] 0]
 
-foreach h $hubs {
-    puts ""
-    puts "---- DEBUG CORE: $h ----"
-    report_property $h
-}
+puts "Selected pin = $hub_clk_pin"
 
-puts ""
-puts "===== 2. CELLS CONTAINING dbg_hub ====="
-get_cells -hier -filter {NAME =~ *dbg_hub*}
+puts "NET:"
+get_nets -of_objects $hub_clk_pin
 
-puts ""
-puts "===== 3. CELLS WITH AXI DEBUG HUB REF_NAME ====="
-get_cells -hier -filter {REF_NAME =~ *axi_dbg_hub*}
+puts "CLOCK:"
+get_clocks -of_objects $hub_clk_pin
 
-puts ""
-puts "===== 4. ALL CLOCK-LIKE PINS UNDER dbg_hub ====="
-get_pins -hier -filter {NAME =~ *dbg_hub*/*clk*}
-
-puts ""
-puts "===== 5. ALL ACLK-LIKE PINS UNDER dbg_hub ====="
-get_pins -hier -filter {NAME =~ *dbg_hub*/*aclk*}
-
-puts ""
-puts "===== 6. ALL RESET-LIKE PINS UNDER dbg_hub ====="
-get_pins -hier -filter {NAME =~ *dbg_hub*/*reset*}
-get_pins -hier -filter {NAME =~ *dbg_hub*/*aresetn*}
+puts "SOURCE:"
+all_fanin -flat -startpoints_only -to $hub_clk_pin
