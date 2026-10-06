@@ -1,5 +1,5 @@
 puts "============================================================"
-puts "DEBUG CORE ACLK / ARESETN CHECK"
+puts "DEBUG CORE AXIS CONNECTIVITY CHECK"
 puts "============================================================"
 
 set cores {
@@ -18,33 +18,37 @@ foreach c $cores {
     puts "CORE = $c"
     puts "=================================================="
 
-    set aclk [get_pins -quiet $c/aclk]
-    set arst [get_pins -quiet $c/aresetn]
+    set cell [get_cells -quiet $c]
 
-    if {[llength $aclk]} {
-
-        puts "ACLK NET:"
-        puts [get_nets -quiet -of_objects $aclk]
-
-        puts "ACLK CLOCK:"
-        puts [get_clocks -quiet -of_objects $aclk]
-
-        puts "ACLK SOURCE:"
-        puts [all_fanin -flat -startpoints_only -to $aclk]
-
-    } else {
-        puts "ACLK = NOT FOUND"
+    if {[llength $cell] == 0} {
+        puts "CELL NOT FOUND"
+        continue
     }
 
-    if {[llength $arst]} {
+    set found 0
 
-        puts "ARESETN NET:"
-        puts [get_nets -quiet -of_objects $arst]
+    foreach p [get_pins -quiet -of_objects $cell] {
 
-        puts "ARESETN SOURCE:"
-        puts [all_fanin -flat -startpoints_only -to $arst]
+        set leaf [lindex [split $p "/"] end]
 
-    } else {
-        puts "ARESETN = NOT FOUND"
+        if {[regexp -nocase {(axis|tvalid|tready|tdata|tlast)} $leaf]} {
+
+            set found 1
+
+            puts ""
+            puts "PIN = $p"
+
+            set n [get_nets -quiet -of_objects $p]
+
+            if {[llength $n]} {
+                puts "NET = $n"
+            } else {
+                puts "NET = *** UNCONNECTED ***"
+            }
+        }
+    }
+
+    if {!$found} {
+        puts "NO AXIS-LIKE TOP LEVEL PINS FOUND"
     }
 }
