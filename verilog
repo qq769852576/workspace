@@ -1,18 +1,12 @@
-set hub_clk [get_pins axi_dbg_hub/aclk]
+set plbuf [get_cells {design_1_wrapper/design_1_i/versal_cips_0/inst/pspmc_0/inst/buffer_pl_clk_0.PL_CLK_0_BUFG}]
 
-puts "=== HUB CLK NET ==="
-get_nets -of_objects $hub_clk
+get_pins $plbuf
 
-puts "=== HUB CLK OBJECT ==="
-get_clocks -of_objects $hub_clk
+get_nets -of_objects [get_pins $plbuf/O]
 
-puts "=== HUB CLK SOURCE ==="
-all_fanin -flat -startpoints_only -to $hub_clk
+get_clocks -of_objects [get_pins $plbuf/O]
 
-set hub_rst [get_pins axi_dbg_hub/aresetn]
+get_nets -of_objects [get_pins proc_sys_reset/slowest_sync_clk]
 
-puts "=== HUB RESET NET ==="
-get_nets -of_objects $hub_rst
-
-puts "=== HUB RESET SOURCE ==="
-all_fanin -flat -startpoints_only -to $hub_rst
+all_fanin -flat -startpoints_only \
+    -to [get_pins proc_sys_reset/slowest_sync_clk]
