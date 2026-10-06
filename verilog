@@ -207,39 +207,18 @@ BUFG u_pll_ref_clk_bufg (
     .O (bank0_pll_clkin)
 );
 
-advanced_io_wizard_0 xpio (
-    .fifo_wr_clk                        (fifo_wr_clk),
-    .fifo_wr_clk_from_strobe_nibble     (fifo_wr_clk_from_strobe_nibble),
-    .intf_rdy                           (intf_rdy),
-    .ctrl_clk                           (ctrl_clk),
-    .en_vtc                             (en_vtc),
-    .fifo_rd_clk                        (bank0_pll_clkout0),
-    .riu_sm_done                        (riu_sm_done),
-    .rst                                (sys_rstn),
+report_drc
+report_clocks
+report_timing_summary
+report_io
 
-    .bank0_pll_clkout0                  (bank0_pll_clkout0),
-    .bank0_pll_clkout1                  (bank0_pll_clkout1),
-    .bank0_pll_clkout2                  (),
-    .pll0_clkout0                       (),
-    .bank0_pll_clkout3                  (bank0_pll_clkout3),
-    .bank0_pll_clkoutphy                (bank0_pll_clkoutphy),
-    .bank0_pll_locked                   (bank0_pll_locked),
+get_cells -hier -filter {REF_NAME == XPLL}
+get_cells -hier -filter {REF_NAME == BUFG}
 
-    .bank0_pll_clkin                    (bank0_pll_clkin),
-    .bank0_pll_rst_pll                  (~por_n),
+foreach c [get_cells -hier -filter {REF_NAME == XPLL}] {
+    puts "$c  LOC=[get_property LOC $c]"
+}
 
-    .phy_rden                           (phy_rden),
-    .phy_wren                           (phy_wren),
-    .dly_rdy                            (dly_rdy),
-    .phy_rdy                            (phy_rdy),
-    .fifo_empty                         (fifo_empty),
-    .fifo_rd_en                         (fifo_rd_en),
-
-    .riu_wr_en                          (riu_wr_en),
-    .riu_wr_data                        (riu_wr_data),
-    .riu_addr                           (riu_addr),
-    .riu_nibble_sel                     (riu_nibble_sel),
-    .riu_rd_valid                       (riu_rd_valid),
-    .riu_rd_data                        (riu_rd_data),
-
-    // 后面的 DQ/CA/CK/WCK/RDQS 保持原来的连接
+foreach c [get_cells -hier -filter {REF_NAME == BUFG}] {
+    puts "$c  LOC=[get_property LOC $c]"
+}
