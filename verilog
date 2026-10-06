@@ -1,9 +1,22 @@
-set hub_rst [get_pins design_1_wrapper/design_1_i/axi_dbg_hub_0/aresetn]
+puts "===== IMPLEMENTED DEBUG CORES ====="
+get_debug_cores
 
-get_nets -of_objects $hub_rst
+puts "===== FRONTEND ILA CELL ====="
+get_cells -hier -filter {NAME =~ *ila_frontend_wr_inst*}
 
-all_fanin -flat -startpoints_only -to $hub_rst
+puts "===== FRONTEND ILA CLOCK PINS ====="
+get_pins -hier -filter {NAME =~ *ila_frontend_wr_inst*/*clk*}
 
+set fclk [lindex \
+    [get_pins -hier -filter {NAME =~ *ila_frontend_wr_inst*/*clk*}] 0]
 
-all_fanin -flat -startpoints_only \
-    -to [get_pins -hier *proc_sys_reset_1*/slowest_sync_clk]
+puts "FRONTEND ILA CLK PIN = $fclk"
+
+puts "NET:"
+get_nets -of_objects $fclk
+
+puts "CLOCK:"
+get_clocks -of_objects $fclk
+
+puts "SOURCE:"
+all_fanin -flat -startpoints_only -to $fclk
