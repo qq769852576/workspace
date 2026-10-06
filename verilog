@@ -1,8 +1,30 @@
-set hub_clk [get_pins axi_dbg_hub_0/aclk]
+puts "===== 1. DEBUG CORE OBJECTS ====="
+set hubs [get_debug_cores -quiet *dbg_hub*]
+puts "HUBS = $hubs"
 
-get_nets -of_objects $hub_clk
+foreach h $hubs {
+    puts ""
+    puts "---- DEBUG CORE: $h ----"
+    report_property $h
+}
 
-all_fanin -flat -startpoints_only -to $hub_clk
+puts ""
+puts "===== 2. CELLS CONTAINING dbg_hub ====="
+get_cells -hier -filter {NAME =~ *dbg_hub*}
 
-all_fanin -flat -startpoints_only \
-    -to [get_pins proc_sys_reset_1/slowest_sync_clk]
+puts ""
+puts "===== 3. CELLS WITH AXI DEBUG HUB REF_NAME ====="
+get_cells -hier -filter {REF_NAME =~ *axi_dbg_hub*}
+
+puts ""
+puts "===== 4. ALL CLOCK-LIKE PINS UNDER dbg_hub ====="
+get_pins -hier -filter {NAME =~ *dbg_hub*/*clk*}
+
+puts ""
+puts "===== 5. ALL ACLK-LIKE PINS UNDER dbg_hub ====="
+get_pins -hier -filter {NAME =~ *dbg_hub*/*aclk*}
+
+puts ""
+puts "===== 6. ALL RESET-LIKE PINS UNDER dbg_hub ====="
+get_pins -hier -filter {NAME =~ *dbg_hub*/*reset*}
+get_pins -hier -filter {NAME =~ *dbg_hub*/*aresetn*}
