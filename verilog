@@ -163,3 +163,9 @@ foreach p [lsort [list_property [get_ips advanced_io_wizard_0]]] {
         puts "$p = [get_property $p [get_ips advanced_io_wizard_0]]"
     }
 }
+
+foreach c [get_cells -hier -filter {REF_NAME == XPLL}] {
+    puts "$c  LOC=[get_property LOC $c]"
+}
+
+get_cells -hier *BANK_WRAPPER_INST*
