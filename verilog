@@ -10,6 +10,11 @@ report_property [get_debug_ports dbg_hub/clk]
 
 get_nets -hier -filter {NAME =~ *clk_pl_0*}
 
+connect_debug_port dbg_hub/clk [get_nets <你的clk_pl_0实际net名称>]
+
+set_property C_CLK_INPUT_FREQ_HZ 250000000 [get_debug_cores dbg_hub]
+set_property C_ENABLE_CLK_DIVIDER false [get_debug_cores dbg_hub]
+
 set pll [get_cells u_bypass/u_xpio_drv/xpio/inst/clk_scheme_inst/xpll_pll0_inst]
 
 set clkin [get_pins $pll/CLKIN]
