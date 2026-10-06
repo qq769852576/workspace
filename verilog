@@ -169,3 +169,23 @@ foreach c [get_cells -hier -filter {REF_NAME == XPLL}] {
 }
 
 get_cells -hier *BANK_WRAPPER_INST*
+
+set bw [get_cells -hier *BANK_WRAPPER_INST0]
+
+foreach p [get_pins -of_objects $bw] {
+    if {[regexp -nocase {clk|pll} $p]} {
+        puts $p
+    }
+}
+
+foreach n [get_nets -hier *bank0_pll_clkoutphy*] {
+    puts "===== BANK0 PLL PHY ====="
+    puts $n
+    puts [get_pins -of_objects $n]
+}
+
+foreach n [get_nets -hier *bank1_pll_clkoutphy*] {
+    puts "===== BANK1 PLL PHY ====="
+    puts $n
+    puts [get_pins -of_objects $n]
+}
