@@ -1,16 +1,9 @@
-puts "===== HARDWARE ILAs ====="
+report_property [get_debug_cores design_1_wrapper/design_1_i/axi_dbg_hub_0]
 
-foreach h [get_hw_ilas -of [current_hw_device]] {
-    puts ""
-    puts "HW ILA = $h"
-    puts "INSTANCE_NAME = [get_property INSTANCE_NAME $h]"
-}
+set dev [current_hw_device]
 
-puts ""
-puts "===== HARDWARE VIOs ====="
+set_property PROBES.FILE \
+    {D:/pdi_backup/LP6_bender_latest.ltx} \
+    $dev
 
-foreach v [get_hw_vios -of [current_hw_device]] {
-    puts ""
-    puts "HW VIO = $v"
-    report_property $v
-}
+refresh_hw_device $dev
