@@ -1,15 +1,19 @@
-set pll \
-[get_cells u_bypass/u_xpio_drv/xpio/inst/clk_scheme_inst/xpll_pll0_inst]
+puts "===== XPLL CLKIN ====="
+set clkin [get_pins $pll/CLKIN]
+puts "NET = [get_nets -of_objects $clkin]"
+puts "SOURCE:"
+all_fanin -flat -startpoints_only -to $clkin
 
-foreach p [get_pins -of_objects $pll] {
+puts ""
+puts "===== XPLL RESET ====="
+set prst [get_pins $pll/RST]
+puts "NET = [get_nets -of_objects $prst]"
+puts "SOURCE:"
+all_fanin -flat -startpoints_only -to $prst
 
-    set leaf [lindex [split $p "/"] end]
-
-    if {[regexp -nocase {(rst|reset|lock|clkin|clkout)} $leaf]} {
-
-        puts ""
-        puts "PIN = $p"
-        puts "DIR = [get_property DIRECTION $p]"
-        puts "NET = [get_nets -quiet -of_objects $p]"
-    }
-}
+puts ""
+puts "===== XPLL LOCKED ====="
+set plock [get_pins $pll/LOCKED]
+puts "NET = [get_nets -of_objects $plock]"
+puts "ENDPOINTS:"
+all_fanout -flat -endpoints_only -from $plock
