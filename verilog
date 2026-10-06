@@ -189,3 +189,9 @@ foreach n [get_nets -hier *bank1_pll_clkoutphy*] {
     puts $n
     puts [get_pins -of_objects $n]
 }
+
+wire [71:0] phy_rden_2bank;
+wire [71:0] phy_wren_2bank;
+
+assign phy_rden_2bank = {36'b0, phy_rden};
+assign phy_wren_2bank = {36'b0, phy_wren};
