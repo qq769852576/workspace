@@ -195,3 +195,14 @@ wire [71:0] phy_wren_2bank;
 
 assign phy_rden_2bank = {36'b0, phy_rden};
 assign phy_wren_2bank = {36'b0, phy_wren};
+
+IBUFDS u_pll_ref_clk_ibufds (
+    .I  (pll_ref_clk_p),
+    .IB (pll_ref_clk_n),
+    .O  (pll_ref_clk_ibuf)
+);
+
+BUFG u_pll_ref_clk_bufg (
+    .I (pll_ref_clk_ibuf),
+    .O (bank0_pll_clkin)
+);
