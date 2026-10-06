@@ -1,83 +1,415 @@
-puts "===== 1. Current project / part ====="
-puts "PROJECT = [current_project]"
-puts "PART    = [get_property PART [current_project]]"
-puts "BD      = [current_bd_design]"
+# ============================================================
+# VE2802 AXI Debug Hub dedicated path
+#
+# Existing:
+#   versal_cips_0
+#   proc_sys_reset_1
+#   axi_dbg_hub_0
+#
+# Existing QDMA NoC:
+#   axi_noc_0
+#   -> DO NOT TOUCH
+#
+# New:
+#   axi_noc_dbg
+#
+# Path:
+#   PMC_NOC_AXI_0
+#        |
+#        v
+#   axi_noc_dbg/S00_AXI
+#        |
+#        v
+#   axi_noc_dbg/M00_AXI
+#        |
+#        v
+#   axi_dbg_hub_0/S_AXI
+#
+# Clock:
+#   pmc_axi_noc_axi0_clk -> axi_noc_dbg/aclk0
+#   pl0_ref_clk          -> axi_noc_dbg/aclk1
+#   pl0_ref_clk          -> axi_dbg_hub_0/aclk
+#   pl0_ref_clk          -> proc_sys_reset_1/slowest_sync_clk
+#
+# Reset:
+#   pl0_resetn
+#      -> proc_sys_reset_1/ext_reset_in
+#
+#   proc_sys_reset_1/peripheral_aresetn
+#      -> axi_dbg_hub_0/aresetn
+# ============================================================
+
 
 puts ""
-puts "===== 2. Search AXI NoC IP definitions ====="
-set noc_defs [get_ipdefs -all -quiet *axi_noc*]
-puts "AXI_NOC defs = $noc_defs"
+puts "============================================================"
+puts "STEP 0 : PRE-CHECK"
+puts "============================================================"
 
-puts ""
-puts "===== 3. Search ALL NoC-related IP definitions ====="
-set all_noc_defs [get_ipdefs -all -quiet *noc*]
-foreach ip $all_noc_defs {
-    puts $ip
-}
-
-puts ""
-puts "===== 4. Search AXI Debug Hub definitions ====="
-set dbg_defs [get_ipdefs -all -quiet *axi_dbg_hub*]
-puts "AXI_DBG_HUB defs = $dbg_defs"
-
-puts ""
-puts "===== 5. Search reset IP definitions ====="
-set rst_defs [get_ipdefs -all -quiet *proc_sys_reset*]
-puts "PROC_SYS_RESET defs = $rst_defs"
-
-puts ""
-puts "===== 6. Existing NoC-like BD cells ====="
-
-foreach c [get_bd_cells -hier] {
-    set vlnv [get_property -quiet VLNV $c]
-    if {[regexp -nocase {noc} $vlnv] || [regexp -nocase {noc} $c]} {
-        puts "$c    VLNV=$vlnv"
-    }
-}
-
-puts ""
-puts "===== 7. CIPS debug-related interfaces ====="
-
-foreach x {
-    PMC_NOC_AXI_0
-    PMC_NOC_AXI_1
-} {
-    set p [get_bd_intf_pins -quiet versal_cips_0/$x]
-    if {[llength $p]} {
-        puts "FOUND INTF: $p"
-    } else {
-        puts "MISSING INTF: versal_cips_0/$x"
-    }
-}
-
-puts ""
-puts "===== 8. CIPS debug-related pins ====="
-
-foreach x {
-    pl0_ref_clk
-    pl0_resetn
-    pmc_axi_noc_axi0_clk
-    pmc_axi_noc_axi1_clk
-} {
-    set p [get_bd_pins -quiet versal_cips_0/$x]
-    if {[llength $p]} {
-        puts "FOUND PIN: $p"
-    } else {
-        puts "MISSING PIN: versal_cips_0/$x"
-    }
-}
-
-puts ""
-puts "===== 9. Existing debug/reset cells ====="
+puts "BD   = [current_bd_design]"
+puts "PART = [get_property PART [current_project]]"
 
 foreach c {
-    axi_dbg_hub_0
+    versal_cips_0
     proc_sys_reset_1
+    axi_dbg_hub_0
 } {
-    set obj [get_bd_cells -quiet $c]
-    if {[llength $obj]} {
-        puts "$c    VLNV=[get_property VLNV $obj]"
+    if {[llength [get_bd_cells -quiet $c]] == 0} {
+        error "ERROR: missing BD cell $c"
     } else {
-        puts "$c    NOT FOUND"
+        puts "FOUND CELL: $c"
     }
 }
+
+foreach p {
+    versal_cips_0/pl0_ref_clk
+    versal_cips_0/pl0_resetn
+    versal_cips_0/pmc_axi_noc_axi0_clk
+} {
+    if {[llength [get_bd_pins -quiet $p]] == 0} {
+        error "ERROR: missing BD pin $p"
+    } else {
+        puts "FOUND PIN: $p"
+    }
+}
+
+if {[llength \
+    [get_bd_intf_pins -quiet versal_cips_0/PMC_NOC_AXI_0]] == 0} {
+    error "ERROR: versal_cips_0/PMC_NOC_AXI_0 missing"
+}
+
+puts "FOUND INTF: versal_cips_0/PMC_NOC_AXI_0"
+
+
+# ============================================================
+# STEP 1 : CREATE DEDICATED AXI NOC
+# ============================================================
+
+puts ""
+puts "============================================================"
+puts "STEP 1 : CREATE axi_noc_dbg"
+puts "============================================================"
+
+if {[llength [get_bd_cells -quiet axi_noc_dbg]] == 0} {
+
+    create_bd_cell \
+        -type ip \
+        -vlnv xilinx.com:ip:axi_noc:1.1 \
+        axi_noc_dbg
+
+    puts "CREATED: axi_noc_dbg"
+
+} else {
+
+    puts "axi_noc_dbg already exists, reuse it"
+}
+
+puts "VLNV = [get_property VLNV [get_bd_cells axi_noc_dbg]]"
+
+
+# ============================================================
+# STEP 2 : CONFIGURE NOC
+#
+# Official AMD debug-hub example:
+#   NUM_CLKS = 2
+#   S00_AXI CATEGORY = ps_pmc
+#   aclk0 -> S00_AXI
+#   aclk1 -> M00_AXI
+# ============================================================
+
+puts ""
+puts "============================================================"
+puts "STEP 2 : CONFIGURE axi_noc_dbg"
+puts "============================================================"
+
+# Check expected interfaces first
+foreach x {
+    S00_AXI
+    M00_AXI
+} {
+    if {[llength \
+        [get_bd_intf_pins -quiet axi_noc_dbg/$x]] == 0} {
+        error "ERROR: axi_noc_dbg/$x missing"
+    } else {
+        puts "FOUND INTF: axi_noc_dbg/$x"
+    }
+}
+
+# Number of clocks
+if {[lsearch -exact \
+    [list_property [get_bd_cells axi_noc_dbg]] \
+    CONFIG.NUM_CLKS] >= 0} {
+
+    set_property CONFIG.NUM_CLKS 2 \
+        [get_bd_cells axi_noc_dbg]
+
+    puts "SET: NUM_CLKS=2"
+
+} else {
+
+    error "ERROR: CONFIG.NUM_CLKS not available on axi_noc_dbg"
+}
+
+# After changing NUM_CLKS, verify clocks exist
+foreach x {
+    aclk0
+    aclk1
+} {
+    if {[llength [get_bd_pins -quiet axi_noc_dbg/$x]] == 0} {
+        error "ERROR: axi_noc_dbg/$x missing after NUM_CLKS=2"
+    } else {
+        puts "FOUND CLK PIN: axi_noc_dbg/$x"
+    }
+}
+
+# Mark input as PS/PMC traffic
+if {[lsearch -exact \
+    [list_property \
+        [get_bd_intf_pins axi_noc_dbg/S00_AXI]] \
+    CONFIG.CATEGORY] >= 0} {
+
+    set_property CONFIG.CATEGORY ps_pmc \
+        [get_bd_intf_pins axi_noc_dbg/S00_AXI]
+
+    puts "SET: S00_AXI CATEGORY=ps_pmc"
+
+} else {
+
+    error "ERROR: CONFIG.CATEGORY missing on S00_AXI"
+}
+
+# Clock associations
+if {[lsearch -exact \
+    [list_property [get_bd_pins axi_noc_dbg/aclk0]] \
+    CONFIG.ASSOCIATED_BUSIF] >= 0} {
+
+    set_property CONFIG.ASSOCIATED_BUSIF S00_AXI \
+        [get_bd_pins axi_noc_dbg/aclk0]
+
+    puts "SET: aclk0 -> S00_AXI"
+
+} else {
+
+    error "ERROR: ASSOCIATED_BUSIF missing on aclk0"
+}
+
+if {[lsearch -exact \
+    [list_property [get_bd_pins axi_noc_dbg/aclk1]] \
+    CONFIG.ASSOCIATED_BUSIF] >= 0} {
+
+    set_property CONFIG.ASSOCIATED_BUSIF M00_AXI \
+        [get_bd_pins axi_noc_dbg/aclk1]
+
+    puts "SET: aclk1 -> M00_AXI"
+
+} else {
+
+    error "ERROR: ASSOCIATED_BUSIF missing on aclk1"
+}
+
+
+# ============================================================
+# STEP 3 : CONNECT PMC -> NOC -> DEBUG HUB
+# ============================================================
+
+puts ""
+puts "============================================================"
+puts "STEP 3 : CONNECT AXI PATH"
+puts "============================================================"
+
+connect_bd_intf_net \
+    [get_bd_intf_pins versal_cips_0/PMC_NOC_AXI_0] \
+    [get_bd_intf_pins axi_noc_dbg/S00_AXI]
+
+puts "CONNECTED:"
+puts "PMC_NOC_AXI_0 -> axi_noc_dbg/S00_AXI"
+
+connect_bd_intf_net \
+    [get_bd_intf_pins axi_noc_dbg/M00_AXI] \
+    [get_bd_intf_pins axi_dbg_hub_0/S_AXI]
+
+puts "CONNECTED:"
+puts "axi_noc_dbg/M00_AXI -> axi_dbg_hub_0/S_AXI"
+
+
+# ============================================================
+# STEP 4 : CONNECT CLOCKS
+# ============================================================
+
+puts ""
+puts "============================================================"
+puts "STEP 4 : CONNECT CLOCKS"
+puts "============================================================"
+
+# PMC side NoC clock
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pmc_axi_noc_axi0_clk] \
+    [get_bd_pins axi_noc_dbg/aclk0]
+
+puts "PMC CLOCK:"
+puts "pmc_axi_noc_axi0_clk -> axi_noc_dbg/aclk0"
+
+
+# Debug side NoC clock
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pl0_ref_clk] \
+    [get_bd_pins axi_noc_dbg/aclk1]
+
+puts "PL CLOCK:"
+puts "pl0_ref_clk -> axi_noc_dbg/aclk1"
+
+
+# Debug Hub clock
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pl0_ref_clk] \
+    [get_bd_pins axi_dbg_hub_0/aclk]
+
+puts "DEBUG HUB CLOCK:"
+puts "pl0_ref_clk -> axi_dbg_hub_0/aclk"
+
+
+# Debug reset controller clock
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pl0_ref_clk] \
+    [get_bd_pins proc_sys_reset_1/slowest_sync_clk]
+
+puts "RESET CLOCK:"
+puts "pl0_ref_clk -> proc_sys_reset_1/slowest_sync_clk"
+
+
+# ============================================================
+# STEP 5 : RESET CONNECTIONS
+# ============================================================
+
+puts ""
+puts "============================================================"
+puts "STEP 5 : CONNECT RESET"
+puts "============================================================"
+
+connect_bd_net \
+    [get_bd_pins versal_cips_0/pl0_resetn] \
+    [get_bd_pins proc_sys_reset_1/ext_reset_in]
+
+puts "pl0_resetn -> proc_sys_reset_1/ext_reset_in"
+
+connect_bd_net \
+    [get_bd_pins proc_sys_reset_1/peripheral_aresetn] \
+    [get_bd_pins axi_dbg_hub_0/aresetn]
+
+puts "proc_sys_reset_1/peripheral_aresetn -> axi_dbg_hub_0/aresetn"
+
+
+# ============================================================
+# STEP 6 : VALIDATE BEFORE ADDRESS ASSIGNMENT
+# ============================================================
+
+puts ""
+puts "============================================================"
+puts "STEP 6 : FIRST VALIDATION"
+puts "============================================================"
+
+validate_bd_design
+
+
+# ============================================================
+# STEP 7 : ADDRESS ASSIGNMENT
+# ============================================================
+
+puts ""
+puts "============================================================"
+puts "STEP 7 : ADDRESS ASSIGNMENT"
+puts "============================================================"
+
+set dbg_seg \
+    [get_bd_addr_segs -quiet \
+        axi_dbg_hub_0/S_AXI_DBG_HUB/Mem0]
+
+if {[llength $dbg_seg] == 0} {
+
+    puts "Existing address segments:"
+    get_bd_addr_segs -of_objects \
+        [get_bd_cells axi_dbg_hub_0]
+
+    error "ERROR: Debug Hub Mem0 segment not found"
+
+}
+
+if {[llength \
+    [get_bd_addr_spaces -quiet versal_cips_0/DATA_PMC]] == 0} {
+
+    error "ERROR: versal_cips_0/DATA_PMC address space not found"
+}
+
+assign_bd_address \
+    -target_address_space \
+        /versal_cips_0/DATA_PMC \
+    $dbg_seg \
+    -force
+
+puts "ADDRESS ASSIGNED:"
+puts "axi_dbg_hub_0 -> versal_cips_0/DATA_PMC"
+
+
+# ============================================================
+# STEP 8 : FINAL VALIDATE + SAVE
+# ============================================================
+
+puts ""
+puts "============================================================"
+puts "STEP 8 : FINAL VALIDATION"
+puts "============================================================"
+
+validate_bd_design
+
+save_bd_design
+
+puts "BD SAVED"
+
+
+# ============================================================
+# STEP 9 : PRINT ACTUAL CONNECTIONS
+# ============================================================
+
+puts ""
+puts "============================================================"
+puts "STEP 9 : CONNECTION CHECK"
+puts "============================================================"
+
+puts ""
+puts "--- PMC_NOC_AXI_0 ---"
+puts [get_bd_intf_nets -of_objects \
+    [get_bd_intf_pins versal_cips_0/PMC_NOC_AXI_0]]
+
+puts ""
+puts "--- Debug Hub S_AXI ---"
+puts [get_bd_intf_nets -of_objects \
+    [get_bd_intf_pins axi_dbg_hub_0/S_AXI]]
+
+puts ""
+puts "--- axi_noc_dbg/aclk0 ---"
+puts [get_bd_nets -of_objects \
+    [get_bd_pins axi_noc_dbg/aclk0]]
+
+puts ""
+puts "--- axi_noc_dbg/aclk1 ---"
+puts [get_bd_nets -of_objects \
+    [get_bd_pins axi_noc_dbg/aclk1]]
+
+puts ""
+puts "--- Debug Hub aclk ---"
+puts [get_bd_nets -of_objects \
+    [get_bd_pins axi_dbg_hub_0/aclk]]
+
+puts ""
+puts "--- proc_sys_reset_1 slowest_sync_clk ---"
+puts [get_bd_nets -of_objects \
+    [get_bd_pins proc_sys_reset_1/slowest_sync_clk]]
+
+puts ""
+puts "--- Debug Hub aresetn ---"
+puts [get_bd_nets -of_objects \
+    [get_bd_pins axi_dbg_hub_0/aresetn]]
+
+puts ""
+puts "============================================================"
+puts "DEBUG HUB PATH COMPLETE"
+puts "============================================================"
