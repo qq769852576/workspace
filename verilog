@@ -1,22 +1,16 @@
-puts "===== IMPLEMENTED DEBUG CORES ====="
-get_debug_cores
+puts "===== HARDWARE ILAs ====="
 
-puts "===== FRONTEND ILA CELL ====="
-get_cells -hier -filter {NAME =~ *ila_frontend_wr_inst*}
+foreach h [get_hw_ilas -of [current_hw_device]] {
+    puts ""
+    puts "HW ILA = $h"
+    puts "INSTANCE_NAME = [get_property INSTANCE_NAME $h]"
+}
 
-puts "===== FRONTEND ILA CLOCK PINS ====="
-get_pins -hier -filter {NAME =~ *ila_frontend_wr_inst*/*clk*}
+puts ""
+puts "===== HARDWARE VIOs ====="
 
-set fclk [lindex \
-    [get_pins -hier -filter {NAME =~ *ila_frontend_wr_inst*/*clk*}] 0]
-
-puts "FRONTEND ILA CLK PIN = $fclk"
-
-puts "NET:"
-get_nets -of_objects $fclk
-
-puts "CLOCK:"
-get_clocks -of_objects $fclk
-
-puts "SOURCE:"
-all_fanin -flat -startpoints_only -to $fclk
+foreach v [get_hw_vios -of [current_hw_device]] {
+    puts ""
+    puts "HW VIO = $v"
+    report_property $v
+}
