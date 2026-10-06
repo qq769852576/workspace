@@ -1,13 +1,9 @@
-set hub_clk_pin \
-    [lindex [get_pins -hier -filter {NAME =~ *dbg_hub*/*aclk*}] 0]
+set hub_rst [get_pins design_1_wrapper/design_1_i/axi_dbg_hub_0/aresetn]
 
-puts "Selected pin = $hub_clk_pin"
+get_nets -of_objects $hub_rst
 
-puts "NET:"
-get_nets -of_objects $hub_clk_pin
+all_fanin -flat -startpoints_only -to $hub_rst
 
-puts "CLOCK:"
-get_clocks -of_objects $hub_clk_pin
 
-puts "SOURCE:"
-all_fanin -flat -startpoints_only -to $hub_clk_pin
+all_fanin -flat -startpoints_only \
+    -to [get_pins -hier *proc_sys_reset_1*/slowest_sync_clk]
