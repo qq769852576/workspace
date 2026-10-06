@@ -1,12 +1,19 @@
-puts "===== 1. PMC SPACE MAPPED SEGMENTS ====="
+puts ""
+puts "===== 2. DEBUG HUB MASTER MAPPING ====="
 
-set pmc_space \
-    [get_bd_addr_spaces /versal_cips_0/PMC_NOC_AXI_0]
+set dbg_slave \
+    [get_bd_addr_segs /axi_dbg_hub_0/S_AXI_DBG_HUB/Mem0]
 
-set pmc_segs \
-    [get_bd_addr_segs -of_objects $pmc_space]
+set dbg_master \
+    [get_bd_addr_segs -addressing -of_objects $dbg_slave]
 
-foreach s $pmc_segs {
+puts "Slave segment:"
+puts "  $dbg_slave"
+
+puts ""
+puts "Master segment(s):"
+
+foreach s $dbg_master {
     puts "SEG = $s"
     puts "  OFFSET = [get_property OFFSET $s]"
     puts "  RANGE  = [get_property RANGE $s]"
