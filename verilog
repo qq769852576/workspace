@@ -1,9 +1,9 @@
-report_property [get_debug_cores design_1_wrapper/design_1_i/axi_dbg_hub_0]
+set axis_if \
+    [get_cells -hier -filter \
+    {NAME =~ *axi_dbg_hub_0*/dbg_core_axis_intf*_inst}]
 
-set dev [current_hw_device]
+puts "Debug Hub AXIS interface count = [llength $axis_if]"
 
-set_property PROBES.FILE \
-    {D:/pdi_backup/LP6_bender_latest.ltx} \
-    $dev
-
-refresh_hw_device $dev
+foreach c $axis_if {
+    puts $c
+}
