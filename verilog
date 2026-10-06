@@ -1,9 +1,50 @@
-set axis_if \
-    [get_cells -hier -filter \
-    {NAME =~ *axi_dbg_hub_0*/dbg_core_axis_intf*_inst}]
+puts "============================================================"
+puts "DEBUG CORE ACLK / ARESETN CHECK"
+puts "============================================================"
 
-puts "Debug Hub AXIS interface count = [llength $axis_if]"
+set cores {
+    i1/frontend/ila_frontend_wr_inst
+    i1/your_ila_data
+    i1/hand_mode_inst/vio_handen
+    i1/your_ila_pcie_data
+    design_1_wrapper/your_pcie_final_ila
+    design_1_wrapper/dma1_qdma_app_i/axi_st_module_i/ST_c2h_0/ila_c2h_monitor
+}
 
-foreach c $axis_if {
-    puts $c
+foreach c $cores {
+
+    puts ""
+    puts "=================================================="
+    puts "CORE = $c"
+    puts "=================================================="
+
+    set aclk [get_pins -quiet $c/aclk]
+    set arst [get_pins -quiet $c/aresetn]
+
+    if {[llength $aclk]} {
+
+        puts "ACLK NET:"
+        puts [get_nets -quiet -of_objects $aclk]
+
+        puts "ACLK CLOCK:"
+        puts [get_clocks -quiet -of_objects $aclk]
+
+        puts "ACLK SOURCE:"
+        puts [all_fanin -flat -startpoints_only -to $aclk]
+
+    } else {
+        puts "ACLK = NOT FOUND"
+    }
+
+    if {[llength $arst]} {
+
+        puts "ARESETN NET:"
+        puts [get_nets -quiet -of_objects $arst]
+
+        puts "ARESETN SOURCE:"
+        puts [all_fanin -flat -startpoints_only -to $arst]
+
+    } else {
+        puts "ARESETN = NOT FOUND"
+    }
 }
