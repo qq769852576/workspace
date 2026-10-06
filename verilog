@@ -1,8 +1,13 @@
-foreach s [get_bd_addr_segs -addressed \
-    -of_objects \
-    [get_bd_addr_spaces /versal_cips_0/PMC_NOC_AXI_0]] {
+puts "===== 1. PMC SPACE MAPPED SEGMENTS ====="
 
-    puts "$s"
-    puts "OFFSET=[get_property OFFSET $s]"
-    puts "RANGE =[get_property RANGE $s]"
+set pmc_space \
+    [get_bd_addr_spaces /versal_cips_0/PMC_NOC_AXI_0]
+
+set pmc_segs \
+    [get_bd_addr_segs -of_objects $pmc_space]
+
+foreach s $pmc_segs {
+    puts "SEG = $s"
+    puts "  OFFSET = [get_property OFFSET $s]"
+    puts "  RANGE  = [get_property RANGE $s]"
 }
