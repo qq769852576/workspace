@@ -1,3 +1,15 @@
+get_debug_cores
+get_debug_cores dbg_hub
+
+get_property C_CLK_INPUT_FREQ_HZ [get_debug_cores dbg_hub]
+get_property C_USER_SCAN_CHAIN    [get_debug_cores dbg_hub]
+get_property C_ENABLE_CLK_DIVIDER [get_debug_cores dbg_hub]
+
+get_debug_ports dbg_hub/clk
+report_property [get_debug_ports dbg_hub/clk]
+
+get_nets -hier -filter {NAME =~ *clk_pl_0*}
+
 set pll [get_cells u_bypass/u_xpio_drv/xpio/inst/clk_scheme_inst/xpll_pll0_inst]
 
 set clkin [get_pins $pll/CLKIN]
