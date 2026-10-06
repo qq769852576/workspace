@@ -1,39 +1,15 @@
-puts "============================================================"
-puts "DEBUG CORE SAMPLE CLOCK CHECK"
-puts "============================================================"
+set pll \
+[get_cells u_bypass/u_xpio_drv/xpio/inst/clk_scheme_inst/xpll_pll0_inst]
 
-set cores {
-    i1/frontend/ila_frontend_wr_inst
-    i1/your_ila_data
-    i1/hand_mode_inst/vio_handen
-    i1/your_ila_pcie_data
-    design_1_wrapper/your_pcie_final_ila
-    design_1_wrapper/dma1_qdma_app_i/axi_st_module_i/ST_c2h_0/ila_c2h_monitor
-}
+foreach p [get_pins -of_objects $pll] {
 
-foreach c $cores {
+    set leaf [lindex [split $p "/"] end]
 
-    puts ""
-    puts "=================================================="
-    puts "CORE = $c"
-    puts "=================================================="
+    if {[regexp -nocase {(rst|reset|lock|clkin|clkout)} $leaf]} {
 
-    set p [get_pins -quiet ${c}/clk]
-
-    if {[llength $p] == 0} {
-        puts "SAMPLE CLK PIN = NOT FOUND"
-        continue
+        puts ""
+        puts "PIN = $p"
+        puts "DIR = [get_property DIRECTION $p]"
+        puts "NET = [get_nets -quiet -of_objects $p]"
     }
-
-    puts "SAMPLE CLK PIN:"
-    puts $p
-
-    puts "SAMPLE CLK NET:"
-    puts [get_nets -quiet -of_objects $p]
-
-    puts "SAMPLE CLOCK OBJECT:"
-    puts [get_clocks -quiet -of_objects $p]
-
-    puts "SAMPLE CLK SOURCE:"
-    puts [all_fanin -flat -startpoints_only -to $p]
 }
