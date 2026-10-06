@@ -1,3 +1,13 @@
+set pll [get_cells u_bypass/u_xpio_drv/xpio/inst/clk_scheme_inst/xpll_pll0_inst]
+
+set clkin [get_pins $pll/CLKIN]
+
+puts "XPLL CLKIN net:"
+get_nets -of_objects $clkin
+
+puts "XPLL CLKIN source:"
+all_fanin -flat -startpoints_only -to $clkin
+
 ila_frontend_wr ila_frontend_wr_inst (
     .clk(clk),
 
