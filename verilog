@@ -1,3 +1,8 @@
-puts [get_property OFFSET \
-    [get_bd_addr_segs \
-        /axi_dbg_hub_0/S_AXI_DBG_HUB/Mem0]]
+foreach s [get_bd_addr_segs -addressed \
+    -of_objects \
+    [get_bd_addr_spaces /versal_cips_0/PMC_NOC_AXI_0]] {
+
+    puts "$s"
+    puts "OFFSET=[get_property OFFSET $s]"
+    puts "RANGE =[get_property RANGE $s]"
+}
