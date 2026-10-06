@@ -150,3 +150,16 @@ foreach p [list_property [get_ips advanced_io_wizard_0]] {
 }
 
 report_io -ports [get_ports {sys_clk_p sys_clk_n}]
+
+foreach p [lsort [list_property [get_ips advanced_io_wizard_0]]] {
+    if {[string match -nocase "*BANK*" $p]} {
+        puts "$p = [get_property $p [get_ips advanced_io_wizard_0]]"
+    }
+}
+
+foreach p [lsort [list_property [get_ips advanced_io_wizard_0]]] {
+    if {[string match -nocase "*PIN*" $p] || \
+        [string match -nocase "*LOC*" $p]} {
+        puts "$p = [get_property $p [get_ips advanced_io_wizard_0]]"
+    }
+}
