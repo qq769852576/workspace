@@ -1,12 +1,2 @@
-set plbuf [get_cells {design_1_wrapper/design_1_i/versal_cips_0/inst/pspmc_0/inst/buffer_pl_clk_0.PL_CLK_0_BUFG}]
-
-get_pins $plbuf
-
-get_nets -of_objects [get_pins $plbuf/O]
-
-get_clocks -of_objects [get_pins $plbuf/O]
-
-get_nets -of_objects [get_pins proc_sys_reset/slowest_sync_clk]
-
-all_fanin -flat -startpoints_only \
-    -to [get_pins proc_sys_reset/slowest_sync_clk]
+get_bd_pins -of_objects [get_bd_cells versal_cips_0]
+get_bd_intf_pins -of_objects [get_bd_cells versal_cips_0]
