@@ -1,6 +1,8 @@
-all_fanin -flat -startpoints_only -to $drv
-
-set srcs [all_fanin -flat -startpoints_only -to $drv]
-foreach s $srcs {
-    puts "$s    CELL=[get_cells -quiet -of_objects $s]"
+$buf = New-Object byte[] 1024
+for ($i=0; $i -lt 1024; $i++) {
+    $buf[$i] = 0xA5
 }
+[System.IO.File]::WriteAllBytes(
+    "D:\qdma_driver\cpm5-phase2-windows-x64-4\binaries\bin\a5_1KB.bin",
+    $buf
+)
