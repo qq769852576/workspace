@@ -1,5 +1,10 @@
-ila_lp6_status u_ila_lp6_status (
-    .clk    (user_clk),
-    .probe0 (pll_locked_dbg),
-    .probe1 (sys_rstn)
-);
+set n [get_nets {design_1_wrapper/m_axis_h2c_tdata[0]}]
+
+puts "NET = $n"
+
+puts "DRIVER:"
+set drv [get_pins -of_objects $n -filter {DIRECTION == OUT}]
+puts $drv
+
+puts "DRIVER CELL:"
+get_cells -of_objects $drv
