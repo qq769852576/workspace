@@ -1,14 +1,5 @@
-puts "IS_RST_INVERTED = [get_property IS_RST_INVERTED $pll]"
-
-report_timing \
-    -from [get_ports sys_rstn] \
-    -to [get_pins $pll/RST] \
-    -max_paths 1 \
-    -path_type full
-
-puts "===== XPLL RST CONE ====="
-all_fanin -flat -to [get_pins $pll/RST]
-
-get_property IS_RST_INVERTED $pll
-
-report_timing -from [get_ports sys_rstn] -to [get_pins $pll/RST] -max_paths 1 -path_type full
+ila_lp6_status u_ila_lp6_status (
+    .clk    (user_clk),
+    .probe0 (pll_locked_dbg),
+    .probe1 (sys_rstn)
+);
