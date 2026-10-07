@@ -1,10 +1,6 @@
-set n [get_nets {design_1_wrapper/m_axis_h2c_tdata[0]}]
+all_fanin -flat -startpoints_only -to $drv
 
-puts "NET = $n"
-
-puts "DRIVER:"
-set drv [get_pins -of_objects $n -filter {DIRECTION == OUT}]
-puts $drv
-
-puts "DRIVER CELL:"
-get_cells -of_objects $drv
+set srcs [all_fanin -flat -startpoints_only -to $drv]
+foreach s $srcs {
+    puts "$s    CELL=[get_cells -quiet -of_objects $s]"
+}
