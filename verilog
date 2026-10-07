@@ -1,8 +1,376 @@
-$buf = New-Object byte[] 1024
-for ($i=0; $i -lt 1024; $i++) {
-    $buf[$i] = 0xA5
-}
-[System.IO.File]::WriteAllBytes(
-    "D:\qdma_driver\cpm5-phase2-windows-x64-4\binaries\bin\a5_1KB.bin",
-    $buf
-)
+这几天我在你发我的 Vivado 工程上继续做了 Bender + QDMA 上板调试，目前主要修改和定位结果如下。
+
+### 1. Debug Hub 已重新处理
+
+原来上板后 Hardware Manager 报：
+
+- `JTAG node is not accessible`
+- `Failed to setup debug cores`
+- `Failed to communicate with debug hub`
+
+定位后发现原 Debug Hub 的工作时钟依赖 LP6 XPLL 输出，一旦 XPLL 没起来，整个 Debug Hub 也无法工作。
+
+现在改成了独立 Debug Hub：
+
+```text
+CIPS PMC_NOC_AXI_0
+    ↓
+axi_noc_dbg
+    ↓
+axi_dbg_hub_0
+```
+
+Debug Hub / NoC 使用 CIPS 的 PL 时钟，不再依赖 LP6 XPLL。
+
+目前 Hardware Manager 已经可以正常识别 ILA/VIO。
+
+---
+
+### 2. LP6 XPIO / XPLL 时钟链已经跑通
+
+当前 LP6 reference clock：
+
+```text
+sys_clk_p/n
+AU11 / AV11
+200 MHz
+Bank702
+    ↓
+IBUFDS
+    ↓
+BUFG
+    ↓
+Advanced IO Wizard bank0_pll_clkin
+    ↓
+XPLL_X6Y0
+    ↓
+CLKOUT0 / CLKOUT1
+```
+
+Implementation 可以通过，XPLL 固定在：
+
+```text
+XPLL_X6Y0
+```
+
+之前 LP6 域的 ILA 全部看不到，而 CIPS 时钟域的 ILA 可以看到。最终定位为 XPLL 实际没有启动。
+
+---
+
+### 3. 找到了 XPLL 不启动的真正原因
+
+原工程：
+
+```text
+sys_rstn → J33
+```
+
+但是检查 schematic 后发现：
+
+```text
+J33 = HB15_P
+板级是 X / NC
+```
+
+也就是说 `sys_rstn` 实际接在一个没有板级驱动的管脚上。
+
+上板 ILA 实测一开始是：
+
+```text
+sys_rstn_IBUF = 0
+pll_locked_dbg = 0
+```
+
+而 XPLL reset 逻辑是：
+
+```text
+XPLL_RST = ~sys_rstn
+```
+
+因此 XPLL 一直被保持在 reset 状态。
+
+我临时在 XDC 中增加：
+
+```tcl
+set_property PULLTYPE PULLUP [get_ports sys_rstn]
+```
+
+重新生成 PDI 后，上板 Immediate Trigger：
+
+```text
+sys_rstn_IBUF  = 1
+pll_locked_dbg = 1
+```
+
+所以目前：
+
+```text
+200 MHz ref clock OK
+XPLL OK
+LP6 时钟域已经真正工作
+```
+
+正式版本建议后面不要长期用 NC 管脚 + 内部 PULLUP，最好换成真实 board reset，或者使用 CIPS 的 `pl0_resetn`。
+
+---
+
+### 4. hand_mode 已经关闭
+
+`mc_bender` 中 frontend 的 H2C 数据选择逻辑是：
+
+```verilog
+.h2c_tdata_0 (hand_en ? m_axis_h2c_tdata_h  : m_axis_h2c_tdata_0),
+.h2c_tlast_0 (hand_en ? m_axis_h2c_tlast_h  : m_axis_h2c_tlast_0),
+.h2c_tvalid_0(hand_en ? m_axis_h2c_tvalid_h : m_axis_h2c_tvalid_0),
+.h2c_tkeep_0 (hand_en ? m_axis_h2c_tkeep_h  : m_axis_h2c_tkeep_0)
+```
+
+也就是说：
+
+```text
+hand_en = 1 → hand_mode 数据
+hand_en = 0 → QDMA H2C 数据
+```
+
+
+
+我已经通过 Hardware Manager 里的：
+
+```text
+hand_mode_inst/vio_handen
+```
+
+把：
+
+```text
+hand_en = 0
+```
+
+所以现在 Bender frontend 已经明确走 QDMA 路径。
+
+---
+
+### 5. 当前真正剩下的问题：QDMA H2C 输出变成了 counter
+
+目前 ILA 看到：
+
+```text
+design_1_wrapper/m_axis_h2c_tdata[511:0]
+```
+
+输出一直是：
+
+```text
+Beat 0:
+001f001e001d...000200010000
+
+Beat 1:
+003f003e003d...002200210020
+
+Beat 2:
+005f005e005d...004200410040
+```
+
+也就是标准：
+
+```text
+16-bit counter
+0x0000, 0x0001, 0x0002 ...
+```
+
+每个 512-bit beat 正好 32 个 16-bit counter。
+
+同时：
+
+```text
+i1/frontend/imem_wr_data[63:0]
+```
+
+看到：
+
+```text
+0003000200010000
+0023002200210020
+0043004200410040
+```
+
+这和上面的 QDMA H2C 低位完全一致。
+
+因此可以确认：
+
+```text
+QDMA m_axis_h2c_tdata
+      ↓
+clock converter
+      ↓
+frontend
+      ↓
+imem_wr_data
+```
+
+这一段已经正常。
+
+不是 frontend 自己重新生成的数据。
+
+---
+
+### 6. counter 也不是 Bender hand_mode 产生的
+
+我继续从 implemented design 反查：
+
+```tcl
+set n [get_nets {design_1_wrapper/m_axis_h2c_tdata[0]}]
+set drv [get_pins -of_objects $n -filter {DIRECTION == OUT}]
+all_fanin -flat -startpoints_only -to $drv
+```
+
+最终追到：
+
+```text
+design_1_wrapper/design_1_i/
+versal_cips_0/inst/cpm_0/inst/qdma_1_wrapper_i/
+AXIST.u_demux/u_h2c_axis_desegmenter/u_out_fifo/...
+```
+
+也就是说现在的：
+
+```text
+0000,0001,0002...
+```
+
+已经是 **CPM5/QDMA H2C FIFO 输出的数据**。
+
+所以 FPGA 侧：
+
+```text
+Bender hand_mode
+frontend
+clock converter
+```
+
+都不是这个 counter 的来源。
+
+---
+
+### 7. send.exe 也做过排查
+
+我用全 `0xA5` 的 1 KB 文件测试：
+
+```text
+A5 A5 A5 A5 ...
+```
+
+但是 ILA 里 `m_axis_h2c_tdata` 仍然是：
+
+```text
+0000,0001,0002...
+```
+
+send.exe 本身只是包装 `dma-arw`：
+
+```text
+dma-arw
+qdma09000 mode 0 queue_st_0
+write -b -l 1024 -f xxx.bin
+```
+
+没有看到 send.exe 自己生成 counter 的代码。
+
+而且之前我们单独测试 QDMA 时，这个 send.exe 确实可以把 bin 文件原始内容发送到：
+
+```text
+m_axis_h2c_tdata[511:0]
+```
+
+所以我目前判断：**你后面发给我的这版 Vivado/QDMA 工程里，QDMA H2C 相关配置或测试逻辑应该被改过，现在又走到了 counter generator/test pattern 路径。**
+
+这部分麻烦你继续看一下。
+
+重点目标是恢复：
+
+```text
+Host bin file
+    ↓
+dma-arw / QDMA driver
+    ↓
+CPM5 QDMA
+    ↓
+m_axis_h2c_tdata = bin真实内容
+    ↓
+Bender frontend
+```
+
+而不是当前：
+
+```text
+CPM5 QDMA
+    ↓
+0000,0001,0002... counter
+```
+
+---
+
+### 8. Bender 代码里另外还有两个地方后面需要处理
+
+当前 H2C QDMA 输入是：
+
+```verilog
+input [511:0] user_h2c_tdata;
+```
+
+但进入 clock converter 时只用了：
+
+```verilog
+.s_axis_tdata(user_h2c_tdata[255:0])
+```
+
+也就是目前实际上只吃了低 256 bit。
+
+后面建议：
+
+```text
+QDMA 512 bit
+    ↓
+AXIS 512→256 width converter
+    ↓
+clock converter
+    ↓
+frontend 256 bit
+```
+
+或者直接把 QDMA user stream 统一成 256 bit。
+
+另外目前还有：
+
+```verilog
+assign user_h2c_tdata[511:256] = 'd0;
+```
+
+但 `user_h2c_tdata` 本身是 input，这句后面也建议删掉。
+
+---
+
+### 当前状态总结
+
+已经确认正常：
+
+```text
+PDI 烧录                 OK
+Debug Hub                OK
+Hardware Manager ILA/VIO OK
+LP6 200 MHz ref clock    OK
+XPLL lock                OK
+LP6/frontend clock       OK
+hand_en = 0              OK
+QDMA → frontend链路      OK
+frontend能收到H2C数据     OK
+```
+
+目前唯一挡住继续 Bender bring-up 的主要问题：
+
+```text
+QDMA H2C 当前输出的是 counter pattern，
+不是 send.exe 输入 bin 文件的原始内容。
+```
+
+之前你那版 QDMA 测试工程这里是正常的，所以麻烦重点帮我对比一下这版工程中 CPM5/QDMA 的 H2C test/data-generator/loopback 相关配置或逻辑，看哪里把真实 H2C 数据切成 counter 了。
