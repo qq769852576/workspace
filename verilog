@@ -1,14 +1,28 @@
-Get-ChildItem D:\qdma_driver -Recurse -Include *.cpp,*.c,*.h,*.hpp -ErrorAction SilentlyContinue |
-Select-String -Pattern "Data generator reported error|data generator|queue_st|dma-arw|dma_arw"
+$raw = [System.IO.File]::ReadAllBytes((Resolve-Path .\dma-arw.exe))
 
-Get-ChildItem D:\qdma_driver -Recurse -File -ErrorAction SilentlyContinue |
-Where-Object {
-    $_.Name -match "dma.*arw|arw|async"
-} |
-Select-Object FullName
+$ascii   = [System.Text.Encoding]::ASCII.GetString($raw)
+$unicode = [System.Text.Encoding]::Unicode.GetString($raw)
 
-Get-Item .\dma-arw.exe |
-Format-List FullName,Length,LastWriteTime,
-@{N="FileVersion";E={$_.VersionInfo.FileVersion}},
-@{N="ProductVersion";E={$_.VersionInfo.ProductVersion}}
+"ASCII match  = " + $ascii.Contains("Data generator reported error")
+"Unicode match = " + $unicode.Contains("Data generator reported error")
+
+
+Get-Item .\dma-arw.exe, .\dma-arw.ex_ |
+Select-Object Name,Length,LastWriteTime
+
 Get-FileHash .\dma-arw.exe -Algorithm SHA256
+Get-FileHash .\dma-arw.ex_ -Algorithm SHA256
+
+
+$b = [System.IO.File]::ReadAllBytes((Resolve-Path .\dma-arw.ex_))
+"{0:X2} {1:X2} {2:X2} {3:X2}" -f $b[0],$b[1],$b[2],$b[3]
+
+mkdir D:\qdma_arw_check -Force
+
+expand.exe .\dma-arw.ex_ D:\qdma_arw_check\dma-arw.exe
+
+Get-FileHash D:\qdma_arw_check\dma-arw.exe -Algorithm SHA256
+
+.\dma-arw.exe qdma09000 mode 0 queue_st_0 write -l 16 `
+0xA5 0xA5 0xA5 0xA5 0xA5 0xA5 0xA5 0xA5 `
+0xA5 0xA5 0xA5 0xA5 0xA5 0xA5 0xA5 0xA5
