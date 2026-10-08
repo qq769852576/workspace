@@ -1,8 +1,6 @@
-$buf = [byte[]]::new(4096)
-for ($i=0; $i -lt 4096; $i++) {
-    $buf[$i] = 0xA5
-}
-[System.IO.File]::WriteAllBytes(".\a5_4KB.bin", $buf)
+.\dma-arw.exe qdma09000 mode 0 queue_st_0 write -b -l 4096
 
+.\dma-ctl.exe qdma09000 queue dump qid 0 ctx type h2c
 
-.\raw_h2c_v5.exe 0 .\a5_4KB.bin 10000
+.\dma-ctl.exe qdma09000 reg dump |
+Select-String -Pattern "ERR|ERROR|H2C|GLBL|PCI"
