@@ -1,2 +1,14 @@
-Get-ChildItem -Recurse -Include *.cpp,*.c,*.h,*.hpp |
-Select-String -Pattern "Data generator reported error|queue_st|write -b|data generator"
+Get-ChildItem D:\qdma_driver -Recurse -Include *.cpp,*.c,*.h,*.hpp -ErrorAction SilentlyContinue |
+Select-String -Pattern "Data generator reported error|data generator|queue_st|dma-arw|dma_arw"
+
+Get-ChildItem D:\qdma_driver -Recurse -File -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.Name -match "dma.*arw|arw|async"
+} |
+Select-Object FullName
+
+Get-Item .\dma-arw.exe |
+Format-List FullName,Length,LastWriteTime,
+@{N="FileVersion";E={$_.VersionInfo.FileVersion}},
+@{N="ProductVersion";E={$_.VersionInfo.ProductVersion}}
+Get-FileHash .\dma-arw.exe -Algorithm SHA256
