@@ -1,1 +1,8 @@
-pnputil /enum-devices /instanceid "PCI\VEN_10EE&DEV_B03F&SUBSYS_000710EE&REV_00\6&323AB3E5&0&00080038" /interfaces /properties
+$buf = [byte[]]::new(4096)
+for ($i=0; $i -lt 4096; $i++) {
+    $buf[$i] = 0xA5
+}
+[System.IO.File]::WriteAllBytes(".\a5_4KB.bin", $buf)
+
+
+.\raw_h2c_v5.exe 0 .\a5_4KB.bin 10000
