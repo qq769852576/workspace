@@ -1,13 +1,1 @@
-Get-PnpDevice |
-Where-Object {
-    $_.FriendlyName -match "QDMA|Xilinx|AMD" -or
-    $_.InstanceId -match "VEN_10EE"
-} |
-Format-List Status,Class,FriendlyName,InstanceId
-
-Get-CimInstance Win32_PnPEntity |
-Where-Object {
-    $_.PNPDeviceID -match "VEN_10EE"
-} |
-Select-Object Name,PNPDeviceID
-
+pnputil /enum-devices /instanceid "PCI\VEN_10EE&DEV_B03F&SUBSYS_000710EE&REV_00\6&323AB3E5&0&00080038" /interfaces /properties
