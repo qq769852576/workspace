@@ -1404,3 +1404,357 @@ DDR5 XPI 已经解决“先接受、后拆分、分层保存、按原事务返�
 | 写响应队列与公开 B | 内部早响应入 WRQ，原条件产生 B；[原 WRQ](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/xpi/DWC_ddr_umctl2_xpi_write.sv>)，L2555–2570 | 本地 WRQ 保留，外层增加公开完成资格；[保留 WRQ](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_write.sv>)，L2806–2809；[E25](#rtl-evidence-index) 及本章第 5.4.5 节 |
 
 表中相对路径直接指向本次所选真实文件，行号单独列示；宏、参数与运行模式仍按本章第 5.6 节和第 4.7 节解释。关键需求仍采用第 2.7 节原编号，未增加或改写需求。后续 PA、HIF、IH 模块评审可在相同的接受与保持事件上继续展开，本章不提前规定它们的内部实现。
+
+
+<a id="pa-detailed-design"></a>
+# 第6章 PA 详细设计
+
+## 6.1 PA 的职责与设计目标
+
+XPI 把 Host 请求整理为内部访问后，MC 还需要决定哪些访问可以继续向后交付。读、写访问会竞争入口与后端容量；有请求等待，也不意味着当前已有足够的资源承接它。PA 在这里负责前端请求选择：结合优先级、资源额度和反压，从当前可参与竞争的请求中产生 Grant。
+
+第 3.1 节已说明原 DDR5 的整体连接，第 4 章说明候选的总体分工。本章进一步区分选择与交付：PA 的 Grant 指明被选来源；HIF_CMD 据此选择命令字段；IH 在自己的输入条件满足时接收该命令。IH 向 TE 交付、PAS 调度 DRAM 命令以及 PHY 传输又是后续事件。PA 不承担 ACT/PRE/READ/WRITE 的完整器件时序调度。
+
+即使本次生成配置只有一个 AXI 端口，读和写仍会竞争，读请求也有不同优先类别。因此，单端口配置仍需要资源判断和读写选择；但不能据此推定多端口公平性已经得到验证。
+
+```mermaid
+flowchart TB
+    X["XPI：保持待交付读写访问"]
+    subgraph AT["arb_top：前端集成范围"]
+        Q["候选新增外围资格检查"]
+        P["PA：额度、优先级、读写选择与 Grant"]
+        H["HIF_CMD：按同一 Grant 选择命令字段"]
+    end
+    I["IH：输入缓冲、地址解释与后端交付"]
+    T["TE / PAS 等后端：资源管理与命令调度"]
+    X -->|"请求有效与旁带资格"| Q
+    Q -->|"可竞争请求 / 写侧反压"| P
+    X -->|"地址、Token、长度及身份字段"| H
+    P -->|"读写 Grant"| H
+    P -->|"内部请求 Ready"| X
+    H -->|"被选命令"| I
+    I -->|"后端请求"| T
+    I -.->|"容量 Credit / 命令 Stall，经顶层互连"| P
+```
+
+图中的实线表示本章讨论的接口方向，虚线表示资源与反压反馈；不表示所有数据都依次穿过这些框。PA 选择来源，命令字段从 XPI 到 HIF_CMD；写数据、读返回仍沿第 3 章和第 5 章说明的独立路径流动。IH 的反馈经顶层互连进入 PA 所用的 HIF 侧端口，并非 HIF_CMD 自行生成容量。
+
+| 本章区分的事件 | 可以据此确认什么 | 后续仍需满足什么 |
+| --- | --- | --- |
+| 请求具备资格 | 当前请求可以进入相应选择逻辑 | 资源类别、优先级和读写方向仍要参与选择 |
+| PA 产生 Grant | 本周期选中哪个来源，XPI 与 HIF_CMD 应使用同一选择 | IH 的实际输入接收条件 |
+| IH 输入 FIFO 写入 | 该命令已进入 IH 缓冲 | 队头消费、TE 接受及可能的重试 |
+| 后端接受与调度 | 相应后端对象进入下一阶段 | 器件侧执行与上游完成响应按各自合同判断 |
+
+RTL 依据：原 PA 顶层的端口预处理与仲裁连接见 [DDR5 PA 顶层](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa.sv>)，L138–201；候选的 PA 输入与 HIF_CMD 连接见 [候选前端集成](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L3180–3248、3357；容量产生见 [IH Credit 生成](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_core_out_if.sv>)，L219–264、283–319、338–381。同源选择与实际接受分别对应 [REQ-PA-001](#req-pa-001)、[REQ-IH-004](#req-ih-004)。
+
+## 6.2 DDR5 PA 原始设计
+
+### 6.2.1 请求来源与仲裁输入
+
+PA 看见的是 XPI 已经组织好的内部读写访问，不是直接对外部 AW、AR 通道做一次 Host 接收。一个 Host 请求可以形成多个内部访问，每次内部交付均可能重新参与选择。原 arb_top 将 `pa_awvalid`、`pa_arvalid` 接到 PA 请求输入，并把 PA 的选择接回内部 Ready 和 HIF_CMD。
+
+| 输入或控制 | 在 PA 中的用途 | 应保留的边界 |
+| --- | --- | --- |
+| 内部读写请求与端口 mask | 表示有待选访问，并屏蔽当前不允许参与的来源 | 不等于外部 Host 握手，也不携带完整写数据 |
+| 端口优先级、读请求类别、urgent 和超时提示 | 调整优先选择与读写方向判断 | 数值优先级、读类别和紧急提示不是同一字段 |
+| WR、LPR、HPR 等 Credit | 判断相应请求类别是否有可用额度 | 不是 Ready，也不是 DRAM 完成通知 |
+| 页匹配提示、连续服务限制与独占保持 | 控制局部性偏好和连续选择 | 页匹配提示不能代替 PAS 的实际 Bank/Row 时序状态 |
+| 命令 Stall 与其他屏蔽条件 | 阻止本周期对外授权，部分条件也影响内部状态更新 | 必须逐项看极性与作用位置 |
+
+`pa_dual` 内有读 PA、写 PA 和共享预处理逻辑。模块名中的 dual 不等于当前启用了双 PA 配置：本次常量为 `DUAL_PA=0`，采用共享读写方向选择。输入端口 mask 先形成 `xa_rreq_masked/xa_wreq_masked`，之后才与 Credit、优先级和方向资格结合。
+
+依据：[原请求与 Ready 连接](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/arb_top/DWC_ddr_arb_top.sv>)，L2239–2240、2437–2452、2511–2512；[候选保留的读写 PA 组织](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_dual.sv>)，L148–230、238–316、341–464。两版相关常量的对应关系沿用 [PA 原始对照报告](<../phase2/03_pa_comparison.md>)。
+
+### 6.2.2 优先级与 Aging
+
+Aging 用等待计数调整端口的竞争优先级，使持续等待的内部请求有机会进入更高优先级集合。它不是为每笔 Host 事务记录一份绝对等待时间。计数器位于端口处理逻辑，受内部请求、配置和 Stall 条件控制。
+
+原 `pa_port` 在命令不 Stall 时按以下先后关系更新计数器；前面的条件成立，就不再执行后面的条件。
+
+| 条件 | 计数器行为 | 设计含义 |
+| --- | --- | --- |
+| 初始化优先级 | 从配置的端口优先级装入初值，低两位为零 | 建立端口的初始等待权重 |
+| 超时提示有效，或启用的 urgent 有效 | 置零 | 进入 priority0 集合，优先处理 |
+| Aging 关闭 | 置固定值 4 | 保留关闭 Aging 时的确定行为 |
+| 本端口产生 `grant_nxt` | 重新装入初值 | 一次内部选择后重新计算等待 |
+| 仍有供给到本逻辑的请求，且计数未到零 | 减一 | 等待中的请求逐步提高优先级 |
+| 其他情况 | 保持 | 无有效更新事件时不继续计时 |
+
+命令 Stall 时，上述计数更新暂停。只有送到本端口处理逻辑的 masked 请求参与普通递减；若候选外围因身份或 Session 不满足而不发布请求，不能把这段等待自动算作 PA 的 Aging 时间。其他类型的屏蔽也不能一概等同于命令 Stall。
+
+这里有两种容易混淆的“优先级”。一类是 Aging 计数及其导出的端口优先级和 priority0；另一类是请求本身携带的读类别，用来区分 HPR、LPR 资源及相应选择。外部优先级可在 `EXT_PORTPRIO=1` 时参与，当前常量为 0。源码注释说明端口数值越小优先级越高；但本次生成的 `pa_priocomp` 直接给出单端口 mask，不能把这个文件当作已验证的通用多端口比较网络。
+
+依据：[原端口优先级与 Aging](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_port.sv>)，L99–161；[优先级比较的当前生成结果](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_priocomp.sv>)，L21–24、73。候选同名 `pa_port`、`pa_priocomp` 与原文件逐字节一致，沿用了这些机制。
+
+### 6.2.3 Credit 与资源资格
+
+Credit 在这里是 PA 可用于继续授权内部命令的额度。输入的 `hif_*_credit` 表示补入额度的事件，PA 内部另有累计计数，复位后由补入事件建立可用额度。请求有效只说明有工作要做；Credit 可用才说明相应类别还有容量预算；最终 Grant 还受仲裁与 Stall 影响。
+
+| 额度类别 | 限制的请求 | 消耗事件及当前配置说明 |
+| --- | --- | --- |
+| WR | 普通写访问 | 任一写 `grant_nxt` 消耗一个 WR 额度 |
+| LPR | 低优先级读；需要时也供读改写使用 | LPR 读选择或读改写选择触发扣减；读改写不能只看 WR 额度 |
+| HPR | 高优先级读 | 按读类别选中的 HPR 读 `grant_nxt` 扣减 |
+| WRECC 及相关阈值 | 内联 ECC 的附加资源条件 | 源码有条件分支；本次 `M_INLINE_ECC=0`，不作为当前活动资源池描述 |
+
+WR、HPR、LPR 的当前非内联 ECC 分支均以补入与扣减组合更新计数：只补入则加一，只扣减则减一，两者同时发生则保持。Credit 的重建还与 LPR Entry 数量变更控制相关。IH 根据容量、FIFO 占用及后端接受/重试情况形成补入事件，PA 因而无需把后端每个 Entry 的具体编号带入仲裁。
+
+特别要注意，扣减依据是内部的 `grant_nxt`。OPT2 下它与对外 Grant 同步；OPT1 下它可以先于寄存后对外呈现的 Grant。因此，不能把“消耗 Credit”统一写成“IH 已接受”，也不能在新增 Reservation 处再扣一次同一额度。XPI Token、IH Entry 和 PA Credit 分别管理不同对象，不能互相替代。
+
+依据：[原 Credit 输入、扣减与非内联分支](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_preproc.sv>)，L59–62、255–309、330–338、430–464、619–633；[原 IH 容量协调与补入](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_core_out_if.sv>)，L219–264、283–319、338–381。候选 `pa_preproc` 与原文件逐字节一致，新增身份和上下文资格另外叠加，不能假定原 Credit 已经计入候选新增的所有保持槽与身份资源。对应 [REQ-PA-002](#req-pa-002)。
+
+### 6.2.4 读写切换与轮转
+
+读写切换先解决“本次服务读还是写”，轮转再解决相应竞争集合中“选哪个端口”。二者都要尊重额度和屏蔽条件，不能仅按固定交替顺序理解。
+
+当前 `DUAL_PA=0` 的共享状态机按读、写状态和下一状态组织选择。读侧已有合格的 priority0 请求时继续读；否则，在允许切换时可转去服务 priority0 写或其他有额度的写。写侧考虑独占保持、priority0 写、priority0 读以及 HPR 读等条件。没有当前方向的可用额度时，可在切换允许且另一侧有合格请求的条件下转向。读写使能由下一状态导出，使本次方向判断参与当前请求资格。
+
+页匹配逻辑允许在一定限额内偏向连续的相关访问，并在竞争、额度或限额条件变化时放行切换。它利用前端提示，而不在 PA 中重新构建 DRAM 开行状态。独占请求则可通过保持控制延续当前选择。两者都说明轮转不是脱离上下文的逐拍端口轮询。
+
+端口轮转同时保留上一批未服务请求，并使用轮转指针决定优先扫描起点。请求集合中若有指针之后的请求，先从那里选择；否则回到集合起点。有效的 `grant_nxt` 在对应更新条件满足时推进指针，已保存的 Grant 与保持控制还可影响选择。没有 Grant 时，并不是每过一个时钟都换一个端口。
+
+依据：[读写状态、请求资格与连续服务控制](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_preproc.sv>)，L528–581、635–637、715–770、827–961；[轮转扫描](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_roundrobincore.sv>)，L48–74；[请求集合、指针与保持](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_arb.sv>)，L112–150、213–232。这些代码定义了静态策略，本次单端口配置与尚未核对的运行寄存器取值，不足以给出多端口等待上界。
+
+### 6.2.5 Grant 生成与请求推进
+
+轮转选择出的候选还要经过授权 mask。原逻辑把命令 Stall、其他 Stall 和端口 mask 合并到 Grant 条件；读写切换使用的屏蔽略有不同，避免端口节流不必要地锁死方向切换。
+
+| 仲裁选项 | 内部选择与对外 Grant | Stall 时的行为 |
+| --- | --- | --- |
+| OPT2，当前配置 | `grant = grant_nxt`；组合选择直接对外授权 | Grant 被屏蔽；解除阻塞后按当时请求与资格重新选择，不要求锁住此前的组合赢家 |
+| OPT1，保留分支 | `grant_nxt` 形成内部候选，候选经寄存后再对外呈现 | 内部候选可以保持，对外 Grant 仍受 Stall mask 限制；还存在防止重复授权的节拍控制 |
+
+原 arb_top 用 `pa_wgrant/pa_rgrant` 同时决定内部请求 Ready 和 HIF_CMD 的选择。这样，XPI 推进的来源与 HIF 选出的地址、长度、Token 和命令类别保持一致，见 [E04](#rtl-evidence-index)。但 IH 的输入 FIFO 真正写入仍需要命令有效且不 Stall；IH 向 TE 的交付还受队头与重试控制。不能沿着相同 Grant 就把这些事件压成一个“完成”。
+
+依据：[授权 mask 与 OPT1/OPT2](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_arb.sv>)，L153–201；[原 Ready 与 HIF 选择](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/arb_top/DWC_ddr_arb_top.sv>)，L2239–2240、2511–2512；[被选命令字段](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)，L288–311；[原 IH 输入接收](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_core_in_if.sv>)，L221–247。
+
+## 6.3 DDR6 对 PA 提出的设计需求
+
+DDR6 的地址组织、访问单位与命令约束已经在第 2 章说明。它们要求整个 MC 解释正确的访问，并按后端承接能力推进；并没有直接规定前端必须使用哪种 Aging、轮转或 Reservation 接口。地址映射由 IH 负责，访问拆分由 XPI 负责，器件时序由 PAS 等后端负责。PA 需要的是这些模块提供的可用请求和准确的接收资格。
+
+当前候选为拆分访问增加 Parent、Fact 和 Child 关联，并使配置与会话状态参与准入。它们描述“这是哪一笔已接受请求、按哪份解释、交付哪一个内部访问”。如果关联信息尚未到达、配置上下文不适用，优先级再高也不应越过检查继续交付。这是候选方案对一致性的组织方式，而非 JEDEC 为 PA 规定的专用结构。
+
+| 原需求与协作对象 | 为什么需要 | DDR5 可复用能力 | 候选扩展及性质 |
+| --- | --- | --- | --- |
+| [REQ-PA-001](#req-pa-001)，XPI/HIF | 选择、请求推进和命令字段应来自同一访问 | 同一 Grant 驱动内部 Ready 与 HIF 命令选择 | 在外围约束身份资格；OPT1 另保留候选事实。属于实现同源交付的候选结构 |
+| [REQ-PA-002](#req-pa-002)，IH/后端 | 不接受当前无法承接的工作 | Credit、Stall、读写资源分类 | 在原额度外加入会话、表绑定和相关上下文准入；容量及产品并发范围仍需确定 |
+| [REQ-XPI-002](#req-xpi-002)、[REQ-HIF-001](#req-hif-001) | 拆分后的命令、数据与原事务不能错配 | Token、命令 mux 和写指针相关机制 | PA 外围核对 Parent/Fact/Child，HIF 路由保持同源；内部身份表示由团队选择 |
+| [REQ-IH-003](#req-ih-003)、[REQ-IF-003](#req-if-003) | 配置解释与正常运行资格不能混用 | 原配置控制和后端反压 | 将当前会话和上下文是否开放用于前端资格；PA 不替代初始化或模式设置 |
+| [REQ-IH-004](#req-ih-004)、[REQ-IF-001](#req-if-001) | 每个模块应按自己的实际接受事件推进 | FIFO、Entry、retry 与后端调度 | 明确 Grant、IH 接受和后端执行的关系；后端时序是跨模块依赖 |
+
+规范来源仍见 [S-GEO](#specification-reference-index)、[S-DATA](#specification-reference-index)、[S-TIM](#specification-reference-index)，DDR6 版本仍是 Rev0.x R0 委员会投票草案，各条款保留其适用 Profile。当前单端口、非内联 ECC、受限请求形状等属于本次构建和产品范围问题，不由 PA 自行扩展。没有证据表明需要因协议变化而替换原仲裁核心。
+
+公平性与持续服务需要明确竞争场景和下游最终可用等前提。现有 17 项需求没有单列多端口等待上界，本轮不新建编号；具体待评审项目记录在检查点。
+
+## 6.4 DDR6 PA 总体设计方案
+
+候选总体上保留 DDR5 的额度管理、Aging、读写切换和端口选择，在 arb_top 中筛选可送入原 PA 的请求，再让同一个 Grant 驱动前端推进和 HIF 命令选择。接收资格并非集中在一个流水级：XPI 先判断是否可以发布内部访问，arb_top 核对关联和上下文，PA 内判断资源与选择，IH 再执行实际接收和队头消费条件。
+
+```mermaid
+flowchart TB
+    X["XPI 待交付访问及关联信息"]
+    Q["arb_top 外围资格<br/>写：AW 事实、会话与上下文<br/>读：Parent / Fact / Child 与已接受 AR 记录"]
+    subgraph P["保留的 PA 核心"]
+        E["端口 mask、Credit、读写资格<br/>及当前 Stall 条件"]
+        A["Aging、优先级与轮转选择"]
+        N["grant_nxt：内部选择事件"]
+        O2["OPT2：直接生成对外 Grant"]
+        O1["OPT1：保持内部候选<br/>经当前 Stall mask 后生成 Grant"]
+    end
+    G["同一读写 Grant"]
+    H["XPI 内部访问推进 / HIF_CMD 选择"]
+    I["IH：命令有效、非 Stall<br/>且满足自身准入与 FIFO 条件时接受"]
+    B["IH 队头消费与 TE 后续接受"]
+    X --> Q
+    Q -->|"可竞争请求与写侧 Stall"| E
+    E --> A --> N
+    N --> O2 --> G
+    N --> O1 --> G
+    G --> H --> I --> B
+```
+
+图将条件按职责分组，不规定各框必须占一个时钟周期；图中两种 OPT 分支互斥选择。Credit 在 `grant_nxt` 处记账，外部 Grant 的呈现时点由 OPT 决定。IH 及 TE 的实际接收条件分别判断，不能由图上的先后关系推导为无条件同拍发生。
+
+当前 AW 事实资格构建接受 OPT1 或 OPT2；已选择的 OPT2 仍执行写事实与上下文检查，只是相关 Reservation 输出为零。读侧使用独立的 Parent/Fact/Child 和已接受记录核对，不能因为写侧存在 Reservation 就推定读侧也增加了一套预留队列。
+
+还有一条可选的完整 Host Packet 路径，要求 OPT1 等特定参数。当前参考实例设置 `DDR6_HOST_PACKET_EXPERIMENT=0`，故绕过这层包封装资格，使用 AW 事实路径；`DDR6_HOST_SEGMENTS_EXPERIMENT=1` 不会自动打开它。候选分支若未满足绑定条件，可能关闭请求而不是退回旧行为，具体条件见第 6.5、6.6 节。
+
+RTL 依据：[AW 构建条件及外围筛选](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L1633–1642、4133–4210；[可选包路径与读资格](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L4236–4325；[两种 Grant 分支与 Reservation 输出](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_arb.sv>)，L91–95、160–208。当前参考实例的开关见 [参考实例参数绑定](<../../11_rtl_project/sim/current195/tb_integrated_startup013.sv>)，L2750–2769、2788–2790；选源见 [工程 MANIFEST](<../../11_rtl_project/MANIFEST.json>) 的 selection。参数绑定和源文件存在只证明静态路径，不能替代运行资格和验证结果。
+
+
+<a id="pa-request-qualification"></a>
+## 6.5 请求资格检查与仲裁的配合
+
+### 6.5.1 为什么需要资格检查
+
+优先级解决的是多个可处理请求之间的先后关系，不能把不完整的请求变为可处理请求。例如，一笔内部写已经可见，但对应原 AW 的事实尚未在核心侧登记，此时授权会使命令与原请求的关联失去依据。另一种情况是额度充足，但配置或会话已经切换，原请求所依赖的解释不再适用。这些条件需要先约束请求发布或对外 Grant，再使用原有仲裁策略。
+
+因此，候选采用两类不同的控制。请求资格信号决定“是否把这个访问交给 PA 竞争”；Stall 决定“当前是否允许授权离开 PA”。内部资源类别、读写方向、优先级和端口选择则仍由 PA 核心处理。高优先级可以影响后者，不能绕过前两类检查。
+
+### 6.5.2 DDR6 候选的资格检查
+
+| 检查位置 | 实际检查对象 | 对请求推进的作用 |
+| --- | --- | --- |
+| XPI 请求发布 | 请求、关联信息和本地资源是否已准备好 | 向 arb_top 提供稳定的内部访问；详见第 5.4 节 |
+| arb_top 的写事实查找 | Parent 与已接受原 AW 的 Fact 是否匹配，包括有效的槽位、代次与边界信息 | 只有非读改写的有效 AW 且查找成功，才发布候选写请求 |
+| arb_top 的写侧准入 | 事实表绑定、传输及核心复位、源端与核心会话、异常隔离、有效上下文 | 形成写侧 Stall；OPT1 还比较当前事实与保持事实 |
+| arb_top 的读请求资格 | Parent/Fact/Child 已知且一致，Child 原生地址等于当前内部读地址，已接受 AR 记录匹配，会话开放 | 生成真正送入 PA 的读请求，不另建读预留队列 |
+| PA 核心 | 端口 mask、对应 Credit、读写资格、优先级、页匹配/保持及 Stall | 在合格集合中选择并产生授权 |
+| IH 输入及后续消费 | 命令有效、非 Stall、正常准入与 FIFO 容量；队头还受规范化和 TE/retry 条件控制 | 决定 IH 实际接收和后续推进，不能由前面的查找成功替代 |
+
+写事实查找不只判断“有没有一条记录”。它检查 Parent 的槽位、代次和 epoch 等身份信息，并比较已登记的原请求事实；同周期登记也可参与匹配。无有效记录但身份合法可以表现为等待，错误、冲突或不一致则进入不同的隔离结果。二者都不发布合格请求，但后续处置语义不同，不能一律解释为普通容量反压。依据：[写事实匹配、等待与异常隔离](<../../11_rtl_project/rtl/source/src/ddr6/ddr6_hif_aw_fact_lookup.sv>)，L39–47、64–96；[写事实查找实例](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L4133–4145。
+
+写侧 `preflight` 信号的值为 1 表示阻塞，不表示检查通过。它不仅看当前请求的 Fact，还检查当前会话和上下文。OPT1 有保持中的候选时，还要求当前可见写访问仍有合法事实，并与保留值相等；否则保持阻塞。当前 OPT2 没有这份 Reservation 保持值，但仍执行其余写事实与会话检查。依据：[写请求筛选和写侧阻塞](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L4153–4210。
+
+读侧则把当前 Child 中的 Fact、原生地址与当前读访问比较，再用 Parent 和原 Fact 查找已接受 AR 的记录。`session_open` 还依赖正常运行开放、复位、读记录传输会话、无异常隔离和有效上下文。只有这些条件同时成立，`r1_ar_pa_request113` 才能置位。PA 不在这里重做地址映射，也不根据 Child 名称推断它代表一个固定 DRAM Burst。依据：[读请求查找与发布](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L4295–4325。
+
+这些检查有明确的构建范围：
+
+| 分支或开关 | 静态条件与行为 | 本次解释范围 |
+| --- | --- | --- |
+| AW Fact 资格构建 | 要求 AW Fact、Parent、已接受 AW 发布、类型与宽度绑定；允许 OPT1/OPT2，并限制单端口、单通道、非内联 ECC 等参数 | 按当前参考绑定解释此路径；完整条件见源码 |
+| AW Fact 实验值明确为 0 | 该资格包装直接使用原读写请求与原命令 Stall | 是显式兼容分支，不能代表当前候选正常路径 |
+| AW Fact 被请求但构建不匹配 | 读写请求置零，写侧 Stall 置一 | 不自动退回 DDR5 路径 |
+| 完整 Host Packet 路由 | 要求 OPT1、包类型/宽度及特定地址宽度等条件；开启但不匹配时关闭对应写路由 | 当前开关为 0，只绕过这一层，不绕过 AW Fact 资格 |
+| AR/Child 资格构建 | 要求原 AR 记录、Child 格式、正常会话及相应类型/宽度绑定，仅当前 lane 0 供给资格 | 不匹配的读 lane 不发布请求；不推广为任意端口数量和访问形状 |
+
+依据：[AW 与 Packet 构建条件](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L1539–1543、1633–1642；[兼容、关闭及包路径分支](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L4178–4210、4217–4270；[读资格构建](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L4278–4293。
+
+读、写的反压连接也有区别：PA 写侧 `hif_wcmd_stall` 接入新增包装后的 `ddr6_packet_pa_stall`；读侧 `hif_rcmd_stall` 接原 `hif_cmd_stall`，而新增读限制主要通过读请求资格输入生效。共享读写状态会使两侧进展相互影响，但不能把某个 AW 检查失败直接说成两套 PA 都接收到同一新增 Stall。实际连接见 [读写 PA 输入的不同接法](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L3151、3180–3248。
+
+### 6.5.3 Grant、Accept 与状态推进
+
+本项目中，一次内部访问推进同时涉及仲裁记账和缓冲交付。判断它们是否一致，需要对照具体事件，而不是只看命令字段保持不变或某个观察计数增加。
+
+| 事件 | 更新对象 | 与下一阶段的关系 |
+| --- | --- | --- |
+| XPI 内部访问有效且对应 Ready/Grant | 按该包握手推进内部请求；Host 原事务是否结束仍由拆分状态判断 | 不等于外部 AW/AR 再次接受；原请求可能还有后续包 |
+| `grant_nxt` | PA 扣减对应 Credit；满足各自使能时更新等待、请求集合和轮转状态 | OPT2 对应本次外部 Grant；OPT1 可先形成保持候选 |
+| 对外 `pa_wgrant/pa_rgrant` | 指定 HIF_CMD 的被选来源，并反馈 XPI 内部 Ready | 应与命令及关联旁带同源，不能据此直接认定 TE 已接受 |
+| IH `fifo_put` 的真实采样 | 写入 IH 输入缓冲 | 还要满足命令有效、非 Stall、IH 正常准入及非满条件 |
+| IH 队头实际消费及 TE 接受 | 推进队头、规范化结果或后端请求，按相应接受和 retry 条件分步更新 | 不能用已经发生的前端 Grant 代替 |
+| PAS 调度、PHY 传输、公开 B/R | 各自推进后端命令、传输或上游响应 | 均不是 PA Credit 或 Grant 的同义事件 |
+
+候选的 IH 写入关系可直接概括为下面三条现有 RTL 表达式。它们强调真正入 FIFO 的事件，不是重新定义一个 PA ready/valid 协议。
+
+```systemverilog
+i_hif_cmd_valid=(core_ddrc_rstn===1'b1) &&
+    (hif_cmd_valid===1'b1) && (hif_cmd_stall===1'b0);
+assign input_fifo_put=i_hif_cmd_valid && r1_ih_admission;
+assign fifo_put = input_fifo_put && (~input_fifo_full);
+```
+
+出处：[候选 IH 输入实际接收](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)，L525–534、571；正常准入和读队头消费分别见该文件 L1717–1721、L905–913，相关原证据仍见 [E09](#rtl-evidence-index)。本章沿用第 5 章的 XPI 推进条件，不引入第二套上游握手。
+
+在同一合格内部访问、时钟条件和反压传递都满足时，Grant 与 IH 接收可以形成紧密对应；但候选新增的正常准入、缓冲和上下文条件仍需要逐一核对。若某次 Grant 后没有观测到预期接受，应先判断是 OPT1 尚在保持、边界条件未满足，还是接受事件本来位于后续接口；本轮不据静态路径判定丢请求或完成验证。这正是 [REQ-PA-001](#req-pa-001)、[REQ-PA-002](#req-pa-002)、[REQ-IH-004](#req-ih-004) 需要共同约束的关系。
+
+<a id="pa-reservation"></a>
+## 6.6 Reservation 相关机制
+
+### 6.6.1 设计目的
+
+OPT1 在内部选出候选后，可能因 Stall 暂时不能对外授权。原 PA 已保存这份候选，并在 `grant_nxt` 发生时扣减额度。候选新增接口把这两个原有事实暴露给外围，使外围能同时保存该访问的 Fact，在后续交付前比较当前可见请求是否仍与已保留候选一致。
+
+本节的 Reservation 因而有很具体的含义：协调已经形成的内部候选、原额度记账和相应事实保持。它不表示新建了一套 DRAM 时隙预留器，也不是 PAS 或 PHY 已为该命令锁定执行时刻。
+
+### 6.6.2 与原有仲裁机制的关系
+
+PA_arb 中新增的两条输出如下；两条赋值均不修改原仲裁计算：
+
+```systemverilog
+assign ddr6_reserved_grant = (PA_OPT_TYPE==1) ? arb_grant_with_stall_switchstate_w : '0;
+assign ddr6_reservation_fire = (PA_OPT_TYPE==1) ? grant_nxt : '0;
+```
+
+`reserved_grant` 暴露当前 Stall mask 之前的保持候选，`reservation_fire` 暴露原先就存在的内部额度预留事件。因此，Aging、Credit 扣减、轮转和最终 Grant 仍使用原机制；外围通过同一事件保存 Fact，不执行第二次资源分配或退休。
+
+“只读输出”只描述 PA 内部没有为这些端口另改仲裁状态，不能据此说外围只做显示。arb_top 在 OPT1 下用 `reservation_fire` 抓取事实，并在有 `reserved_grant` 时核对保存值。比较结果可以阻止对外交付，确实属于控制逻辑。可选完整包路径还保存并比较包内容，但当前没有选择该路径。
+
+依据：[Reservation 输出原表达式](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_arb.sv>)，L91–95，既有索引 [E20](#rtl-evidence-index)；[写侧连接与读侧未使用端口](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_dual.sv>)，L271–272、355–356；[Fact 的保持与比较消费者](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L4153–4199；[可选完整包保持与比较](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L4239–4268。
+
+### 6.6.3 当前实现的生效条件
+
+| 机制 | OPT2：当前生成配置 | OPT1：保留条件分支 |
+| --- | --- | --- |
+| 内部选择与 Credit | 按 `grant_nxt` 运行，并直接形成 Grant | 按 `grant_nxt` 记账，再通过保持候选呈现 Grant |
+| 两个新增 Reservation 输出 | 均为零 | 分别输出保持候选和原内部选择事件 |
+| AW Fact 与会话资格 | 仍按已绑定路径执行 | 同样执行，并增加候选 Fact 保持和后续一致性比较 |
+| 完整 Host Packet 保持 | 当前开关为 0，不使用；其路由构建也要求 OPT1 | 只有另行开启且满足类型、宽度等约束时才可能选择 |
+| 读侧新增 Reservation | 本次连接未使用读 PA 的这两个输出 | 本次连接仍未使用；不能由写侧方案推定已有读预留机制 |
+
+当前常量与顶层传递的依据为 [当前生成常量](<../../11_rtl_project/rtl/source/src/DWC_ddrctl_cc_constants.svh>)，L1089、1498、4049、4082、11418、11436；[OPT 参数与传递](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddrctl.sv>)，L1751、21547。当前参考实例绑定见第 6.4 节。这里确认的是当前代码和参数选择；并未将 OPT1 的存在写成当前产品已经采用该功能。
+
+### 6.6.4 尚待确认的问题
+
+后续若考虑采用 OPT1，需要先确定为何保留候选、预期减少哪类时序或接口压力，以及它如何影响连续服务能力。动态验证还应覆盖保存期间出现 Stall、Fact 改变、会话关闭、复位与重新开放时，候选、Credit 和事实保持是否按同一访问清理或继续交付。
+
+当前 OPT2 需要重点核对外围资格变化与 Grant/IH 接收的对应，而不是验证一个输出恒为零的接口是否“完成预留”。两种配置的验证目标应分别制定；没有运行依据时不作通用活性、吞吐或异常恢复保证。产品是否选择 OPT1、是否开启完整包路径，仍应由团队确认，不在本文中代为决定。
+
+## 6.7 PA 与 XPI、HIF、IH 的接口协作
+
+PA 的接口以选择控制为主。命令字段、写数据和读返回可以走其他通路，因此核对接口时要同时看“选中了谁”和“字段从哪里来”。
+
+| 交互对象 | PA 获取或提供的信息 | 协作目的 | 责任边界与实际连接 |
+| --- | --- | --- | --- |
+| XPI | 获取内部读写请求、类别与优先提示；通过 arb_top 反馈相应 Grant/Ready | 让被选内部访问推进，未选访问继续等待 | XPI 保存、拆分原请求，管理 Token 与响应；候选事实筛选位于 arb_top，不在 PA 中重新拆包 |
+| HIF | 向 HIF_CMD 提供读写 Grant；命令字段及候选旁带从相应前端来源进入 mux | 同一选择决定命令与关联信息，写数据指针沿既有通路组织 | HIF 负责命令和数据路由；PA 不搬运 Payload、不执行 BL24 编解码 |
+| IH | 经 HIF 命令接口交付被选访问；IH 经顶层互连提供命令 Stall 和相关 Credit | 协调入口容量与请求交付，避免把队列可见当成已接受 | IH 执行实际 FIFO 接收、地址解释、Entry 及后续交付；没有一根通用的“PA 到 IH 已完成”信号可代替这些事件 |
+| TE/PAS 等后端 | PA 通过 IH/HIF 侧容量与反压间接感知承接能力，并向 DDRC 提供 go2critical 紧急类别提示 | 使前端资源预算与后端承接保持一致 | 不把 PA 信号表述为直接的 TE/PAS ready 握手；TE 管理后端请求资源，PAS 承担相应器件命令调度 |
+
+候选中的内部 Ready 仍由 `pa_rgrant/pa_wgrant` 反馈，见 [XPI 内部 Ready](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L3032–3033；PA 的真实输入与输出见 [PA 连接](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L3180–3248，HIF_CMD 的被选请求见该文件 L3320–3370。IH 的容量含义见第 6.2.3 节，实际接受见第 6.5.3 节；后端分工沿用 [E09](#rtl-evidence-index)、[E19](#rtl-evidence-index) 及第 3 章。
+
+PA 还向 DDRC 提供 WR/LPR/HPR 的 go2critical 提示，用于表达紧急或超时请求受资源限制时的调度压力。它是请求类别提示，不是后端 Ready 或完成回执；是否触发还依赖相应配置和输入。依据：[原紧急提示机制](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa.sv>)，L203–245、272–330；[候选紧急提示连接](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L3194–3196；[进入 DDRC 的紧急提示](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddrctl.sv>)，L12432–12434。
+
+这些接口共同承接 [REQ-PA-001](#req-pa-001)、[REQ-PA-002](#req-pa-002)、[REQ-HIF-001](#req-hif-001) 和 [REQ-IH-004](#req-ih-004)。具体到下一轮模块评审，HIF 应解释同一 Grant 如何选择命令、写指针与身份旁带；IH 应解释实际接收、规范化结果保持、Entry 分配和后端 retry 如何分别推进，而不是把它们全部归结为 PA 已授权。
+
+
+## 6.8 反压、公平性与进展条件
+
+分析等待时，应先辨认请求停在哪个阶段。不同阶段的等待由不同模块解除，单独提高 PA 优先级不能解决所有阻塞。
+
+| 请求所处状态 | 当前 RTL 中的典型条件 | 能促进进展的机制及限制 |
+| --- | --- | --- |
+| 暂时不具备资格 | 记录尚未登记、会话尚未开放，或对应 Credit 不可用 | 登记、开放或额度补入后可重新参与；Aging 不能绕过缺失条件 |
+| 已具备资格但本周期未选中 | 另一方向或更优先集合获选 | 读写切换、priority0、轮转和连续服务限额共同作用 |
+| OPT1 已有内部候选但尚未对外授权 | 保存候选期间出现 Stall | 原候选与相应事实保持；解除阻塞且一致性条件满足后再交付，不重复扣减额度 |
+| 已对外 Grant，后续接受尚待核对 | IH 另有正常准入/FIFO 条件，或接受发生在后续接口 | 对照真实 FIFO 写入、队头消费与后端接受；不能只凭观察信号推定完成 |
+| 长期受到其他请求压力 | 持续 urgent、HPR、页匹配或保持等竞争条件 | 需要结合运行配置、流量与下游服务假设分析，不能只凭 Aging 推定有限等待 |
+| 静态构建不支持或身份冲突 | 未绑定构建、关闭的读 lane、事实不一致或异常隔离 | 不是等待一段时间必然恢复；需由配置选择或系统错误/恢复流程处理 |
+
+第 6.2 节的机制提供了可解释的选择策略：有资源的请求才进入相应集合，等待可改变优先级，轮转避免始终从固定起点扫描，页匹配限额与方向切换约束连续服务。但这些机制本身没有给出所有请求的等待上界。例如，下游永不补入某类额度时，PA 无法通过仲裁创造容量；会话一直关闭时，外围也不会把相应访问交给 PA。
+
+当前 OPT2 在 Stall 时屏蔽 Grant，解除后依当时资格选择；它没有 OPT1 的同一份寄存候选保持合同。无论采用哪种方式，上游都应按相应内部握手保存尚未交付的访问，旁带与命令字段不能各自独立前移。此处的协议一致性与后端是否能持续提供服务是两个需要分别核对的问题。
+
+本轮静态阅读可以确认上述条件与状态更新位置，没有新增竞争仿真，也没有得到多端口、所有 urgent/超时组合或会话重建场景的活性结论。Aging、Credit、轮转存在，不等于已排除饥饿；缺少这类运行证据，也不等于已发现饥饿缺陷。后续验证应先明确目标端口数、读写类别、运行寄存器配置，以及下游在何种条件下承诺恢复服务，再检查连续反压解除后的授权、接受与额度记账。
+
+依据：原状态与公平性机制见第 6.2.2～6.2.5 节；候选关闭与隔离条件见第 6.5.2 节。容量协作和异常可见结果分别沿用 [REQ-PA-002](#req-pa-002)、[REQ-IF-004](#req-if-004)，独立的多端口公平性目标交由统一需求评审。
+
+## 6.9 当前候选实现与适用范围
+
+下表中的“当前条件”指本次选源、生成常量和参考实例绑定。只有运行中的有效请求、配置与会话满足时，相关路径才会实际推进；不能把静态分支已选择写成该功能已通过仿真或已获产品签署。
+
+| 设计事项 | DDR5 原有能力 | DDR6 候选修改 | 当前生效条件 | 尚待确认或验证 |
+| --- | --- | --- | --- | --- |
+| Aging 与端口优先级 | 等待计数、超时/urgent 提升与可选外部优先级 | 核心文件未改；外围可先限制请求发布 | EXT_PORTPRIO=0；具体 Aging/urgent 行为还取决于运行寄存器 | 目标设置及持续压力下的服务份额 |
+| Credit | WR/HPR/LPR，条件性 ECC 资源和读改写资格 | 原累计与扣减核心保留，新增资格另行叠加 | M_INLINE_ECC=0；按 grant_nxt 记账 | 新增保持资源与原容量预算的对应、异常重建 |
+| 轮转 | 保存请求集合、指针扫描与选择保持 | 核心文件未改 | 当前 A_NPORTS=1，不能外推为多端口验证结果 | 目标多端口生成配置及公平性证据 |
+| 读写切换 | 共享方向状态、类别优先与页匹配限额 | 原预处理核心保留 | DUAL_PA=0；PAGEMATCH_EN=1 只说明逻辑存在，实际偏好受提示和配置影响 | 切换开销、持续 HPR/写压力与目标吞吐 |
+| 写请求资格 | 原请求有效、资源与 Stall | 增加已接受 AW 事实查找、会话/复位/上下文检查 | 当前 AW Fact 路径的类型与构建绑定满足时；非读改写路径 | 身份等待、错误隔离及恢复的完整处置 |
+| 读身份与上下文 | 原内部读包与 Token | 增加 Parent/Fact/Child、原生地址和已接受 AR 记录核对 | AR/Child 构建、lane 0 和正常会话开放等条件同时满足 | 连续读、记录重用与会话变化时的关联保持 |
+| Reservation 接口 | OPT1 原有内部候选和额度记账 | 暴露保持候选/原选择事件，并在外围按条件保持和比较事实 | 当前 OPT2 两输出为零；OPT1 分支才使用相关保持逻辑 | 是否采用 OPT1、保持期间 Stall/复位的动态对应 |
+| OPT 与完整包路径 | OPT1/OPT2 有不同授权节拍 | 额外完整包资格与保持路径受 OPT1 等条件约束 | 当前 PA_OPT_TYPE=2、HOST_PACKET=0；HOST_SEGMENTS=1 不等于包路由开启 | 目标路径选择及必要的性能/接口依据 |
+| Grant 与实际接受 | 同一 Grant 控制前端 Ready 与 HIF 命令 mux | IH 另有正常准入、规范化及后续接受条件 | 各实际接口条件分别成立，不能只检查 PA 输出 | Grant、FIFO 写入、TE 接受与 retry 的逐事件验证 |
+| 反压与进展 | Stall、资源类别和选择策略 | 写侧外围 Stall、读侧资格与关闭分支 | 不同方向接法见第 6.5.2 节；配置不匹配可能长期关闭 | 解除阻塞的系统前提、异常出口与公平性目标 |
+
+核对这张表应使用四个不同判断：源代码中是否存在、当前参数是否选择、运行中是否满足条件并有验证、是否属于已确认产品范围。本轮完成前两类的定向静态分析，并保留运行条件；没有新运行结果，也不关闭第 4.7 节保留的 Profile、并发和接口事项。DDR6 草案要求与本表中的内部实现选择仍按第 2 章区分。
+
+本章复核了原/候选 `pa_port`、`pa_preproc`、`pa_priocomp`、`pa_roundrobincore` 的文件指纹，四组均逐字节一致；PA 包装层与 arb_top 的具体变化按第 6.4～6.6 节所引位置阅读，不据此推定两套完整工程具有唯一已证实的版本继承关系。详细输入指纹与检查结果保存在本轮[检查点](<00_progress_checkpoint.md>)。
+
+## 6.10 本章小结
+
+DDR5 PA 已具备请求屏蔽、分类额度、等待优先级、读写切换、页匹配偏好和端口轮转。候选保留这套选择核心，主要把“是否允许竞争”的条件扩展到已接受请求的身份、事实、会话与上下文，使选中的访问能够继续沿用原 Ready/Grant 和 HIF 命令选择关系。
+
+Reservation 的当前状态应分别理解：OPT2 仍执行新增资格检查，但两个 Reservation 输出为零；OPT1 保留候选时，外围会同步保持事实并参与后续一致性检查。这是内部交付方案，不是 JEDEC 指定的仲裁格式，也不表示已经预留 DRAM 执行时刻。
+
+下一步模块评审需要围绕同一访问继续解释两件事：HIF 如何让命令、写指针、数据路由与身份旁带服从同一选择；IH 如何把输入接受、地址解释、结果保持、Entry 分配与 TE/retry 分开推进。PA 则依据这些明确的承接条件控制前端，而不替代后端时序调度。本章完成设计说明，运行验证范围与产品选择留待人工评审。
