@@ -70,6 +70,12 @@ DDR5 JEDEC 用于说明原器件行为，DDR6 委员会投票草案用于说明�
 
 原始 DDR5 RTL 说明现有机制如何工作，DDR6 候选 RTL 说明目前采用的实现及其限制。项目控制文件确定产品建议和当前工程状态；Phase1～2D 报告提供定向查阅入口。本文将已有规范和 RTL 事实作为设计依据，将由此推导的功能需求提交评审，并在对应章节保留尚待确认的配置与接口条件。规范版本、引用方法和适用范围见第 2.1 节。
 
+<!-- SW-INTEGRATION-V1:scope:BEGIN -->
+
+软件相关补充以[《DDR6 MC 当前软件接口与中文编程指南》](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md>)（2026-10-21，复核修订 v2）为入口。指南说明软件希望如何操作和观察候选系统；本评审继续用实际源码与构建条件判断硬件行为。该目录当前缺少指南引用的快照及证据配套，版本差异和核实范围集中见[第 4.9 节](#software-system-contract)，不据文档日期替换既有 RTL 基线。
+
+<!-- SW-INTEGRATION-V1:scope:END -->
+
 # 第2章 DDR5 与 DDR6 规范差异及 MC 修改需求
 
 本章先说明 DDR5 与 DDR6 器件行为的变化，再分析原 MC 机制的适用性，最后归纳需要保留、调整或补充的能力。内部身份格式、缓冲深度和状态机由后续模块方案具体论证。
@@ -661,6 +667,12 @@ Metadata、CRC 和 Ignore 会同时影响布局、合法地址、时序及错误
 目标外部接口按第 2.4.3 节和 [REQ-IF-002](#req-if-002) 跟踪。MR 占位、CRC 红字修订和未投票章节，在权威草案更新时定向复核。本轮保留这些设计前提，后续由团队评审确认。
 
 
+<!-- SW-INTEGRATION-V1:premises:BEGIN -->
+
+软件入口能否部署、配置/控制回执的完成对象，以及初始化和业务开放资格，另见[软件关联待确认项](#software-open-questions)。这些事项继续由 [REQ-IF-003](#req-if-003)、[REQ-IF-004](#req-if-004) 等既有需求承接；补充软件说明不表示它们已经关闭。
+
+<!-- SW-INTEGRATION-V1:premises:END -->
+
 <a id="ddr5-original-architecture"></a>
 # 第3章 DDR5 MC 原始架构与功能机制
 
@@ -1070,6 +1082,119 @@ Parent 结束活动状态，也不表示历史记录全部清空或同槽立即�
 本章保留三项需要团队结合目标范围判断的取舍：原始请求、原生包和物理片段的层次是否适合产品粒度；结果保持与历史结构如何影响并发和持续服务；完成、回执与资源复用怎样符合系统响应约定。对应证据已经在各节给出，后续评审可据此深入，不把当前受限实现提前推广为全部目标配置。
 
 
+<!-- SW-INTEGRATION-V1:system:BEGIN -->
+
+<a id="software-system-contract"></a>
+## 4.9 软件可见行为与软硬件交付合同
+
+软件需要知道“写什么、何时可以写、结果在哪里、失败后怎么办”；详细设计则应解释这些操作如何落到硬件对象和真实事件。两者之间的依据应是同一版本的寄存器实现、构建参数和接口合同，而不是名称相同就视为兼容。
+
+<a id="software-evidence-scope"></a>
+### 4.9.1 先对齐指南和实际源码的版本
+
+本次已通读权威入口目录中的 PROGRAMMING_GUIDE.md。其版本为 2026-10-21 复核修订 v2，声明交付根目录为 `D:\sunrui\DDR6\deliveries\DDR6_vivado_complete_20261020`。该目录在当前环境不可访问；指南相对路径不能直接套到本项目根目录。
+
+| 资料或结论 | 本次核实结果 | 在本评审中的用法 |
+| --- | --- | --- |
+| 指南正文 | 权威入口 `review_inputs/software_guide/` 当前只有这一份文件，正文及版本已核实 | 可以准确引用其操作描述、假设和限制 |
+| EVIDENCE_AND_GAPS.md、SOURCE_SNAPSHOT.json、REGISTER_MAP.csv、review_20261021_v2/REREVIEW.md | 未在入口目录或本次项目文件名搜索中找到，声明根目录也不可访问 | 未读取，不能引用其内容、哈希或寄存器审计结果；指南中的数量不等于本轮核对数量 |
+| 编号 RTL、软件 helper、平台配置/生成器 | 指南所指 390/395/394/066 等文件及对应桥、软件任务和平台配置未定位；现有 20261014 归档的中央目录也没有这些指定文件 | 新桥的连线、使能、保持及异常行为仍待对应源码 |
+| 既有评审基线 | 当前 [MANIFEST](<../../11_rtl_project/MANIFEST.json>) 仍选 control0_empty_provider195_fixture_v18 / candidate_normal_rebind195_v44，含 DDR6_COMMAND_BUILD | 原第 1～6 章的源码范围保持；不把两个交付版本拼接成一份活动设计 |
+
+MANIFEST 的选择只说明源码和编译条件，不代表扩展桥已实例化、已使能或正在运行。
+
+因此，下文分别说明“当前 RTL 已核对”“指南描述、集成待核实”和“模型/验证范围待补证”。指南中的 SOURCE_FACT 是指南对其源版本的声明；在缺少对应源码与快照时，本评审不把它提升为本地 RTL 已确认事实。MODEL_FACT、ENGINEERING_ASSUMPTION、SPEC_REQUIRED、UNKNOWN/UNVERIFIED 继续保留各自限制，参见 [软件指南第 1 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#1-使用前必须知道的完成边界>)。
+
+<a id="software-apb-boundary"></a>
+### 4.9.2 软件入口、地址空间与当前可确认的路由
+
+指南用 D6C1 表示 Config/Geometry 配置请求桥，用 D6I1 表示启动控制传输桥；原 DDR4/DDR5 寄存器接口沿用其 donor APB 命名。三者的对象不同，不能把启动桥或配置桥等同于 XPI、PA、HIF、IH 的专用编程口。
+
+| 入口 | 指南描述的职责和地址 | 本地证据状态与集成边界 |
+| --- | --- | --- |
+| D6C1 | APB `0xF00000..0xF00FFF`；配置/几何请求、版本和回执；指南称由 TB 在 MC 外实例化 | 仅指南描述。须补外部桥实例、连接及 使能/构建依据；单实例化本项目 MC 不能据此认定已有该窗口 |
+| D6I1 | APB `0xF01000..0xF01FFF`；启动控制传输和相应回执，受 FULL_INIT_MODE、时钟/PHY/类型绑定条件限制 | 仅指南描述。内部集成与默认关闭条件须由对应 066/395/394 源码确认；不能靠访问地址推定入口存在 |
+| donor APB | 原控制寄存器及跨域传播 | 当前 195 源码可确认原寄存器从接口；可访问和字段存在仍不保证其 DDR6 功能语义适用 |
+
+入口定义及声称的两级截获链来自 [软件指南第 1 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#1-使用前必须知道的完成边界>)、[软件指南第 3 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#3-apb-访问规范>)、[软件指南第 4 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#4-寄存器表与属性>)，**没有作为本地已确认拓扑绘图**。下面仅画当前源码能确认的原 APB 路径，不增加尚未找到的扩展桥：
+
+```mermaid
+flowchart TB
+    P["DWC_ddrctl 顶层 APB<br/>MANIFEST 选择的 195 源码"]
+    D["adrdec<br/>地址采样、译码与读回选择"]
+    F["slvfsm<br/>访问节拍与等待控制"]
+    W["slvif<br/>寄存器字段存储"]
+    C["coreif<br/>配置输出与状态读回"]
+    P -->|"字地址"| D
+    P -->|"访问控制"| F
+    F -->|"write_en_pulse"| W
+    D -->|"rwselect"| W
+    W -->|"存储的寄存器字"| D
+    W -->|"配置字段来源"| C
+    C -->|"状态字"| D
+    D -->|"读回 / 错误"| P
+    F -->|"pready"| P
+```
+
+图中 adrdec、slvfsm、slvif 和 coreif 均在 U_apb_slvtop 内；顶层将 paddr 的最低两位去除后交给内部译码。图省略安全筛选、部分状态连接和 CDC 内部级数，只表示已核对的模块级方向。顶层端口与实例连接见 [当前顶层 APB](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddrctl.sv>)，L2591–2601、5295–5324；译码、存储、FSM 与读回来源见 [原 APB 内部连接](<../../11_rtl_project/rtl/source/src/apb/DWC_ddrctl_apb_slvtop.sv>)，L1868、1878–1904、2136–2160、2434–2454、2716–2718、2761。地址宏采用字节常量右移两位供内部比较，见 [地址单位](<../../11_rtl_project/rtl/source/src/apb/DWC_ddrctl_apb_defines.svh>)，L20–26。这些事实不能证明软件指南的新桥已经接入当前构建。
+
+指南列出的窗口是其 RTL APB 地址空间中的字节地址；CPU 物理基址、地址平移、总线字节序和屏障要求仍是 UNKNOWN。图中也没有 CPU→APB 平台映射。固件能够访问的寄存器，与 TB 通过层次路径读取的内部 busy、版本、时钟或引脚状态必须分开；后者不能改写为公开 CSR。
+
+<a id="software-events-and-responsibility"></a>
+### 4.9.3 配置、控制传输与完成事件
+
+软件发起操作后，硬件可能先结束 APB 访问，再等待内部对象接收请求，随后产生结果并保留给软件消费。是否释放资源、是否改变 DRAM 状态、是否允许 Host 业务，需要继续看各自对象的条件。
+
+| 事件 | 能说明什么 | 仍不能据此说明什么 |
+| --- | --- | --- |
+| APB 访问完成 | 在该从接口的总线条件下完成一次访问；还需检查错误响应 | 内部配置已生效、PHY 已应用、DRAM 写入完成 |
+| 内部请求被接受 | 对应内部对象取得本次请求；必须保持身份和参数 | 已经产生成功回执，或所有后续动作已完成 |
+| 配置或控制回执产生 | 在相应合同下得到一个结果；还要辨认成功/拒绝及所针对的对象 | 完整初始化或训练成功；控制传输回执也不是 Host B/R |
+| 软件 ACK / 消费回执 | 按该入口的规则归还或推进特定结果对象 | 自动撤销错误、解除隔离，或释放仍由模式/后端引用的全部资源 |
+| PHY/DRAM 操作与业务开放 | 需要实际应用、器件时序、训练及资源/生命周期资格的相应证明 | 不能由固定等待到期、donor INIT_DONE 写入或文档例程返回替代 |
+
+当前 donor FSM 的 WAITACK 既可因跨域应答也可因计时到期退出并给出 pready，见 [APB 等待结束条件](<../../11_rtl_project/rtl/source/src/apb/DWC_ddrctl_apb_slvfsm.sv>)，L158–182；SWCTL 输出和 SWSTAT 的后端 ack 读回仍是独立连接，见 [配置传播与状态方向](<../../11_rtl_project/rtl/source/src/apb/DWC_ddrctl_apb_coreif.sv>)，L4721–4729。因此，区分访问结束和功能生效也有现有 RTL 依据。D6C1/D6I1 的具体 ACK、超时和资源关系目前仅能引用 [软件指南第 5 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#5-configgeometry现有提交协议>)、[软件指南第 6 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#6-d6i1控制传输精确ack与引用>)、[软件指南第 8 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#8-错误超时和恢复策略>)，须补其版本对应的源码和验证记录。
+
+指南特别区分 D6C1 的软件序号检查与 D6I1 的精确 ACK_SEQUENCE，并指出 ACK 后可能仍有模式或引用义务。这些差别关系到多调用者互斥和资源复用，评审应保留，不能将两组状态位、ACK 方法和错误空间合并。它们尚未在本地新桥源码中复核，也没有形成可以据此部署的驱动合同。
+
+| 责任方 | 与本次详细设计的关系 |
+| --- | --- |
+| 软件 | 依适用入口和能力发起操作，检查总线错误、结果身份与状态；超时后先确认请求结局，不能直接重发或宣告成功 |
+| MC | 为实际支持的请求提供接收、保持、拒绝和交付语义；配置解释、模式与数据路径资格应一致；四模块职责仍按本章和模块章节划分 |
+| PHY / 平台 | 提供真实电源、时钟、复位、引脚应用及训练相关合同。指南提及的常开域监督不能替代完整训练或板级确认 |
+| TB 与行为模型 | 用于特定构建下的接口驱动和内部观察。指南中的 SV helper、时钟预算和测试配置记录不是固件 API，也不等于本轮重现了验证 |
+
+指南仍报告完整初始化、初始 CS 操作、适用训练、真实 PHY 应用及 NORMAL/AXI 开放的缺口，见 [软件指南第 7 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#7-从复位到axi当前可做步骤与缺失步骤>)、[软件指南第 11 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#11-规范缺口与更新>)。本轮未取得能关闭这些缺口的新证据；配置/几何回执或局部控制传输不能绕过 [REQ-IF-002](#req-if-002)、[REQ-IF-003](#req-if-003)、[REQ-IF-004](#req-if-004) 的相邻接口要求。
+
+<a id="software-module-contract"></a>
+### 4.9.4 软件约束如何传递到四个模块
+
+| 软件可见行为或约束 | 软件手册依据 | 相关硬件模块及实现机制 | 对 DDR5→DDR6 修改的影响 | 当前证据状态 |
+| --- | --- | --- | --- | --- |
+| 配置获准不代表任意 Host 请求形状都可用；R/B 结局要关联原请求 | [软件指南第 1 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#1-使用前必须知道的完成边界>)、[软件指南第 5 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#5-configgeometry现有提交协议>)、[软件指南第 7 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#7-从复位到axi当前可做步骤与缺失步骤>) 的完成/开放边界；访问粒度直接依据仍见本文第 2.3、5.6 节 | XPI 保留拆包、Token、RRB 与响应组织，候选增加身份和返回关联 | 软件能力范围必须与实际字节覆盖、支持形状和错误映射一致，不能用配置成功代替访问适配 | 原机制与候选局部实现已有本文章节依据；新软件入口到 Host 结果的端到端关系尚未核实。[REQ-XPI-001](#req-xpi-001)、[REQ-XPI-002](#req-xpi-002) |
+| APB 写入或配置回执不会自动消除资源反压 | [软件指南第 3 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#3-apb-访问规范>)、[软件指南第 7 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#7-从复位到axi当前可做步骤与缺失步骤>)；指南未给出本轮可核实的新 PA 编程口 | PA 仍以 Credit、优先级、读写资格和外围上下文选择请求；Grant 不等于下游接受 | 新准入需要与有效配置及后端容量一致；不把软件操作变成对 Grant/Entry 的直接控制 | 第 6 章 RTL 结论保留；未新增“软件可配置仲裁参数”的目标承诺。[REQ-PA-001](#req-pa-001)、[REQ-PA-002](#req-pa-002) |
+| 启动控制传输回执不是读写 Payload 已交付或 Host 已完成 | [软件指南第 6 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#6-d6i1控制传输精确ack与引用>)、[软件指南第 8 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#8-错误超时和恢复策略>)；与正常数据路径分开 | HIF 按 Grant、写指针/包尾及读返回标识衔接命令和数据，见 [E04](#rtl-evidence-index)、[E05](#rtl-evidence-index)、[E06](#rtl-evidence-index)、[E07](#rtl-evidence-index) | 数据、命令、身份和错误仍需在各自交付事件保持同源，不能用 D6I1 ACK 代替数据 FIFO/响应队列推进 | 原路径有 RTL 依据；D6I1 到该路径的实际连接未核实，也不把两者视为同一编程接口。[REQ-HIF-001](#req-hif-001) |
+| Profile/Geometry 合法性与运行期请求合法性需要一致，但对象不同 | [软件指南第 5 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#5-configgeometry现有提交协议>)、[软件指南第 7 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#7-从复位到axi当前可做步骤与缺失步骤>) | IH 的配置/几何快照、地址解释和请求检查按第 4.4 节运行 | 配置发布与 IH 数据路径映射需通过明确上下文关联；D6C1 请求桥本身不等于地址映射器 | IH 局部路径已有依据；新桥如何接入同一有效配置、如何公开拒绝结局尚未核实。[REQ-IH-002](#req-ih-002)、[REQ-IH-003](#req-ih-003) |
+
+上表说明的是接口合同如何约束设计，不给四模块增设未经证实的 CSR。软件指南中的 R 操作标识也不能与 AXI R 通道或地址混用；其编码和保持关系仍需对应版本的桥及请求生产者说明。
+
+<a id="software-open-questions"></a>
+### 4.9.5 本次保留的软件关联问题
+
+| 待确认项 | 现有描述与核实结果 | 需要的证据 / 责任方 |
+| --- | --- | --- |
+| D6I1 在 HELD 前读取 R 分片 | [软件指南第 6 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#6-d6i1控制传输精确ack与引用>)、[软件指南第 9 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#9-参考调用示例>) 先 START、读序号和 R，再等待 HELD/receipt_valid。缺少对应源码，未证明此时 R 已锁存且多片读取稳定；记录为**操作顺序待修正或补充稳定性证明**，不认可该示例为已验证正确流程 | 395 桥及 R 生产者在接收、故障/超时和复位期间的保持逻辑；软件/桥负责人核对必要的采样顺序。指南原文保持 |
+| D6C1 STATUS.bit10 running | [软件指南第 4 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#4-寄存器表与属性>)、[软件指南第 5 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#5-configgeometry现有提交协议>) 赋予该位 running 名称，并提示本地 APB 存储与 MC cold 状态有区别。其直接表达式和作用域未读取，不能写成“冷启动已完成”或“允许 AXI” | 390 的状态读回与记录生命周期、时钟和复位条件，结合 MC cold/NORMAL 资格；配置桥与启动负责人 |
+| FULL_INIT_MODE 与 DDR6_R1_FULL_INIT_MODE | 指南同时使用两个名称，并引用某 NORMAL 分支；本项目 195 源码的本次关键词查找未命中对应定义。未确认它们是 TB、工具参数还是 RTL 参数及怎样传递 | 066 声明、实例参数传播、Tcl/TB/命令行绑定和 NORMAL 条件；集成/启动负责人。不能把相近名称默认为等价 |
+| CONFIG_SHADOW 首次写后固定 | [软件指南第 5 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#5-configgeometry现有提交协议>) 声称首次写入后只能重写同值，并区分首次 START 前供 MC 检查的候选值和已提交配置。尚未核对实现及批准意图，**不作为已冻结的可编程合同**，也不能把它概括为所有配置版本永远不变 | 390 写使能/拒绝、复位/记录生命周期、版本回收及决定记录；配置接口和软件负责人确认是产品选择还是候选限制 |
+| 两桥路由、使能与地址 | 指南称两级串联且截获各自窗口；对应源码/快照未找到。当前只能确认图示的原 APB 路径；CPU 物理基址、地址平移依然 UNKNOWN | 完整同版顶层、390/395/394/066、使能及构建绑定、平台地址图；SoC 集成负责人 |
+| 错误、超时、ACK 与资源释放 | 指南描述桥层与控制传输执行单元（engine）层错误、消费与持续模式引用，尚缺配套源和寄存器表复核；不能统一为“收到 ACK 即资源全释放”或“超时即请求取消” | 寄存器表、实际完成/消费/退休事件、异常记录及测试；接口/软件/DV 负责人 |
+| 完整初始化、训练与业务开放 | 指南保留初始 CS、训练 API/资格、物理时序、真实 PHY 应用和 NORMAL 开放缺口。没有新证据可据此关闭旧设计前提 | 同版初始化/训练资格生产者、PHY/平台合同和完整启动至 AXI 的验证结果；启动、PHY、平台与 DV 负责人 |
+
+UNKNOWN、未核实和指南中的 SPEC_REQUIRED 不因本文补充而消失。没有把错误直接裁定为 RTL 缺陷，也没有修改指南示例、替代软件手册或自行确定启动/恢复策略。配套资料补齐后，应先核对快照与构建，再定向更新这些结论。
+
+<!-- SW-INTEGRATION-V1:system:END -->
+
 <a id="xpi-detailed-design"></a>
 # 第5章 XPI 详细设计
 
@@ -1335,6 +1460,17 @@ XPI 自身的 outstanding_writes 按其本地 AW/B 接口记账；公开 B 被�
 等待时应看当前内容由哪个保持级负责：PA 暂不授予时，RAR 或相应写命令保持级保留包；HIF 写数据不 ready 时，当前数据和 IQ 组织信息不被包尾消费；Host RREADY 低时，响应级保留数据和 tag。WRQ 满则通过响应容量影响特定写数据拍。候选新增身份必须跟随这些实际移交边沿，不另起一套与数据无关的出队规则。
 
 原 AXI/XPI 前端时钟 aclk 与内部 e_clk 可以由队列实现解耦，新增事实还经过独立跨时钟域传递（CDC）。原请求包与原始事实不保证同拍到达 IH，外围需要保存并匹配；本文不指定时钟比或固定跨域延迟。跨域来源与回执关系沿用 [Phase2B §2](<../phase2b/02_ddr6_write_transaction.md>) 和 [Phase2D §1–2](<../phase2d/02_ddr6_read_mechanism.md>) 的定向证据。
+
+<!-- SW-INTEGRATION-V1:xpi:BEGIN -->
+
+<a id="xpi-software-boundary"></a>
+### 5.5.1 软件可见结果与 Host 完成边界
+
+[软件指南第 1 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#1-使用前必须知道的完成边界>)、[软件指南第 5 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#5-configgeometry现有提交协议>)、[软件指南第 6 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#6-d6i1控制传输精确ack与引用>) 将配置和启动传输结果与完整启动分开。对 XPI 而言，配置请求得到回执不扩大本章第 5.6 节的访问形状，也不替代第 5.4.4～5.4.5 节的 Host R/B 交付。软件能够观察到的控制结果、Host 访问结果和内部拒绝必须各有对象及关联；内部返回标签并不是新软件寄存器。
+
+本轮未核实新桥到 XPI 开放/错误返回的端到端连接，不将指南中的启动例程视为业务许可来源。相关系统条件见[第 4.9 节](#software-system-contract)，继续由 [REQ-XPI-002](#req-xpi-002)、[REQ-XPI-003](#req-xpi-003)、[REQ-IF-004](#req-if-004) 承接，不改变原数据路径结论。
+
+<!-- SW-INTEGRATION-V1:xpi:END -->
 
 ## 5.6 当前支持形状、构建条件与配置范围
 
@@ -1709,6 +1845,17 @@ PA 还向 DDRC 提供 WR/LPR/HPR 的 go2critical 提示，用于表达紧急或�
 这些接口共同承接 [REQ-PA-001](#req-pa-001)、[REQ-PA-002](#req-pa-002)、[REQ-HIF-001](#req-hif-001) 和 [REQ-IH-004](#req-ih-004)。具体到下一轮模块评审，HIF 应解释同一 Grant 如何选择命令、写指针与身份旁带；IH 应解释实际接收、规范化结果保持、Entry 分配和后端 retry 如何分别推进，而不是把它们全部归结为 PA 已授权。
 
 
+<!-- SW-INTEGRATION-V1:pa:BEGIN -->
+
+<a id="pa-software-boundary"></a>
+### 6.7.1 软件配置与服务选择的边界
+
+软件操作可以通过配置和系统运行资格间接约束请求供给，但不能把 APB 完成或控制回执当成 Credit 补入、Grant、IH 接受或后端完成。本文保留原 DDR5 仲裁配置机制；本轮没有核实 D6C1/D6I1 提供新的 PA 参数控制，也不声称软件能直接驱动内部 Reservation、Grant 或 Entry。指南中的 donor APB 诊断步骤仍按其限定范围理解。
+
+软件入口与 PA 的实际关联应由同版集成源码说明，见[第 4.9.4 节](#software-module-contract)及[待确认项](#software-open-questions)。这不改变 [REQ-PA-001](#req-pa-001)、[REQ-PA-002](#req-pa-002) 的同源交付和容量反压要求。
+
+<!-- SW-INTEGRATION-V1:pa:END -->
+
 ## 6.8 反压、公平性与进展条件
 
 分析等待时，应先辨认请求停在哪个阶段。不同阶段的等待由不同模块解除，单独提高 PA 优先级不能解决所有阻塞。
@@ -1758,3 +1905,389 @@ DDR5 PA 已具备请求屏蔽、分类额度、等待优先级、读写切换、
 Reservation 的当前状态应分别理解：OPT2 仍执行新增资格检查，但两个 Reservation 输出为零；OPT1 保留候选时，外围会同步保持事实并参与后续一致性检查。这是内部交付方案，不是 JEDEC 指定的仲裁格式，也不表示已经预留 DRAM 执行时刻。
 
 下一步模块评审需要围绕同一访问继续解释两件事：HIF 如何让命令、写指针、数据路由与身份旁带服从同一选择；IH 如何把输入接受、地址解释、结果保持、Entry 分配与 TE/retry 分开推进。PA 则依据这些明确的承接条件控制前端，而不替代后端时序调度。本章完成设计说明，运行验证范围与产品选择留待人工评审。
+
+
+<a id="hif-detailed-design"></a>
+# 第7章 HIF 详细设计
+
+## 7.1 HIF 的职责与设计目标
+
+一条写命令被选中后，写数据不一定立即到达；一次读请求被接受后，数据也要经过后端处理才能返回。HIF 解决的是这些交接中的选择与路由问题：命令选自哪一个前端请求、当前写数据取自哪个端口，以及返回数据应交给哪个 XPI。它不是把 PA 输出简单打一拍的单一流水级。
+
+实际结构由 `DWC_ddr_umctl2_hif_cmd` 和 `DWC_ddr_umctl2_hif_data` 两个模块协作组成。前者按 PA Grant 选择命令字段；后者保存写路由指针、选择写数据，并分发读返回。命令 FIFO 位于 IH，写数据存储和 Entry 描述位于 WU，读重排位于 XPI。它们有不同的接受与释放事件。
+
+| 路径 | HIF 的工作 | 相邻模块承担的工作 |
+| --- | --- | --- |
+| 命令 | 同一次 Grant 选择地址、类型、长度、优先级、Token 或写路由指针；候选增加身份旁带 | XPI 保存与拆包，PA 仲裁，IH 保存并解释请求，TE/PAS 管理后端资源和调度 |
+| 写数据 | 用指针队头选来源，维持有效/反压及包尾推进；候选同阶段传递 Parent | WU 组织 Entry 对应的存储位置及接收资格；MR、数据关联和传输逻辑处理后续读出与发送 |
+| 读返回 | 从返回 Token 解出端口，分发有效信号，转发数据、包尾与错误 | RT 关联发令控制记录，RD 处理后端格式，XPI RRB、格式恢复和响应队列完成上游交付 |
+
+本章沿用[第 3 章](#ddr5-original-architecture)的职责划分和[第 4 章](#ddr6-overall-design)的总体方案。下文 DP 指 `dwc_ddrctl_ddrc_dp` 数据通路封装。HIF 在 MC 内部交接命令和数据；目标 MC–PHY 边界仍由 [REQ-IF-002](#req-if-002) 约束，不能把 HIF valid/stall 当作 DFI 或真实 PHY 的传输完成。
+
+当前候选的两个实例及实际端口见 [HIF 实例与命令连接](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L3266–3370、[HIF_DATA 写指针、数据及返回连接](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L3371–3426。本章只对 MANIFEST 选中的源码、明确的参数绑定和可见状态推进作静态判断；不以编入文件代替运行与功能验证。
+
+<a id="hif-original-routing"></a>
+## 7.2 DDR5 HIF 原始设计
+
+### 7.2.1 命令选择与路由
+
+原 HIF_CMD 接收各 XPI 的内部读写候选。写侧选择地址、写指针、优先级、包属性，并根据上游读改写标志生成 RMW 类型；读侧选择地址、Token 和长度。普通读、普通写和 RMW 是这里可选择的请求类型，TE/PAS 不通过此 mux 反向插入一条 Host 命令。
+
+字段由同一组 `pa_wgrant/pa_rgrant` 选择。读写有效和类型还结合被选请求有效信号；HIF_CMD 没有独立命令 FIFO。单一来源和读写互斥由仲裁合同保证，不能把原字段按位汇合的写法理解为允许多个请求同时组成一条命令。依据：[E04](#rtl-evidence-index)；[原写字段选择](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)，L166–211、[原命令统一输出](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)，L288–311。
+
+PA Grant 同时反馈前端内部 ready。IH 的命令 stall 参与 PA 掩码，IH 输入端再用 `hif_cmd_valid && !hif_cmd_stall` 写入 FIFO。因此“选择了哪个来源”“IH 本次实际收到了什么”和“后端何时发令”必须分别解释；在当前组合 Grant 分支，前两个事件可以同拍，但仍不是 PAS 已执行器件命令。原 IH 接受条件见 [E09](#rtl-evidence-index)，仲裁细节沿用第 6.2.5、6.5.3 节。
+
+### 7.2.2 写数据指针队列
+
+写数据需要两个不同坐标。HIF 要知道从哪个端口取数据、相应 BID 和是否为原事务末包；WU 要知道把这个内部包存入哪个 Entry。原设计因此保留两条同源队列，而不是让 HIF 指针直接表示 RAM 地址。
+
+HIF_CMD 先把前端产生的写路由指针随命令交给 IH。IH 在写请求有效且 TE 不要求 retry 时，经出口寄存器返回同一请求的指针；HIF_DATA 用 `hif_wdata_ptr_valid` 将它写入 `wptrq`。同一后端接受阶段，WU 描述 FIFO 保存 Entry 和相关属性。指针返回不是 PA Grant 当拍无条件入队，也不是新申请一块写数据 RAM。依据：[原 IH 指针返回寄存器](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_core_out_if.sv>)，L158–176、[原 WU 描述入队与流控](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/wu/memc_wu_wdata_if.sv>)，L245–282。
+
+~~~mermaid
+flowchart TB
+  C["HIF_CMD 选中的写命令<br/>含原写路由指针"] --> I["IH 输入 FIFO<br/>等待后端交付"]
+  I --> A["IH 写交付有效<br/>TE 无 retry，数据资源允许"]
+  A --> P["IH 出口寄存器<br/>返回路由指针与 valid"]
+  A --> Q["WU 描述 FIFO<br/>Entry 与包属性"]
+  P --> H["HIF_DATA wptrq<br/>端口、BID、原事务末包等"]
+  H -->|"队头选数据来源"| M["HIF_DATA 写数据 mux"]
+  X["XPI 数据缓冲<br/>经原包装通路"] --> M
+  M --> R["可选数据重定时"]
+  R --> W["WU 数据接收与 RAM 写通路"]
+  Q -->|"Entry 与包内位置"| W
+~~~
+
+图中两队列分属 HIF 与 WU，模块间经 MC 顶层/数据通路互连接线；它们没有合并为一个 FIFO。当前包的数据来源由 wptrq 队头的端口字段决定，RAM 位置则由 WU 的 Entry 及包内计数决定。原字段解码见 [写指针内容及端口选择](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_data.sv>)，L375–396，原 WU 地址关系已在第 3.5 节说明。
+
+### 7.2.3 写数据选择与交付
+
+指针队列非空后，HIF 才能从指定端口提供数据。是否接受一个上游数据拍，还受数据阶段容量以及该拍是否需要生成响应、响应队列能否承接的约束。原 RTL 的两个推进条件最能说明其含义：
+
+~~~systemverilog
+assign wptrq_rd = wdata_valid & ~wdata_stall_i & wdata_end;
+assign e_wready = {(NPORTS){~wdata_stall_i & ~wptrq_empty}} & (e_bready|~bresp_wlast) & wport_num_oh;
+~~~
+
+来源：[E05](#rtl-evidence-index)、[E06](#rtl-evidence-index)，分别对应原文件 L335、534。`wdata_end` 来自内部包尾 `e_wlast_pkt`，不是把所有 Host burst 的 WLAST 当作同一事件。`e_bready` 只在当前数据拍会产生相应响应记录时限制接受，不要求每个写数据拍都等公开 BREADY。数据选择与有效形成见 [原写数据 mux 与包尾](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_data.sv>)，L414–439。
+
+配置了重定时缓冲时，XPI→HIF 的接受表示数据进入该保持阶段，WU 可以稍后接受。没有重定时则两者在相同有效边沿对齐。指针在 HIF 当前阶段接受包尾后出队；WU 描述在其数据接收端的包尾推进，因此不能给所有配置都画成“两个队列无条件同拍弹出”。依据：[原数据重定时及组合分支](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_data.sv>)，L471–534。WU 接收、RAM 写入和后续 MR 读出不属于 HIF 本体。
+
+### 7.2.4 读数据返回
+
+读返回身份先在后端恢复。PI 发令时，RT 保存 partial/tag 控制记录；数据回来后，RT 用相应控制记录附回 Token，按有效数据和末尾条件弹出该记录。RD 再处理相应后端格式和请求类别，DP 将 RD 的 data、valid、end 和 info 接成 HIF 返回接口。这里不是从 DRAM DQ 数据中解出 AXI ID。原 RT 记录与出队见 [RT 控制记录入队/出队](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/rt/rt.sv>)，L400–412、[RT 有效、包尾和 tag](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/rt/rt.sv>)，L524–539；完整原路径见[Phase2D DDR5 读机制](<../phase2d/01_ddr5_read_mechanism.md>)。
+
+HIF_DATA 取 `hif_rdata_token` 的低位选择端口，数据总线广播、有效信号按端口解复用；Token、包尾、奇偶校验及错误随之转发。错误合并并不表示所有端口都收到一条响应，仍须结合相应端口 valid。此返回段没有一组可用 Host RREADY 随时暂停的数据重试握手。数据进入 XPI RRB 后，格式恢复和响应队列再向 Host 提供 R。依据：[E07](#rtl-evidence-index)。RT 控制 FIFO 出队、RRB 消费/Token 归还及 Host 最后 R 握手继续分别管理。
+
+### 7.2.5 原始机制的设计价值
+
+命令 mux 避免复制仲裁；写指针与 Entry 描述使“取自哪里”和“存到哪里”分工清楚；可选重定时解耦数据接受；读返回按 Token 找回前端来源。这些结构已能支持原设计中的排队和等待。DDR6 需要重新确认数据组织和来源关系，但没有依据仅因 BL24 或 Profile 变化就废弃这些基础机制。
+
+<a id="hif-design-requirements"></a>
+## 7.3 DDR6 对 HIF 提出的设计需求
+
+DDR6 Rev0.x R0、2026-09-14 委员会投票草案中的用户访问单位、BL24 与 non-data 布局，影响 MC 怎样组织并交付数据；它不规定 HIF 必须使用何种 Parent、Fact 或内部指针格式。规范差异仍以第 2 章 [S-DATA](#specification-reference-index)、[S-MD](#specification-reference-index)、[S-IF](#specification-reference-index) 为依据，本章不重新定义产品范围。
+
+| 需求及产生原因 | DDR5 已有基础 | 当前候选补充 | HIF 的具体责任与修改性质 |
+| --- | --- | --- | --- |
+| [REQ-HIF-001](#req-hif-001)：一次 Host 请求扩展出多级内部工作后，命令与数据仍须同源 | Grant 选源、写指针、包边界与反压 | 命令侧同 Grant 选择身份/事实，数据侧同阶段传递 Parent；相邻模块继续核对 | 保持选源和接受事件一致。身份编码、比较位置与保留方式是候选设计选择 |
+| [REQ-HIF-002](#req-hif-002)：用户字节与 BL24、Metadata/CRC 布局不能混算 | 数据宽度、掩码、包组织与 WU 接口 | 与相邻编解码/存储路径约定每包、每片段的有效数据和容量 | 协议要求正确数据覆盖；八个 16B、内部总线宽度、受限 MD_OFF/CRC 关闭路径由方案和配置决定 |
+| [REQ-HIF-003](#req-hif-003)：读片段最终要回到同一请求，错误与末拍也要对应 | RT 控制记录、Token 路由及 XPI RRB | 外围接收器关联实际命令/片段，保留原返回链；XPI 在保持级附加返回 tag | HIF 负责返回端口、数据/Token/错误的衔接，不承担所有物理片段重组和 Host 排序 |
+
+原请求身份的建立和生命周期已由[第 5 章](#xpi-detailed-design)说明，PA 的选择资格由[第 6 章](#pa-detailed-design)说明；HIF 只承接这些既有接口。[REQ-PA-001](#req-pa-001) 与 [REQ-XPI-002](#req-xpi-002) 在这里是跨模块背景，不转移其负责模块。接受、传输和上游响应的区分继续遵守 [REQ-IF-004](#req-if-004)。
+
+<a id="hif-overall-scheme"></a>
+## 7.4 DDR6 HIF 总体设计方案
+
+候选保留原命令 mux、写指针 FIFO、可选数据重定时和读返回路由，在已有交接处增加身份与来源检查。下面按三个通路展示 HIF 的实际位置；HIF_DATA 的写路由和读路由只是同一实例的两个功能视图。
+
+~~~mermaid
+flowchart TB
+  X["XPI 原命令及身份旁带"] --> C["HIF_CMD<br/>同 Grant 选命令与旁带"]
+  P["PA 的读写 Grant"] --> C
+  C --> I["IH 输入 FIFO<br/>同头检查与后端交付"]
+  I --> E["TE 请求资源<br/>后续由 PAS 等调度"]
+  I --> OP["IH 出口寄存器<br/>写路由指针返回"]
+  OP --> Q["HIF_DATA 指针 FIFO"]
+  Q --> W["HIF_DATA 写路由<br/>数据与 Parent 同阶段"]
+  D["XPI 当前数据包<br/>data / Parent"] --> W
+  I --> DQ["WU 描述 FIFO"]
+  DQ --> U["WU 接收/存储资格<br/>后续 MR 与数据关联逻辑"]
+  W -->|"data / end / Parent"| U
+  U -.->|"实际数据反压"| W
+  T["RT<br/>控制记录与返回数据关联"] --> R["RD：后端数据处理"]
+  R --> H["HIF_DATA 读路由<br/>Token 选端口"]
+  H --> G["arb_top 返回入口门控"]
+  G --> B["XPI RRB / 格式恢复<br/>响应队列"]
+~~~
+
+图中 MC 顶层/DP 的纯接线以边表示，IH 出口寄存器、HIF 指针 FIFO、WU 描述 FIFO等会改变保持和接受时刻的环节均单独标出。TE 不通过 HIF 搬运写数据；PAS 的器件时序检查也不归入 HIF。读片段接收和 RT 前的实际数据源另见[第 7.7 节](#hif-read-return)。
+
+实际 DP 写数据/反压与描述连接见 [HIF 数据接入 WU](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)，L1483–1496；RD→HIF 的返回连接见 [返回 Token 和地址错误](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)，L1134–1137、[返回数据与有效](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)，L1174–1176。命令、指针和新旁带的 HIF 实例连接已列于第 7.1 节。
+
+命令侧新增比较发生在原命令字段选择之后，数据侧新增 Parent 不占用原用户数据位，也不塞入旧写指针字。两侧并没有因此变成一个同步通道：命令可先进入 IH FIFO，数据仍需等返回指针与 WU 资格。BUILD 与类型不匹配时，各个旁带、数据保持和返回分支有各自关闭行为，不能统一概括为“所有功能自动回退”；具体条件见[第 7.10 节](#hif-build-scope)。
+
+
+<a id="hif-command-identity"></a>
+## 7.5 命令通路与请求身份关联
+
+### 7.5.1 Grant 与命令交付
+
+命令通路需要先选来源，再确认接受。PA 的资源与资格判断解决“能否参加本次选择”；有效 Grant 决定 HIF_CMD 使用哪个端口；IH 输入 FIFO 的写入才表示本次命令被该边界接收。FIFO 中的同一队头以后还要通过解释、重试和真实后端接受，才能消费。PAS 发出器件命令发生在更后面的调度阶段。
+
+~~~mermaid
+flowchart TB
+  Q["XPI 当前内部请求<br/>及外围资格"] --> P["PA 优先级与资源选择"]
+  P --> G["有效读写 Grant"]
+  G --> H["HIF_CMD<br/>同来源字段及旁带选择"]
+  G -.->|"内部 ready 回接"| Q
+  H --> A["IH 输入接受<br/>valid、无 stall、准入满足"]
+  A --> F["IH 输入 FIFO 的同一命令头"]
+  F --> T["解释与重试条件满足后<br/>TE 实际接受"]
+  T --> S["PAS 等后端调度与器件发令"]
+  B["IH stall / 外围暂不准入"] -.->|"限制选择资格"| P
+~~~
+
+这是事件依赖图，不给出固定拍距。当前 OPT2 的有效 Grant 是受 stall 屏蔽的组合选择，等待期间不要求 HIF 保存一份不变的 Grant；真正未交付的请求由 XPI 队列保持。IH FIFO 接受和队头消费还可以在同一边沿分别服务不同记录，不能合并成一次统一出队。PA 细节沿用第 6.5.3 节，相关掩码见 [当前仲裁 stall 掩码](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_arb.sv>)，L159–168。
+
+候选输入写入为 `input_fifo_put=i_hif_cmd_valid && r1_ih_admission`；后者受当前 normal-open 资格约束。FIFO 队头的读消费又要满足真实接受与重试条件，见 [候选输入写入](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)，L519–534、[准入对写入后推进的约束](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)，L1717–1721及 [E21](#rtl-evidence-index)。因此，HIF 选中一条命令并不单独证明 TE Entry 已加载，更不表示对应写数据已到 RAM。
+
+### 7.5.2 身份或来源信息的传递
+
+原 Token 和写路由指针仍有各自用途。候选另外携带 Parent、原始事实和原生 Child，是为了在不同队列和时钟阶段核对“当前看到的命令，是否仍属于原来接受的请求”。身份的分配和 XPI 保持机制见第 5.4.1～5.4.3 节，本节只说明 HIF 的选择边界。
+
+| 信息 | HIF 从哪里取得 | HIF 实际核对什么 | 后续负责范围 |
+| --- | --- | --- | --- |
+| 命令 Parent | 被 Grant 选中的 XPI 内部 AW/AR 旁带 | Grant 已知且仅一个来源；命令有效；Parent 已知且非零 | IH 随原命令保存并参与同头资格，不替代 Token/Entry |
+| AW Fact | 写 Grant 对应的已登记原请求事实 | 写方向、选中请求有效、非 RMW；Fact 与被选 Parent 一致，命令为普通写 | IH/后端继续核对该事实、地址解释与已接受请求 |
+| AR Fact 与原生 Child | 读 Grant 对应的事实及已检查范围记录 | 读事实的格式/身份一致；Child 包含同一 Fact，原生地址等于当前命令地址，保留 present 与 checked 的区别 | IH/TE 核对描述与实际 Child，HIF 的 checked 不是规范化读执行许可 |
+| 可选 Host Packet | 特定写分支的包描述 | 包 Parent、事实、原生地址与本次命令一致；另有宽度和格式限制 | 当前 HOST_PACKET=0；此旧 25bit Parent 分支不能当作当前 188bit 路径已启用能力 |
+
+命令 Parent 的关键资格为：
+
+~~~systemverilog
+if (selected_count==1 && ((^selected_parent)!==1'bx) && selected_parent != '0) begin
+  hif_ddr6_parent_valid=1; hif_ddr6_parent=selected_parent;
+end
+~~~
+
+这是 [同 Grant 的 Parent 选择](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)，L358–381 中的条件；外围还要求实验开关、命令有效及 Grant 已知。AR Child/Fact 见该文件 L384–435，AW Fact 见 L438–467，Host Packet 见 L469–496。旁带与原字段使用相同选择来源，而不是用 Token 数值冒充 Parent，也不是把多个身份按位合成一个新身份。
+
+### 7.5.3 同来源检查与状态推进
+
+HIF_CMD 在比较失败时将对应新增旁带的有效标志保持为零；原 `hif_hif_cmd_valid` 的表达式仍由旧请求和 Grant 形成。这一点决定了检查必须与其消费者一起评审：仅看见比较器，不能认定原命令已经被 HIF 撤销或已向 Host 返回错误。
+
+| 检查结果 | HIF 本地作用 | 对后续推进的实际含义 |
+| --- | --- | --- |
+| Parent 来源唯一且合法 | 输出 Parent 与 valid | IH 在同一个 FIFO 字保存该旁带；仍须其余准入条件 |
+| Parent 无效或多来源/未知 Grant | 新 Parent valid 为零 | 原命令 valid 不因此直接清零；IH 相应头部资格不能视为成立 |
+| Fact/Child 关联不满足 | 对应 Fact valid 或 Child checked 不成立；Child 可以仍 present | 不能凭 present 推进真实读接受；后续检查和系统异常处理仍有独立职责 |
+| 可选格式分支不满足 | 该分支旁带关闭 | 不推论原通路或其他候选分支都可用；当前包分支并未启用 |
+
+依据：[保留的原命令输出](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)，L336–353与第 7.5.2 节各比较分支。IH 将无效 Parent 写为无效旁带，并在队头资格中读取其 valid/已知条件，见 [Parent 随原 FIFO 字保存与检查](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)，L973–994。当前受限写头还核对已检查 carrier 与同一 Parent，见该文件 L925–968；读头消费见 [E21](#rtl-evidence-index)。这些是不同环节的资格，不能只凭 HIF 某一 valid 就证明整条命令链闭环。
+
+这类失败也不能一律写成“等资源恢复即可”。如果请求上下文不完整、身份矛盾或形状超能力，需要明确诊断、拒绝或恢复合同；本地旁带无效本身没有定义完整 AXI R/B 错误响应。相关边界继续由 [REQ-HIF-001](#req-hif-001)、[REQ-IF-004](#req-if-004) 及第 4.4.2 节承接。
+
+<a id="hif-write-routing"></a>
+## 7.6 写数据路由与事务对应
+
+### 7.6.1 DDR5 的双队列机制
+
+写指针在 IH 实际写交付之后返回，不在 AW 握手时直接产生。HIF wptrq 保存“从哪里取”，WU 描述 FIFO 保存“交给哪个 Entry”；第 7.2.2 节已画出二者关系。当前候选保留 `wptrq_wr=hif_wdata_ptr_valid` 和包尾出队条件，FIFO 字仍是原路由/响应信息及可选地址错误位，没有新增 Parent 字段。
+
+同一包的多个数据拍继续使用同一指针队头。HIF 的端口/BID/末包信息与 WU 的 Entry 位置必须由此前的接受顺序对应；只比较指针数值，不能证明跨多个包和完成记录的全部来源一致。原数据组织队列怎样跟随包尾推进，仍见第 5.4.2 节。
+
+原/候选队列与推进对照见 [E05](#rtl-evidence-index)和 [保留的 wptrq 及状态连接](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L373–412。深度仍由 WDATA_PTR_QD 参数决定，宽度仍由原指针字段及可选地址错误位构成；新增旁带不等于扩容或另建一个 Parent 指针 FIFO。
+
+### 7.6.2 DDR6 候选的来源一致性检查
+
+候选写 Parent 来自 XPI 随数据组织记录保持的旁带。HIF_DATA 用当前指针的 one-hot 端口选择它，要求对应数据 valid、Parent valid 且 Parent 已知；再与所选数据、掩码和包尾经过同一重定时或组合阶段。其内部保持字可增加 Parent+valid，原用户数据位及旧指针字的含义保持。
+
+当前 arb_top 仅在 `A_NPORTS==1 && INT_NPORTS_DATA==1` 时直接连接这组数据 Parent，多端口不匹配分支将其有效和数据清零。不能从 HIF_DATA 内部写了端口循环就认定当前顶层已实现多端口身份路径。依据：[数据 Parent 的实际单端口接法](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L1525–1535、[Parent 已知性和同端口选择](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L227–234、[Parent 与数据同阶段保持](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L513–562。
+
+~~~mermaid
+flowchart TB
+  XP["XPI 数据组织记录<br/>data / mask / 包尾 / Parent"] --> H["HIF_DATA<br/>指针选端口，同阶段传 Parent"]
+  Q["原 HIF wptrq 队头"] -->|"选择来源"| H
+  H --> U["WU 接收资格<br/>来源、描述头位置、计划及行保留许可"]
+  U --> O["WU 保留记录与实际 RAM 写<br/>记录行 Parent 及保护状态"]
+  O --> M["MR 实际 RAM 读出<br/>读回保护及相位身份保持"]
+  M --> J["DP 内 Join<br/>命令 Parent 与相位 Parent、行、序号匹配"]
+  A["已经接受的命令与两行记录"] --> J
+  J --> F["当前八片段交付<br/>交付不等于最终完成"]
+  U -.->|"stall 经原数据接口返回"| H
+~~~
+
+图中的计划与行保留许可用于确认实际存储位置和可接收性；严格说，HIF 自身没有在指针队头保存另一份命令 Parent 并与数据 Parent 比较。WU 的源身份已知性、描述头位置、计划/保留地址回显和接收容量共同参与 stall。真实数据接受观察为：
+
+~~~systemverilog
+assign ddr6_wdata_parent_source_fire=DDR6_HIF_WDATA_PARENT_TRANSPORT &&
+  ddr6_wdata_parent_intake_ok && wu_co_wdata_stall===1'b0;
+~~~
+
+来源：[WU 接收资格及实际 source_fire](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/memc_wu.sv>)，L816–853。这里的 intake_ok 已含有效、时钟和复位条件；预先容量可用、来源已知或允许接收都不是独立的实际数据接受事件。
+
+接收以后，保留逻辑先捕获数据、Parent、地址和掩码，实际 RAM 写发生后再记录保护状态。读回还核对行 Parent、行保留/保护状态和实际数据校验。它们属于 WU/相邻存储路径，而不是 HIF 的一个新 RAM。依据：[行身份与实际读回保护](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/ddr6_wu_retained_word_owner.sv>)，L314–345、[捕获和实际写入分开](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/ddr6_wu_retained_word_owner.sv>)，L452–465。
+
+Join 位于 DP 内，接收命令/行记录和 MR 读出后的相位数据。它才显式比较 `phase_parent` 与已接受命令的 Parent，并核对行、ordinal（包内片段序号）、完整成员/掩码和重复捕获。失败形成 phase_bad，限制正常捕获/呈现并参与故障处理；没有据此证明已经产生公开 AXI 错误。实例与相位接线见 [Join 位于 DP 及其输入连接](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)，L735–806；比较和正常呈现条件见 [命令与数据的明确匹配](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/ddr6_command_data_join_sender.sv>)，L326–380。本章不重复其八片段与完成账本的全部生命周期。
+
+### 7.6.3 写数据接受与完成事件
+
+下面每个事件都有独立对象。当前 WDATA_RETIME=0 的静态配置使部分数据接受时刻对齐，但不改变语义；开启重定时后，HIF 指针和 WU 描述的推进还可以分开。
+
+| 事件 | 具体条件或归属 | 含义及后续关系 | 是否代表 DRAM 阵列写入成功 |
+| --- | --- | --- | --- |
+| HIF 选择写数据 | wptrq 非空，端口字段驱动数据 mux | 决定当前来源；仍可能反压 | 否 |
+| XPI→HIF 接受数据拍 | 被选 e_wvalid 与 e_wready | 数据进入 HIF 当前阶段；有重定时可先保存 | 否 |
+| HIF→WU 接受数据拍 | hif_wdata_valid 且无 hif_wdata_stall；候选还受 WU intake 条件约束 | 承接一个数据拍；后续实际 RAM 写另有事件 | 否 |
+| 指针出队 | wdata_valid 且无当前阶段 stall，且 wdata_end | 该内部数据包在 HIF 当前阶段结束 | 否 |
+| 内部早 B 记录产生 | e_bvalid=e_wvalid & bresp_wlast & e_wready | 普通无相关保护分支可在原事务末包的首个接受拍产生；不是全部数据已发送 | 否 |
+| Join 片段接受 | packet_valid 与 packet_ready | 推进相应发送位，不是片段最终完成 | 否 |
+| 后端/模型传输完成 | 当前 transport 完成写 UI 并释放引脚后产生 completion | 是该模型传输阶段的完成输入 | 不能据此确认 |
+| 内部聚合与公开 B | 所有片段相关完成依据齐备，再与原 WRQ 信息匹配；Host BVALID/BREADY 完成交付 | 聚合、公开交付、WRQ 消费和内部回执各有条件 | 不能直接据此确认 |
+
+原早 B 的条件见 [E24](#rtl-evidence-index)及 [原早 B 的实际产生点](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_data.sv>)，L636–638；候选本地产生条件仍见 [候选保留内部 B 路由](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L685–687。模型 completion、片段聚合及公开 B 已在第 4.6、5.4.5 节和[Phase2B 完成分析](<../phase2b/04_identity_completion_analysis.md>)展开，公开 B 的独立条件见 [E25](#rtl-evidence-index)。HIF 没有因新完成策略而把原指针一直留到公开 B 或 Parent 退休。
+
+<a id="hif-read-return"></a>
+## 7.7 读返回数据路由
+
+### 7.7.1 先恢复控制关联，再沿原返回链交付
+
+当前候选在 RT 之前增加受限返回接收器，而不是在 HIF_DATA 内新增一个完整片段重组器。接收器先关联实际 IH 接受的请求、核心 tag、命令目录和片段记录；收集八份 128bit 用户数据，再按前四片/后四片形成两份 512bit 返回。DDRC 的真实 mux 在对应 BUILD 成立时选择这些输出，否则按代码回到原 DFI 输入。
+
+~~~mermaid
+flowchart TB
+  A["IH 实际接受的请求<br/>核心 tag 与原始 AR 事实"] -.-> RX["候选读返回接收器<br/>身份检查与四加四重组"]
+  TR["仿真 transport 解包<br/>MD_OFF 数据与片段标识"] --> RX
+  RX -->|"两份 512bit 返回"| M["DDRC 实际数据源 mux"]
+  O["原 DDR5 DFI 数据输入<br/>对应回退分支"] --> M
+  M --> RT["RT 数据处理<br/>配合控制 FIFO 队头"]
+  PI["PI 的实际读发令控制记录"] --> TF["RT 控制 FIFO<br/>保存 partial / tag"]
+  TF --> RT
+  RT --> RD["RD 格式和请求类别处理"]
+  RD --> H["HIF_DATA<br/>Token 低位选端口，数据与错误转发"]
+  H --> G["arb_top 返回入口<br/>first_core_gate_allow"]
+  G --> X["XPI RRB<br/>再经格式恢复与响应队列"]
+  X --> U["Host RVALID / RREADY"]
+~~~
+
+图中仿真 transport 是当前模型适配，不是目标 PHY/DFI 已冻结的接口。命令/片段身份来自控制记录和接受事件，不是 DRAM 数据线上携带 Parent。接收器实例的分配、Token 与片段接线见 [返回接收器的真实关联输入](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc.sv>)，L4472–4508；数据源 mux 见 [E23](#rtl-evidence-index)；四加四重组见 [片段核对与两拍输出](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/ddr6_r1_rd_return_receiver122.sv>)，L200–266。
+
+HIF 后半段继续使用原机制：`rport_num` 从 Token 低位取得，`e_rvalid` 只对相应端口有效，数据、末包和 Token 转发，错误合并后随数据交给 XPI。候选表达式见 [候选保留读返回路由](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L707–725，原版见 [E07](#rtl-evidence-index)。完整返回 tag 在 XPI RRB 和后续保持级附加、保存，见第 5.4.4 节及 [E22](#rtl-evidence-index)；不能把这些保持结构改称 HIF 内部重排缓冲。
+
+
+HIF 到 XPI 的实际入口还受保护条件控制：arb_top 将 HIF 的端口 valid 接成 hif_rvalid，送 XPI 时与 first_core_gate_allow 相与；RRB 写入使用 XPI 内已选中的返回 valid。因此“HIF 返回有效”和“XPI 入口实际允许接收”仍需分别核对，这不是 Host RREADY 的逐拍反压。依据：[返回有效的入口资格](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L2774–2784、该文件 L3434；[RRB 返回信息与写入](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi.sv>)，L5980–6003。
+
+### 7.7.2 返回容量与资源释放
+
+这条 HIF 返回接口没有逐拍 ready，Host 的 RREADY 不会沿一根反压线直达 transport。后端需要先保证返回容量；当前 RT 观察使用空 FIFO、无当前返回数据、计数/模式合格等条件服务单笔在途返回。接收器输出也没有普通 ready/valid 式的逐拍重试，依靠真实 RT 返回和出队观察核对进度。依据：[RT 当前容量和实际进度观察](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/rt.sv>)，L1501–1549。有两个保留历史组，不等于已有任意两笔并发服务能力。
+
+| 环节 | 实际推进或保存对象 | 不能合并的后续事件 |
+| --- | --- | --- |
+| 返回接收器 | 已接受片段、数据缓存及已发两拍；核对实际控制记录 | 内部 retired 不等于 Host 最后 R 已交付 |
+| RT | 发令时保存 partial/tag；按数据末尾等条件弹出控制记录 | RT 出队不等于 XPI Token 已释放 |
+| HIF_DATA | 组合路由返回数据及有效/末包/错误 | 此段没有独立 Host 响应消费队列 |
+| XPI | RRB、格式与响应保持级关联原请求；按各自消费事件释放 | TM 归还、响应队列出队、Host 最后 R 和 Parent 退休分别处理 |
+
+Host 暂不接收时，由已分配的 RRB 和后续保持级吸收等待；这并不赋予已启动的外部读传输任意暂停能力。HIF 也没有用 Parent 比较器替代已有 Token 和容量管理。对应要求为 [REQ-HIF-003](#req-hif-003)，完成边界继续按 [REQ-IF-004](#req-if-004)。
+
+### 7.7.3 访问粒度必须沿完整返回路径判断
+
+以下范围沿用第 2.3、4.7、5.6 节和[Phase2D 访问粒度分析](<../phase2d/03_profile_access_granularity.md>)。表中的“已有”表示静态局部实现，不表示本轮仿真通过或产品范围获准。
+
+| Profile / 请求 | 地址与描述已有能力 | 当前分列和返回数据路径 | 本章可作出的判断 |
+| --- | --- | --- | --- |
+| 2p3 / 3DQ，8B 用户单元 | 已有按 8B 解释地址和逐列检查 | 当前 AR helper 要求 16B 用户列；所选返回目录和 codec 为八份 128bit 数据，没有核实到此链中 16×8B→8×16B 的转换 | 地址语义有实现；当前选中读路径的粒度组合与适用范围待确认，不能认定为已支持或静默映错 |
+| 2p6 / 6DQ，128B、八个 16B | 地址与八列描述在合法上下文下相容 | 当前固定配置仅启用 2p6/32Gb；受限返回接收器对应 8×128bit→2×512bit，另有零号资源和模式限制 | 是最直接对应的静态子集；仍需运行和端到端验证 |
+| 1p6 / 6DQ，16B 用户单元 | 地址解释和分列单位相容 | 当前 Profile 位图不启用；实际 transport/服务范围仍是受限 2p6 路径 | 可讨论相关机制复用，不能据列检查推出整条 1p6 返回已可用 |
+| 256B 请求 | 原生 Child/规范化描述可表达两个 128B 工作单元 | 受限 AR columns 要求原始 len1/size6，当前返回和公开观察未证明覆盖两组完整返回 | 描述支持不能替代数据路径支持；端到端范围仍待确认 |
+
+八列 helper 的 16B/端点条件见 [E14](#rtl-evidence-index)，用户数据编解码见 [E15](#rtl-evidence-index)，当前 Profile 绑定见 [E26](#rtl-evidence-index)。其他目标 Profile 和真实器件布局仍保留 DDR6 草案及产品条件。
+
+已有 `ddr6_host_packet_segments` 确实能描述 2p3 的 16×8B 分段，不能遗漏。但其 source_ok 要求写方向，SHAPE 要求 HOST_PACKET、旧 Parent/Fact 格式等条件；当前 HOST_PACKET=0，而且该 helper 不传输用户 payload。它不是上述 AR 数据返回链的 8B 组合器。依据：[写分段 helper 的构建范围](<../../11_rtl_project/rtl/source/src/ddr6/ddr6_host_packet_segments.sv>)，L64–90、[8B/16B 分段描述及写来源](<../../11_rtl_project/rtl/source/src/ddr6/ddr6_host_packet_segments.sv>)，L157–181。
+
+<a id="hif-backpressure"></a>
+## 7.8 反压、队列管理与资源释放
+
+HIF 的等待要按接口分别判断。命令 stall 影响选择和 IH 输入，数据 stall 影响当前数据阶段；读返回则依靠事先容量，不具备对称的逐拍重试。身份不合法和超范围请求还需要异常合同，不能与暂时资源不足合并解释。
+
+| 情况 | 已核实的局部行为 | 保持、释放与待确认边界 |
+| --- | --- | --- |
+| 命令候选尚未被 IH 接受 | stall 参与 PA 掩码；XPI 当前请求未按内部 ready 消费 | 不要求组合 Grant 保持常量；FIFO put 与头部 get 分别记账 |
+| 指针有效而当前数据未就绪 | wptrq 保存队头，取被选端口数据；无数据包尾接受则不正常弹出指针 | 原数据和 IQ 组织记录继续保持；重定时分支另有本地保持阶段 |
+| WU 反压或行保留/计划资格不足 | WU stall 返回 HIF；组合分支使对应 e_wready 下降 | 临时容量等待不能计 source_fire；缺失或矛盾上下文不承诺可自行恢复 |
+| XPI 响应队列容量不足 | e_bready 在会产生响应的拍阻止接受 | 不是所有数据拍都与公开 BREADY 直接串联 |
+| 读返回暂时无法交给 Host | XPI RRB/后续响应级保留 | HIF 没有补出一个外部逐拍 ready；需验证预留容量和已发返回的承接 |
+| 指针 FIFO 满 | HIF 本地没有独立 pointer READY 协议；代码有条件编译的溢出断言 | 需要上游资源预算/接受合同防止越界；存在断言不等于本次宏启用了断言或已验证无溢出 |
+| 身份未知、不匹配或上下文不完整 | 命令旁带资格降低，WU/Join 等层次限制接收或置诊断故障 | 不认定自动丢弃、自动重试或已有公开错误响应 |
+| 请求形状超范围 | 有限形状 helper 可不形成正结果；部分原始读形状走 capability_wait | 区分资源等待、非法输入与能力边界；不能把全部情况都写成正常背压 |
+
+FIFO 溢出检查位于 [条件编译的指针溢出断言](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L740–748，受其外层 SNPS_ASSERT_ON/非综合条件限制。R1_DATA_BUILD 还只在限定单端口、无重定时和相关错误/独占存储关闭的分支导出 known、baseline、events；这些是状态观察，不能替代容量控制或证明所有并发场景活性。条件与观察输出见 [限定状态观察分支](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L148–157、[队列和数据阶段观察](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L752–767。
+
+资源归还保持原对象划分：wptrq 在当前 HIF 阶段接受包尾后释放队头；WU 描述在自身接受包尾时推进；Entry 还可能由后续 MR 读出进度归还；公开 B、完成回执和 Parent 活动状态按各自条件推进。读侧同样区分 RT 控制 FIFO、RRB/Token、响应队列和公开 R。第 3.7、4.6、5.4.4～5.4.5 节已经给出这些事件，本章不把它们改造成一个统一释放脉冲。
+
+没有新的动态测试支持“任意反压、并发、复位和身份故障下均能最终恢复”的结论。详细评审需要针对本节各个保持点核对实际事件顺序和恢复责任；具体未闭合项集中在第 7.10 节及 checkpoint。
+
+
+<a id="hif-software-contract"></a>
+## 7.9 软件编程模型关联与外部行为影响
+
+HIF 没有因为新增身份旁带就获得一个软件可直接读写的 Parent、指针或 Grant 寄存器。本轮可确认的是内部命令/数据接口；软件看到的配置回执、控制传输结果和 Host R/B 属于不同对象。软件如何获准启动业务、怎样读取错误与恢复，仍要由系统接口把这些对象连接起来。
+
+软件参考仍是权威入口中的 [软件指南第 1 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#1-使用前必须知道的完成边界>)所对应的《DDR6 MC 当前软件接口与中文编程指南》（2026-10-21，复核修订 v2）。本轮目录清点仍只有 PROGRAMMING_GUIDE.md；指南所指配套证据、快照、寄存器表和复核记录未在入口目录找到，声明的另一交付根目录不可访问。其版本与本章候选选源不能自动合并，详细缺口继续见[第 4.9.1 节](#software-evidence-scope)。
+
+| 软件可见行为 | 软件指南依据 | HIF 相关硬件行为 | 当前证据状态 |
+| --- | --- | --- | --- |
+| 软件或上游使用者提交业务读写，等待 R/B | [软件指南第 1 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#1-使用前必须知道的完成边界>)、[软件指南第 7 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#7-从复位到axi当前可做步骤与缺失步骤>)区分局部控制结果与业务开放；未给出可据此部署的完整业务启动流程 | 已准入请求仍按本章命令选择、指针/数据路由和返回链处理；Host 完成由 XPI 与外围响应逻辑组织 | 内部路径有本章静态 RTL 依据；指南新入口到业务开放/响应的端到端合同未核实 |
+| 配置/几何请求得到成功回执 | [软件指南第 5 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#5-configgeometry现有提交协议>)、[软件指南第 7 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#7-从复位到axi当前可做步骤与缺失步骤>) | HIF 仍受实际访问形状、后端容量和相应上下文约束；配置桥不等于 IH 映射器或 HIF 数据转换器 | 不用回执成功替代 2p3/1p6/256B 数据路径证据 |
+| APB 访问返回完成 | [软件指南第 3 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#3-apb-访问规范>) | 与 HIF 一拍数据接受或一个包结束没有通用等价关系 | 扩展桥行为仅按指南描述；原 APB 已核实边界见第 4.9.3 节 |
+| D6I1 控制传输回执及 ACK | [软件指南第 6 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#6-d6i1控制传输精确ack与引用>) | 启动控制传输不是 HIF 普通写数据队列；ACK 不直接代表指针出队、WU Entry 释放或 Host B | 对应新桥源码未取得，不增加未核实的桥→HIF 连接 |
+| 软件观察错误或发生超时 | [软件指南第 8 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#8-错误超时和恢复策略>) | HIF 有原数据/地址/校验错误转发；候选来源故障还可能在 WU、Join 或返回接收器出现 | 现有错误线不等于所有候选故障已映射成公开 R/B 或软件 CSR；恢复及对账仍需系统合同 |
+| 原 DDR5 APB 字段能够访问 | [软件指南第 1 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#1-使用前必须知道的完成边界>)、[软件指南第 7 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#7-从复位到axi当前可做步骤与缺失步骤>)限定原寄存器诊断用途 | 某些原数据路径仍使用相关模式字段，但字段存在不证明新的 PHY/格式语义适用 | 不把原寄存器名称变成新 HIF 编程口，也不补造初始化成功条件 |
+
+指南中的 SOURCE_FACT 继续限定在其声明版本，MODEL_FACT、ENGINEERING_ASSUMPTION、SPEC_REQUIRED、UNKNOWN/UNVERIFIED 也保持原范围。TB 可以层次化观察指针、内部身份和完成记录；这种可观察性不等于固件拥有相应 CSR，更不是 CPU 物理地址已经确定。
+
+当前完整初始化、适用训练、PHY 实际应用与 AXI 业务开放的缺口仍保留于[系统级待确认项](#software-open-questions)。D6C1、D6I1 与 HIF 数据通路之间既不能用名称建立连线，也不能用 APB 成功或局部 ACK 替代真实端到端完成。本章只说明这些外部行为对 HIF 接口合同的约束。
+
+<a id="hif-build-scope"></a>
+## 7.10 当前候选实现与适用范围
+
+### 7.10.1 原机制、候选修改与生效条件
+
+本章使用 [选源清单](<../../11_rtl_project/MANIFEST.json>)，L1–18 对应的 control0_empty_provider195_fixture_v18 / candidate_normal_rebind195_v44。宏包括 DDR6_COMMAND_BUILD；RTL 顶层为 DWC_ddrctl，参考测试顶层为 tb_integrated_startup013。主顶层默认值与参考测试绑定分别读取，不把后者自动当成任意顶层实例的运行状态。
+
+| 设计事项 | DDR5 原有机制 | DDR6 候选修改 | 当前生效条件 | 尚待确认或验证 |
+| --- | --- | --- | --- | --- |
+| 命令选择与 Grant | 同一 Grant 选择原命令字段 | 增加同来源 Parent、AW/AR Fact、AR Child 旁带 | 各 EXPERIMENT、格式和宽度必须成立；参考配置显式开启相关项 | 有效 Grant、IH put、头部 get 和 TE 接受的动态对应 |
+| 写指针队列 | 指针入队、包尾出队，端口/BID/末包等字段 | 原字与深度公式保留，新增状态连接 | 原 WDATA_PTR_QD/ADDR_ERR_EN 等参数继续决定存储 | 容量预算、溢出防护与实际指针返回时序 |
+| 写数据路由 | mux、响应空间及可选重定时 | Parent+valid 随数据保持阶段传递 | WDATA_PARENT_TRANSPORT；顶层直接接法限一个 Host/内部数据端口 | 多端口、其他重定时/错误存储组合需另给绑定和覆盖 |
+| 数据来源与命令匹配 | 顺序和两队列维持对应 | HIF 选来源；WU 接收/存储核对；DP Join 明确比较命令与相位来源 | 参考绑定开启 WU retained、预取、Join/片段相关项；数据宽度、模式和类型还须匹配 | 失败后的诊断、阻止交付、公开错误与恢复闭环 |
+| 读返回路由 | RT/RD 后按 Token 选 XPI 端口 | HIF 核心表达式保留；前置接收器重组数据 | R1_RD_RETURN_BUILD122 决定真实数据源；关闭/不匹配分支回原输入 | 回退路径是否满足目标模式须单独判断，不能视为通用 DDR6 兼容 |
+| XPI RRB/RDQ 衔接 | Token、数据、末包、错误及原重排 | 完整返回 tag 在 XPI 保持级附加，不在 HIF 数据线上新增 Parent | RETURN_TAG_BUILD 限单通道、内部 RRB、特定同步和宽度等条件 | Host RREADY 长反压、返回次序、错误和最后拍对应 |
+| IH、TE、WU 分工 | IH 交付请求，TE 管请求资源，WU 承接数据和 Entry 描述 | 加入配对解释、来源和实际接收资格 | 受 normal-open、retry、容量及各类型绑定限制 | 不把准入/Entry/配置控制都归入 HIF；详细 IH 机制留待其章节 |
+| Profile 与访问大小 | 原内部包和格式处理 | 当前受限八个 16B，读返两份 512bit | 固定 Profile 位图仅 2p6/32Gb；2p3、1p6、256B 分层边界见第 7.7.3 节 | 目标 Profile 人工签署及完整粒度桥、资源覆盖 |
+| Metadata、CRC 和外部载荷 | 原掩码及校验接口 | BL24 payload bridge 在相邻模型/传输路径 | 当前 MD_OFF、CRC 关闭；HIF 旧 CRC 错误输入存在不代表目标 CRC-on 已实现 | Metadata/CRC-on、真实 PHY 布局与目标接口合同 |
+| 队列/数据阶段观察 | 原队列和数据状态 | known/baseline/events 输出 | R1_DATA_BUILD 限 FIRST_STORE 开启、单端口、无重定时/交织/独占及相关片上保护分支关闭 | 状态观察不是新存储、接收许可或动态通过证据 |
+| 反压、错误与完成 | 原接受、早 B、包尾及资源释放分开 | 新来源资格与外围完成关联分别插入 | 各接口按本章实际事件推进；不成立分支分别阻断/关闭或回原输入 | 复位、并发、持续反压与异常恢复；真实 PHY 和 Host 完成承诺 |
+
+参考参数出处：[Profile、旁带与状态观察绑定](<../../11_rtl_project/profiles/fixture195_parameters.json>)，L12–52、[返回、WU、预取和写身份绑定](<../../11_rtl_project/profiles/fixture195_parameters.json>)，L89–123。原生成常量的单端口/512bit/片上保护条件与第 6 章相同，本轮定向核对的参数值见 [内部数据宽度](<../../11_rtl_project/rtl/source/src/DWC_ddrctl_cc_constants.svh>)，L163、该文件 L1498、2180、2206；HIF_DATA 将 OCECC_EN 传给 WDATA_RETIME，见第 7.1 节实例出处 L3394。
+
+Join 实例还明确要求当前内部宽度、ratio、掩码及若干原 DDR5 数据路径模式字段满足其条件，见第 7.6.2 节 DP 源码 L735–792。这说明当前模型路径如何复用原后端，不能把 reg_ddrc_ddr5 等字段的取值外推成目标 DDR6 PHY 接口规定。状态观察的 BUILD 与写 Parent transport 的开关也不同：前者不满足时观察不具备资格，并不等于后者在所有分支都不存在。
+
+### 7.10.2 详细评审需要确认的三个取舍
+
+| 取舍 | 当前方案的理由与边界 | 需要评审的证据 |
+| --- | --- | --- |
+| 保留原双队列，身份另随命令和数据保持 | 复用原取源/存放组织，不改变指针字职责；但跨多个保持阶段的一致性需要共同成立 | 同来源命令、返回指针、数据 Parent、WU Entry/行在持续反压及重定时下逐项对应 |
+| 将检查分布在 HIF、WU、Join 和返回接收器 | 各模块在掌握实际对象时核对，避免把“来源已知”误写成“整笔请求已匹配” | 缺失、重复、漂移和不匹配时的具体阻断事件、错误归属、公开结果与恢复；当前无统一 HIF 自动错误响应 |
+| 以八个 16B 衔接原返回和受限写交付 | 对当前 128B/2p6 静态子集直接；原 512bit 通路继续复用 | 2p3 的 8B 组合、1p6 配置/时序、256B 完整目录与公开返回，以及实际 PHY 的容量和次序合同 |
+
+这些是候选结构及其适用范围的评审，不预先决定扩大、替换或冻结方案。代码存在、参考参数绑定、真实服务选中、功能仿真通过和目标产品签署仍分别判断。本轮没有运行 RTL 仿真，没有用历史局部记录证明表中所有反压、并发或恢复场景。
+
+<a id="hif-chapter-summary"></a>
+## 7.11 本章小结
+
+DDR5 HIF 的核心是三件事：按 PA Grant 选择命令、按返回指针选择写数据、按返回 Token 分发读数据。命令和数据分别排队，使前端选择与后端承接解耦；它们的接受与包尾条件继续是候选方案的基础。
+
+DDR6 候选在命令侧增加同 Grant 的身份/事实校验，在数据侧增加同保持阶段的 Parent 传递，并在限定 BUILD 中导出状态观察。更完整的命令数据匹配、存储保护、片段重组和公开完成分属 WU、MR/Join、返回接收器及 XPI/外围响应逻辑。HIF 的新比较不是 JEDEC 指定的内部格式，也不把 HIF 变成 DFI 或软件可直接编程的事务管理器。
+
+因此，本章能够说明真实连接、推进条件和当前受限路径，但软件控制回执、HIF 交付、PHY 传输和 Host 完成仍各有边界。2p3、1p6、256B 的数据路径范围以及完整初始化/训练和真实接口，继续按前述条件审阅。后续第 8 章需要在既有接口基础上展开 IH 的地址解释、同头请求接受、Entry 和后端交付关系，本轮不提前展开。
