@@ -1,0 +1,29 @@
+# 第一阶段完成情况：LPDDR6 Bender 仿真验证与上板准备
+
+### 1. 完成 LPDDR6 Bender 关键功能仿真验证
+
+完成 LPDDR6 Bender 在 DRAM 行为模型下的基础读写仿真验证，按照 Bank、Row、Column 地址访问顺序执行写入和读回操作，验证写入数据与读回数据的一致性，初步确认相关指令执行及基础读写控制流程符合预期，为后续硬件平台部署和功能验证提供了仿真依据。
+
+### 2. 完成 Versal 2802 公板关键链路功能验证
+
+基于 Versal 2802 公板，完成 Windows Host 经 PCIe/QDMA 向 FPGA Frontend BRAM 下发指令的功能验证。通过 ILA 对 Frontend BRAM 写入端口进行观测，确认指令写入过程中的相关信号及波形符合预期，验证了 Host—QDMA—Frontend 的指令传输链路。
+
+该阶段验证了 Host 侧指令下发至 FPGA Frontend 的关键路径，为后续 Pipeline、Adapter、PHY 及 DRAM 访问链路的进一步联调奠定了基础。
+
+### 3. 推进 Host—FPGA 基础链路闭环验证
+
+完成当前 Versal 2802 公板上 Host 通过 QDMA 向 FPGA Frontend 传输指令的链路验证，初步打通指令从 Host 端到 FPGA 端的传输路径。
+
+现阶段验证范围主要覆盖指令下发及 Frontend 接收，后续仍需结合下游模块联调，进一步验证指令执行、DRAM 数据写入、读回及结果回传等环节，逐步完成 LPDDR6 Bender 的端到端测试闭环。
+
+### 4. 梳理定制板上板准备流程及阶段性问题
+
+结合现有仿真结果和 2802 公板验证情况，梳理 LPDDR6 Bender 定制板上板的主要步骤，包括 FPGA 程序加载、PCIe 枚举、QDMA 通信、指令下发、Frontend 接收验证，以及后续基础读写和数据回传测试。
+
+初步明确后续需要重点验证的环节，包括 Pipeline、Adapter、PHY 与 LPDDR6 DRAM 的集成，以及端到端读写闭环。同时，对已验证链路和待验证环节进行区分，为定制板返回后的 Bring-up、问题定位和系统联调做好准备。
+
+### 阶段性总结
+
+第一阶段围绕 LPDDR6 Bender 的仿真验证、公板关键链路验证和定制板上板准备开展工作，已取得基础读写仿真及 Host—QDMA—Frontend 指令传输链路验证成果，并明确了后续端到端联调的重点。
+
+下一阶段将结合定制板实际返回情况，推进平台 Bring-up、LPDDR6 基础读写验证及数据回传闭环，并为后续开展 DE 提供的 RowHammer 测试 Pattern 验证做好准备。
