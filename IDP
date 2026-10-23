@@ -1,323 +1,311 @@
-# 任务：重新绘制 XPI 的 Mermaid 模块图，提高可读性并拆分通路
+# TASK_ID: PACKAGE_PA_IO_ANALYSIS_INPUTS_V1
+# REASONING: High
+# MODE: Read-only packaging
 
-我正在学习 DDR5/DDR6 MC 中的 XPI 模块。  
-当前已有的 Mermaid 图把多条通路混在一起，导致以下问题：
+# 任务：整理 PA 模块 I/O 架构分析资料包
 
-1. 读命令请求通路与读返回数据通路画在同一张图里，不容易理解；
-2. `blue` / `red` 两路 ready 与请求、仲裁、返回关系不清楚；
-3. 控制、时钟、复位、低功耗、配置寄存器接口图过长，字体太小，不便阅读。
+## 一、任务背景
 
-请你基于**真实 RTL、已有模块分析报告和现有图的意图**，重新绘制更清晰的 Mermaid 图。
+我正在通过绘制模块 I/O 图，学习 DDR5/DDR6 Memory Controller 的硬件架构。
 
----
+此前已经完成 XPI 模块的 I/O 图，现在需要按照相同方式学习 PA 模块。
 
-## 一、总体要求
+但是完整 DDR6 MC 工程过大，无法通过公司邮箱传输。
 
-### 1. 绘图原则
+请从当前完整项目中提取理解 PA 模块所需的最小资料，制作一个体积尽量小、但保留关键接口和技术依据的 ZIP 压缩包，供公司的 AI 进行 Mermaid 架构绘图。
 
-请遵循以下原则：
+项目根目录：
 
-- 以**帮助工程师理解**为目标，不是追求把所有信号堆在一张图里；
-- 图中只保留**关键接口、关键信号组和关键职责**；
-- 必须基于**真实 RTL 和已有分析**，不能虚构连接；
-- 如果某条连接或语义尚不能确认，请明确标注“待确认”；
-- 图要**短而清楚**，优先可读性；
-- 同一张图中不要同时放太多子模块；
-- 如果图太长，请拆成多张图，而不是继续压缩字体。
+`E:\ddr6-mc-codex-ddr6-assets-20261013-171144`
 
-### 2. 输出格式
+DDR5 原始 RTL：
 
-请输出：
+`review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/`
 
-1. Mermaid 源码；
-2. 每张图对应的中文说明；
-3. 如有必要，补充一个简短表格说明关键接口含义；
-4. 对图中 `blue/red` 的理解说明；
-5. 标出哪些内容是 RTL 已确认、哪些仍待确认。
+DDR6 候选 RTL 请根据当前项目 MANIFEST、选源清单及已有分析报告定位。
 
-### 3. 命名与说明要求
+## 二、需要整理的资料
 
-- 保留真实的模块名和关键真实信号名；
-- 但对信号组要增加中文解释；
-- 不要只写英文缩写；
-- 如果某些信号很多，可以按“信号组”归纳；
-- 对 `Grant`、`ready`、`valid`、`Token`、`Host 完成` 等概念要避免混淆。
+### 1. DDR5 PA 原始 RTL
 
----
+找到 DDR5 PA 的核心代码，重点包括：
 
-## 二、任务 1：将“内部读命令与读返回通路”拆成两张图
+- PA 顶层模块及子模块。
+- 请求来源及输入接口。
+- 请求优先级和 Aging。
+- Credit 与资源约束。
+- 读写切换及轮转仲裁。
+- Grant 生成。
+- Stall、Ready 与其他反压控制。
+- PA 的时钟、复位及配置接口。
 
-### 图 1：XPI 内部读命令请求通路（Request / Arbitration / Command Path）
+优先保留直接负责这些功能的 RTL 文件。
 
-请单独绘制一张图，只描述**读请求从 XPI 发往 PA / HIF 命令侧**的通路。
+### 2. DDR6 PA 候选 RTL
 
-### 目标
+找到当前选源中的 DDR6 PA 候选实现。
 
-让读者清楚理解：
+重点整理：
 
-- Host 的读请求进入 XPI 之后，怎样在 XPI 内部形成读请求；
-- RAR、TM、WS/RP 等模块在这条路径中的作用；
-- 哪些信息送到 PA 读仲裁；
-- 哪些信息送到 HIF_CMD；
-- PA 与 HIF_CMD 在这条路径上的职责区别；
-- `blue` / `red` 在这条请求侧图中的意义；
-- ready / valid / token / qos / urgent 这些信号组分别做什么。
+- DDR5 保留的 PA 仲裁逻辑。
+- DDR6 新增的请求资格检查。
+- Fact/Session 等上下文关联。
+- Reservation 相关接口。
+- Grant 与实际接受的衔接。
+- BUILD 参数、条件编译和构建选择。
 
-### 绘图要求
+特别检查 `PA_OPT_TYPE`、OPT1/OPT2 的实际定义和生效条件。
 
-1. 只画**请求侧**，不要把 HIF_DATA、RRB、RDQ、Host R 混进来；
-2. 图中要单独体现：
-   - WS / RP
-   - TM
-   - RAR
-   - PA（读仲裁）
-   - HIF_CMD
-3. 必须区分：
-   - 请求内容（地址、长度、payload、token）
-   - 仲裁依据（priority、timeout、urgent 等）
-   - ready/valid 握手
-4. 如果 `blue` 和 `red` 分别代表不同内部通道、不同请求路径或不同 ready 反馈，请结合 RTL 解释；
-5. 如果目前只能确认它们是不同颜色命名的内部路径，也请明确说明“语义待进一步确认”。
+不能因为某个历史候选分支存在 Reservation 逻辑，就认定当前配置已经启用。
 
-### 希望回答的核心问题
+### 3. PA 的实例化及上下游连接
 
-图后请用中文解释：
+这是本资料包的重点。
 
-1. 为什么 RAR 同时连到 PA 和 HIF_CMD？
-2. 为什么 PA 不直接处理读返回数据？
-3. `hif_arready_blue_dca` 和 `hif_arready_red_dca` 分别作用于什么？
-4. `blue` / `red` 是什么含义？当前是否已完全确认？
-5. 请求“被发出”和“被真正接受”之间有什么区别？
+必须找到 PA 在上层 RTL 中的实际实例化位置，并提取有关连接。
 
----
+重点追踪：
 
-### 图 2：XPI 内部读返回通路（Read Return / Reorder / Host Response Path）
+- XPI 向 PA 提供的请求及仲裁属性。
+- PA 向 HIF_CMD 或相关模块提供的 Grant/选择控制。
+- 下游资源、Ready、Stall 等反馈信号。
+- PA 与 IH 实际接受事件之间的直接或间接关系。
+- 其他与仲裁状态更新有关的连接。
 
-请单独绘制一张图，只描述**读数据从 HIF_DATA 返回到 XPI，再返回给 Host R** 的路径。
+对于大型上层 RTL，优先提取相关实例化片段和必要的信号声明，不必复制整个文件。
 
-### 目标
+每个片段必须保留：
 
-让读者清楚理解：
+- 原始文件路径。
+- 起止行号。
+- 模块及实例名称。
+- 完整的相关端口连接。
 
-- HIF_DATA 返回了什么；
-- Token 如何帮助 XPI 识别这份返回数据属于哪一个请求；
-- RRB 为什么需要存在；
-- RDQ / DF / RPR 负责什么；
-- Host R 通道最终如何得到 `rvalid / rdata / rlast / rid`；
-- Token 在什么时机释放；
-- 哪些事件不等于 Host 事务完成。
+不能为了简化而将间接连接描述成直接连接。
 
-### 绘图要求
+### 4. 必要的参数与宏定义
 
-1. 只画**返回侧**，不要再画 PA 和请求仲裁；
-2. 图中要单独体现：
-   - HIF_DATA
-   - RRB
-   - RDQ / DF / RPR
-   - TM（Token 释放关系）
-   - Host R 通道
-3. 要区分：
-   - 返回数据
-   - 返回状态/错误
-   - 返回 token
-   - Host 响应
-4. 说明 `e_resp_token_dca` 的作用；
-5. 标出 `release_token` 从 RRB 返回 TM 的关系。
+提取能够解释 PA 端口和实际配置的必要内容，包括：
 
-### 希望回答的核心问题
+- 端口位宽相关参数。
+- 仲裁相关参数。
+- PA_OPT_TYPE。
+- 条件编译宏。
+- 时钟和复位定义。
+- 与 PA 接口有关的 package、typedef 或结构定义。
 
-图后请用中文解释：
+如果某个参数无法确定最终取值，请保留表达式及其依赖，并标记为待确认。
 
-1. 为什么读返回数据不经过 PA？
-2. RRB 的“重排”到底是在做什么？
-3. `release_token` 代表什么？是不是 Host 已经完成读事务？
-4. `HIF_DATA -> RRB -> RDQ -> Host R` 这条路径中，各模块分别负责什么？
-5. 哪个事件可以视为“Host 侧真正收到了读响应”？
+### 5. 现有设计报告
+
+优先整理：
+
+- `review_analysis/phase2/03_pa_comparison.md`
+- `review_analysis/phase2/06_cross_module_changes.md`
+- `review_analysis/phase2/07_review_summary.md`
+- Phase2B 中与 PA Grant、写事务和请求接受相关的分析。
+- Phase2D 中与 PA 读请求选择相关的分析。
+- Phase3 正式设计评审文档的第 6 章 PA 详细设计。
+
+其他章节仅在解释 PA 接口所必需时提取，不要打包整份大型评审文档。
+
+如果文件名与实际项目不同，以真实文件为准。
 
 ---
 
-## 三、任务 2：重新绘制“控制 / 时钟 / 复位 / 配置接口”图
+## 三、为了方便公司 AI 绘图，额外生成三份辅助资料
 
-当前已有图太长，导致字体太小。请重新拆分绘制。
+### 3.1 PA 端口清单
 
----
+生成：
 
-### 图 3：XPI 时钟、复位与低功耗 / 端口控制接口
+`PA_IO_PORT_MAP.csv`
 
-请绘制一张较短的 Mermaid 图，只放以下内容：
+字段包括：
 
-#### A. 时钟与复位
-- `aclk`
-- `aresetn`
-- `e_clk`
-- `e_rst_n`
+| 字段 | 内容 |
+|---|---|
+| Signal | 真实端口名称 |
+| Direction | 输入或输出 |
+| Width | 端口位宽 |
+| Category | 请求、仲裁、Grant、反馈、配置、时钟等 |
+| Source/Destination | 实际连接模块 |
+| Function | 用中文解释用途 |
+| Handshake | 有效或接受条件 |
+| Build Condition | 生效宏及参数 |
+| RTL Evidence | 源码文件和行号 |
 
-#### B. 低功耗 / 端口控制
-- `csysreq`
-- `csysack`
-- `cactive`
-- `cactive_out`
-- `rd_port_busy`
-- `wr_port_busy`
-- `ddrc_xpi_port_disable_req`
-- `ddrc_xpi_clock_required`
-- `xpi_ddrc_port_disable_ack`
-- `xpi_ddrc_wch_locked`
+不得凭空填入信号。
 
-### 目标
+### 3.2 PA 构建配置说明
 
-这张图重点回答：
+生成：
 
-- XPI 依赖哪些时钟和复位；
-- 哪些接口用于低功耗或端口开关控制；
-- 哪些是输入，哪些是输出；
-- 哪些接口是状态反馈。
+`PA_BUILD_CONFIG.md`
 
-### 绘图要求
+重点说明：
 
-1. 不要把配置寄存器和错误输出放进这张图；
-2. 图尽量短，使用 2～3 个子图即可；
-3. 每个信号后面加一句简短中文说明；
-4. 图后请补充解释：
-   - `aclk` 和 `e_clk` 的大致职责区别；
-   - `aresetn` 和 `e_rst_n` 的大致作用范围；
-   - `csysreq/csysack/cactive` 这组信号的基本含义；
-   - `disable_req/disable_ack` 和 `rd_port_busy/wr_port_busy` 的关系。
+- 当前实际选用的 PA 实现。
+- PA_OPT_TYPE 的实际取值。
+- OPT1 与 OPT2 的区别。
+- Reservation 是否真正参与当前构建。
+- DDR6 新增资格检查在哪一层实现。
+- 当前构建未覆盖的候选功能。
 
----
+严格区分代码存在、配置启用和验证通过。
 
-### 图 4：XPI 配置寄存器输入接口（按功能拆组）
+### 3.3 PA 与上下游模块的连接说明
 
-请单独绘制另一张图，只画配置寄存器输入接口，不再混入时钟复位和错误输出。
+生成：
 
-### 目标
+`PA_CONNECTION_GUIDE.md`
 
-把配置寄存器按功能分组，让读者看清楚**XPI 受哪些配置控制**。
+用容易理解的中文解释：
 
-### 建议分组
+1. 哪些请求进入 PA。
+2. PA 如何获得请求优先级和资源资格。
+3. PA 输出哪些 Grant。
+4. Grant 如何影响 HIF 的命令选择。
+5. PA Grant 与 IH Accept 为什么不同。
+6. Stall 或资源不足时请求如何处理。
+7. PA 与 PAS 为什么不是同一个调度模块。
 
-#### A. 突发 / 数据总线配置
-- `reg_ddrc_burst_rdwr`
-- `reg_ddrc_data_bus_width`
-- `reg_ddrc_burstchop`
+每条关键连接附上实际 RTL 证据。
 
-#### B. 端口与模式配置
-- `reg_arb_port_en`
-- `reg_xpi_snf_mode`
-- `reg_ddrc_dual_channel_en`
-
-#### C. DRAM 类型相关
-- `reg_ddrc_ddr4`
-- `reg_ddrc_ddr5`
-- `reg_ddrc_lpddr4`
-- `reg_ddrc_lpddr5`
-
-#### D. ECC / 数据保护
-- `reg_ddrc_ecc_type`
-- `ecc_mode`
-- `multi_beat_ecc`
-
-#### E. 读返回 / 仲裁阈值
-- `reg_arb_rrb_lock_threshold`
-
-#### F. QoS 映射
-- `rqos_map_*`
-- `wqos_map_*`
-
-#### G. 地址映射 / pagematch 相关
-- `pagematch_addrmap_mask`
-- `data_channel_addrmap_mask`
-- `bg_or_bank_addrmap_mask`
-
-### 绘图要求
-
-1. 图中以 XPI 为中心；
-2. 左侧放配置输入；
-3. 按上面的功能组分成多个 subgraph；
-4. 每组用中文解释其用途；
-5. 图后再用表格说明：
-   - 配置组名称
-   - 代表寄存器
-   - 大致影响哪类功能
-   - 当前是否能从 RTL 明确确认用途
-
-### 需要特别说明
-
-- 不要求把每个寄存器位域全部展开；
-- 重点是理解“这一组配置会影响 XPI 的什么行为”；
-- 若某个寄存器作用暂不明确，请标注“待确认”。
+这些说明用于绘图和学习，不要将尚未确认的握手关系写成已验证的事实。
 
 ---
 
-### 图 5：XPI 错误与诊断输出接口
+## 四、资料包组织方式
 
-请单独再画一张小图，只画错误与诊断输出，不与配置放在一起。
+请创建：
 
-### 包含内容
+`review_analysis/io_diagrams/pa_input_pack/`
 
-- `par_waddr_err_pulse`
-- `par_raddr_err_pulse`
-- `par_rdata_err_pulse`
-- `ocecc_xpi_write_uncorr_err`
-- `ocecc_xpi_read_uncorr_err`
-- `ocecc_xpi_*_corr_err`
-- `ac_cmp_err`
-- `cc_cmp_err`
-- `aa_parity_err`
-- `cc_parity_err`
+建议目录：
 
-### 目标
+```text
+pa_input_pack/
+├── START_HERE.md
+├── manifest.csv
+├── rtl/
+│   ├── ddr5/
+│   ├── ddr6/
+│   ├── connections/
+│   └── definitions/
+├── reports/
+│   ├── pa_comparison.md
+│   ├── pa_write_path.md
+│   ├── pa_read_path.md
+│   └── pa_detailed_design.md
+├── PA_IO_PORT_MAP.csv
+├── PA_BUILD_CONFIG.md
+└── PA_CONNECTION_GUIDE.md
+```
 
-让读者理解：
+目录结构可以根据实际内容调整，不得创建虚假的源码文件或空壳报告充数。
 
-- XPI 输出了哪些错误或诊断类信息；
-- 这些错误大致分成哪几类；
-- 哪些与地址相关，哪些与数据相关，哪些与 ECC / parity / compare 有关。
+### START_HERE.md
 
-### 绘图要求
+这份文件要专门写给公司的 AI，说明：
 
-1. 图尽量小；
-2. 可以按以下类别分组：
-   - 地址奇偶校验错误
-   - 读写数据相关错误
-   - ECC 纠错 / 不可纠错错误
-   - 比较器 / parity 检查错误
-3. 图后补充一个小表格总结每类错误的意义。
+- 本资料包的用途。
+- DDR5 和 DDR6 源码分别放在哪里。
+- 应先阅读哪些文件。
+- 哪些文件用于判断端口方向。
+- 哪些文件用于追踪上下游连接。
+- 哪些文件用于判断构建配置。
+- 如何利用资料绘制 PA 的六张 I/O 图。
+- 哪些连接或语义仍待确认。
+
+必须强调：
+
+**不要将 PA Grant、IH Accept 和 PAS 命令执行视为同一事件。**
+
+### manifest.csv
+
+记录所有文件：
+
+- 压缩包内路径。
+- 原始相对路径。
+- 文件用途。
+- 文件大小。
+- 是否完整原文件或提取片段。
+- 如果是片段，记录原始行号范围。
 
 ---
 
-## 四、Mermaid 绘图风格要求
+## 五、控制压缩包大小
 
-1. 每张图尽量横向布局，但不要无限拉长；
-2. 如果一张图过长，请拆成多张图；
-3. 不要把过多换行文本塞进单个节点；
-4. 每个节点尽量简洁；
-5. 可以把说明放到图下的文字或表格中；
-6. 优先让字体可读，而不是把所有信息强行塞进图中；
-7. 如果需要，可同时给出：
-   - Mermaid 图（简洁版）
-   - 表格说明（补充细节版）
+目标是适合公司邮箱传输。
+
+优先将 ZIP 控制在 10 MB 以内；如果做不到，先分析原因。
+
+缩减顺序：
+
+1. 删除与 PA 无关的文档和源码。
+2. 对大型分析报告仅保留 PA 相关章节，并注明原文位置。
+3. 对大型父模块提取相关端口连接及必要声明。
+4. 删除重复的历史版本和不相关的候选分支。
+5. 保留解释当前 DDR6 选源及 OPT1/OPT2 差异所必需的内容。
+
+不能为了减少体积而删除关键端口定义、BUILD 条件或实例连接依据。
+
+不要打包：
+
+- 完整 Git 历史。
+- 全部 JEDEC PDF。
+- 全部 Testbench。
+- 无关模块源码。
+- 完整软件手册。
+- 无关历史备份。
+- 密钥、密码和访问令牌。
+
+任何打包内容必须符合公司源码和文档的内部传输规定。
 
 ---
 
-## 五、最终输出内容
+## 六、生成 ZIP
 
-请输出以下结果：
+输出：
 
-1. 图 1：XPI 内部读命令请求通路；
-2. 图 2：XPI 内部读返回通路；
-3. 图 3：时钟、复位与低功耗/端口控制接口；
-4. 图 4：配置寄存器输入接口；
-5. 图 5：错误与诊断输出接口；
-6. 每张图后都给出中文解释；
-7. 最后给出一段总结，说明：
-   - 为什么要把请求通路和返回通路分开；
-   - `blue/red` 当前能确认到什么程度；
-   - 这几张图分别帮助理解 XPI 的什么方面；
-   - 哪些问题仍待结合 RTL 进一步确认。
+`review_analysis/io_diagrams/pa_input_pack.zip`
 
-如果需要保存，请放到：
+打包后检查：
 
-`review_analysis/io_diagrams/xpi_refined/`
+1. ZIP 能正常打开。
+2. `START_HERE.md` 和 `manifest.csv` 存在。
+3. DDR5、DDR6 PA 的核心源码存在。
+4. PA 实例化连接和必要参数定义存在。
+5. PA 端口表和 BUILD 配置说明完整。
+6. 没有包含无关的大型目录。
+7. 没有文件路径冲突。
+8. 关键源码片段与原文件行号一致。
 
-不要修改 RTL、Testbench、现有正式评审文档或已有软件指南。
+如果超过邮箱限制，请额外生成一个更精简的 `pa_input_pack_minimal.zip`，但必须说明精简版缺少哪些证据。
+
+## 七、执行限制
+
+本任务只允许读取原工程并新增资料包。
+
+禁止修改：
+
+- 原始 DDR5/DDR6 RTL。
+- Testbench。
+- 项目构建配置。
+- 软件指南。
+- Phase1～Phase3 正式分析与评审文档。
+
+不运行仿真，不执行综合，不联网，不上传文件。
+
+完成后用中文报告：
+
+1. DDR5 PA 核心 RTL 文件。
+2. DDR6 PA 当前选源文件。
+3. 实际打包文件数量。
+4. ZIP 压缩前后的大小。
+5. OPT1/OPT2 和 Reservation 的实际配置情况。
+6. 是否足以绘制 PA 的六张 I/O 图。
+7. 仍然缺失的关键连接或证据。
+
+完成后停止，等待人工检查。
