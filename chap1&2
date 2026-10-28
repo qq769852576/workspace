@@ -39,6 +39,10 @@ PA、HIF、RT、RD 的英文名称分别来自源码注释：[PA](<../../review_
 
 下图用于区分评审范围与相邻职责。**虚线表示逻辑衔接，不表示逐级串行的 RTL 连线或实例层次。**
 
+<a id="fig-01"></a>
+
+**图 1-1：评审范围与外部合同边界（原 FIG-01）**
+
 ~~~mermaid
 flowchart LR
   subgraph MC["Memory Controller"]
@@ -51,6 +55,10 @@ flowchart LR
   IFACE -.-> PHY["PHY<br/>外部传输"]
   PHY -.-> DRAM["DRAM"]
 ~~~
+
+**读图说明：** 虚线表示职责范围及外部交付关系。前端四模块与后端、PHY、DRAM分工分别看待。
+
+**RTL 依据与适用条件：** 职责范围示意；外部合同未冻结。 [W03 dwc_ddrctl_ddrc_dp.sv L735-814;1073-1135;1261-1285;1392-1496](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)；[R02 dwc_ddrctl_ddrc.sv L4444-4451;4474-4511](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc.sv>)；[B02 DWC_ddrctl.sv L1-4;44-59;1751-1751;4071-4081;11459-11459;12013-12044](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddrctl.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 本轮定向核对了当前选中版本的 XPI、PA、HIF_CMD、HIF_DATA 和 IH 端口声明，未发现直接的 DFI（DDR PHY Interface，MC–PHY 接口规范）事务端口或 DRAM 的 CA（命令/地址）、DQ（数据）、DQS（数据选通）引脚接口。XPI 和 IH 中的 CS（片选）地址映射配置字段用于解释地址，不能按名称当作物理片选端口。该结论限于所查事务接口；共有时钟、复位和控制信号仍需正常集成。检查文件和行段记录在 [Phase3 检查点](<00_progress_checkpoint.md>)，接口分工见第 2.4.3 节。
 
@@ -688,38 +696,34 @@ Host 的 AW、AR 和 W 通道首先进入 XPI。XPI 保存原请求、组织内�
 
 下图按原 RTL 分别表示请求与命令、写数据、读返回和写响应。TE/PAS/PI 及写数据 RAM（随机存取存储器）/MR 在图中折叠，HIF_DATA 与 XPI 则按不同接口职责分别示意，未新增实际模块。实线表示命令、数据或响应传递，虚线表示选择、流控及写响应生成所依据的内部事件，均不规定固定拍距。图中的 tag 是内部关联标记，WRQ 是写响应队列，RDQ 是读数据响应队列；这些缓冲的内容和释放事件分别说明。
 
+<a id="fig-02"></a>
+
+**图 3-1：DDR5 命令、写数据与读返回主路径（原 FIG-02）**
+
 ~~~mermaid
 flowchart TB
-  U["Host AW / AR / W"] -->|"地址与数据分别接受"| X["XPI<br/>请求与写数据组织"]
-  X --> P["PA<br/>前端请求选择"]
-  P -.->|"Grant / ready"| X
-  P -.->|"同一 Grant"| HC["HIF_CMD<br/>命令选择"]
-  X -->|"命令字段"| HC
-  HC --> I["IH<br/>输入 FIFO、映射与 Entry"]
-  I --> T["TE / PAS / PI<br/>请求保存、后端调度与控制"]
-  T -->|"命令"| F["原 DDR5 DFI 边界"]
-  I -.->|"写指针返回"| HD["HIF_DATA<br/>写指针队列与数据路由"]
-  X -->|"写数据"| HD
-  I -->|"写 Entry 描述"| W["WU<br/>描述保持与数据接收"]
-  HD -->|"写数据"| W
-  W -.->|"流控"| I
-  W --> M["写数据 RAM / MR"]
-  M -->|"后端写数据"| F
-  T -->|"读控制与 tag"| RT["RT / RD<br/>返回匹配与数据处理"]
-  F -->|"读数据 / valid"| RT
-  RT -->|"读数据、Token 与错误"| HD
-  HD -->|"读返回"| RR["XPI RRB / RDQ<br/>重排、格式恢复与保持"]
-  RR --> HR["Host R"]
-  HD -.->|"写接受事件与末包属性"| BG["HIF_DATA 内部写响应逻辑"]
-  BG -->|"内部 B 信息"| BQ["XPI WRQ<br/>写响应队列与交付控制"]
-  BQ --> HB["Host B"]
-  classDef readpath fill:#edf4ff,stroke:#5279a6;
-  classDef writepath fill:#eef7ee,stroke:#60845e;
-  classDef bpath fill:#fff4df,stroke:#ad8245;
-  class RT,RR,HR readpath;
-  class W,M writepath;
-  class BG,BQ,HB bpath;
+  X["XPI 请求 / W数据 / RRB / WRQ"]
+  P["PA"] -->|"Grant"| C["HIF_CMD 组合选择"]
+  X -->|"命令字段"| C
+  P -->|"内部 Ready"| X
+  C -.->|"经顶层"| I["IH FIFO / 映射 / Entry"]
+  I -->|"命令"| T["TE / PAS / PI 后端"]
+  I -.->|"登记写指针"| H["HIF_DATA"]
+  I -.->|"写描述"| W["WU / RAM / MR"]
+  X -->|"W数据"| H
+  H -.->|"写数据"| W
+  W -.->|"停流"| I
+  T -.->|"发令控制"| R["RT / RD 返回链"]
+  D["原 DDR5 DFI"] -->|"读数据"| R
+  T -->|"命令"| D
+  W -->|"写数据"| D
+  R -.->|"数据 / Token / 错误"| H
+  H -->|"R返回 / 本地B事件"| X
 ~~~
+
+**读图说明：** 命令经PA选择和IH保持后进入后端；写数据沿HIF_DATA到WU，读数据沿RT/RD返回；本地B事件与读返回分别进入XPI响应路径。
+
+**RTL 依据与适用条件：** DDR5 donor机制；不作为DDR6目标PHY合同。 [H01 DWC_ddr_umctl2_hif_cmd.sv L90-134;199-344;350-466](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)；[D01 DWC_ddr_umctl2_hif_data.sv L333-355;534-534;636-636;658-675](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_data.sv>)；[D02 ih_core_out_if.sv L158-177](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_core_out_if.sv>)；[D03 memc_wu_wdata_if.sv L245-282;385-405](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/wu/memc_wu_wdata_if.sv>)；[D04 rt.sv L400-412](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/rt/rt.sv>)；[D05 dwc_ddrctl_ddrc_dp.sv L780-790;920-933;1027-1042](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/top/dwc_ddrctl_ddrc_dp.sv>)；[X02 DWC_ddr_umctl2_xpi_rrb.sv L706-726](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_rrb.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 读返回携带数据，经 RT/RD、HIF_DATA 的读路由进入 XPI RRB，再经格式恢复和 RDQ 等保持级交给 Host R。写响应则由 HIF_DATA 的写分支形成内部 B 信息，进入独立的 XPI WRQ，最后按上游条件交付 Host B；它不经过 RRB，也不是 DRAM 返回的写成功数据。普通早 B 分支及最后 W 拍约束见第 3.5 节，读返回关联见第 3.6 节，关键依据为 [E07](#rtl-evidence-index)、[E24](#rtl-evidence-index)。
 
@@ -791,6 +795,10 @@ TE 保存已接受的请求及待调度信息，PAS 再结合 bank 状态和时�
 
 HIF 的 wdata_ptr 携带端口、BID、原事务末包及相关属性，负责选数据来源和组织返回。RAM 地址则由 WU 使用 Entry 编号与包内 word_num 形成。两套队列保持同源顺序，在当前包结束前分别使用各自的队列头，包尾接受后再推进。对应的实际接线与算法见 [写指针注册返回](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_core_out_if.sv>)，L158–176、[HIF 指针队列与路由字段](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_data.sv>)，L333–396、[WU 描述 FIFO](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/wu/memc_wu_wdata_if.sv>)，L245–282、[WU RAM 写地址](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/wu/memc_wu_wdata_if.sv>)，L396–404。
 
+<a id="fig-03"></a>
+
+**图 3-2：DDR5 两条写队列的关联（原 FIG-03）**
+
 ~~~mermaid
 flowchart TB
   I["IH 实际写接受"] -->|"路由指针返回"| HQ["HIF 指针 FIFO"]
@@ -804,6 +812,10 @@ flowchart TB
   W -.->|"包尾推进"| WQ
   HD -.->|"包尾推进"| HQ
 ~~~
+
+**读图说明：** 写命令交付派生写指针和WU描述；前者选择XPI数据来源，后者提供Entry与包内位置。两队列各按本地包尾接受推进。
+
+**RTL 依据与适用条件：** DDR5 donor机制；不作为DDR6目标PHY合同。 [D02 ih_core_out_if.sv L158-177](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_core_out_if.sv>)；[D01 DWC_ddr_umctl2_hif_data.sv L333-355;534-534;636-636;658-675](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_data.sv>)；[D03 memc_wu_wdata_if.sv L245-282;385-405](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/wu/memc_wu_wdata_if.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 数据有效且下游不 stall 时，WU 接受一个数据拍。HIF 若启用重定时，可以先把数据移入本地保持级，WU 稍后才接受；指针出队与 WU 描述出队应按各自保持级解释。当前生成配置的 HIF 数据重定时由 OCECC 条件决定，普通所选分支关闭。数据推进和反压依据见 [E05](#rtl-evidence-index)、[E06](#rtl-evidence-index)、[WU 接受与数据齐备资格](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/wu/memc_wu.sv>)，L623–673。
 
@@ -825,6 +837,10 @@ B 返回另走响应队列。普通无交织、无片上奇偶校验和纠错码
 
 依据：[PI 读控制](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pas/pi/dwc_ddrctl_paspi.sv>)，L524–545、[RT 控制队列](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/rt/rt.sv>)，L400–412、[RT 数据有效与 tag](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/rt/rt.sv>)，L524–539。原 DFI 数据字和有效信号打包见 [DDR5 返回入口](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/dfi/dfi_ic_dp_ddr.sv>)，L223–257。
 
+<a id="fig-04"></a>
+
+**图 3-3：DDR5 读返回与 Token 释放（原 FIG-04）**
+
 ~~~mermaid
 flowchart TB
   PI["PAS PI：读控制与 tag"] --> Q["RT 控制 FIFO"]
@@ -837,6 +853,10 @@ flowchart TB
   D -->|"R 数据、身份与末拍"| R["Host R"]
   B -.->|"Token 末拍移交下级"| TM["TM：归还 Token"]
 ~~~
+
+**读图说明：** RT用控制FIFO关联返回，RD处理后进入HIF路由和RRB。RRB末拍交给下级再归还Token，Host可继续反压响应队列。
+
+**RTL 依据与适用条件：** DDR5 donor机制；不作为DDR6目标PHY合同。 [D04 rt.sv L400-412](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/rt/rt.sv>)；[D05 dwc_ddrctl_ddrc_dp.sv L780-790;920-933;1027-1042](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/top/dwc_ddrctl_ddrc_dp.sv>)；[D01 DWC_ddr_umctl2_hif_data.sv L333-355;534-534;636-636;658-675](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_data.sv>)；[X02 DWC_ddr_umctl2_xpi_rrb.sv L706-726](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_rrb.sv>)；[X03 DWC_ddr_umctl2_xpi_tm.sv L94-125;145-156](<../../11_rtl_project/rtl/source/src/xpi/DWC_ddr_umctl2_xpi_tm.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 RD 依据类型和配置处理普通读、RMW、MRR、宽度及 CRC 等相关分支，Host 方向只接相应读数据。HIF_DATA 利用 Token 低位选择目标端口，数据可以广播而有效信号按端口解复用。随后 XPI 以返回 Token 索引 RRB，结合原请求信息恢复 RID、有效数据拍范围、错误与末拍。RRB 的 BAM/SBAM 等管理结构按配置组织输出，其中 SBAM 已能记录 start_token、tokens_allocated、tokens_received，原设计具备多 Token 事务关联。依据：[RD 返回分类](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/rd/rd.sv>)，L894–935、[E07](#rtl-evidence-index)、[E03](#rtl-evidence-index)、[RRB 输出选择](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/xpi/DWC_ddr_umctl2_xpi_rrb.sv>)，L974–1000。
 
@@ -887,20 +907,27 @@ PSD、访问单位、命令与数据布局变化有规范依据，见 [S-GEO](#s
 
 下图聚焦命令侧的实际协作。XPI 的命令字段仍直接进入 HIF_CMD，PA 只提供选择结果；身份准备与事实发布在 arb_top 中协同原入口，配置和几何信息参与 IH 的地址解释。图中的控制依赖不表示另一条数据 FIFO。
 
+<a id="fig-05"></a>
+
+**图 4-1：DDR6 请求选择与原生命令入口（原 FIG-05）**
+
 ~~~mermaid
 flowchart TB
-  U["Host AW / AR"] --> X["XPI<br/>原队列与包组织"]
-  ID["身份准备与已接受事实发布"] -.->|"接受资格与旁带"| X
-  X -->|"候选请求"| Q["arb_top 外围<br/>来源、事实与会话资格"]
-  ID -.->|"原始请求记录"| Q
-  Q -->|"合格请求"| P["PA<br/>原仲裁框架"]
-  P -.->|"Grant / ready"| X
-  P -.->|"同一 Grant"| H["HIF_CMD<br/>命令与旁带同源选择"]
-  X -->|"命令字段与身份"| H
-  H --> I["IH<br/>同 FIFO 字保持与同头校验"]
-  C["已发布配置与几何快照"] -.->|"地址和模式解释"| I
-  I -->|"真实接受才消费"| T["TE 与相邻后端<br/>请求保存、调度与数据协同"]
+  X["XPI 保持的内部请求"] --> Q["arb_top Fact / Session资格"]
+  Q -->|"写 / 读请求集合"| P["PA 选择"]
+  P -->|"Grant"| H["HIF_CMD 组合mux"]
+  X -->|"命令与同源旁带"| H
+  P -.->|"Grant映射且first_core_gate_allow"| X
+  H -.->|"经封装命令入口"| I["IH 两条目FIFO"]
+  I --> C["同头解释与接受资格"]
+  G["已发布cfg / geometry"] -.->|"解释依赖"| C
+  C -.->|"Child / 坐标 / Entry"| T["TE及相邻后端"]
+  T -.->|"retry / actual_read_accept"| I
 ~~~
+
+**读图说明：** 外围先筛选原始事实与会话资格，再由PA和HIF_CMD选择同源命令。原生FIFO保存、同头解释及TE接受分别受约束。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [A03 DWC_ddr_arb_top.sv L2707-2744;3032-3033;3072-3072;3151-3250;3299-3357](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[A04 DWC_ddr_arb_top.sv L4128-4209;4236-4238;4306-4320](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[H01 DWC_ddr_umctl2_hif_cmd.sv L90-134;199-344;350-466](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)；[I01 ih_core_in_if.sv L518-534;567-575;631-650;905-913;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)；[I02 ih_core_in_if.sv L905-913;1129-1180;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)；[N05 teengine.sv L798-805;853-865;1578-1588;2897-2920](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/teengine.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 **目标设计能力与当前候选实现的适用范围**
 
@@ -963,6 +990,10 @@ IH 原两条目输入 FIFO 深度保持不变，单条记录按开关增加 Pare
 
 读路径还增加一个 Canonical 结果保持槽。原始 AR 事实经跨域入口进入规范化逻辑，检查完整地址区间和当前能力，得到统一描述或带类型的拒绝结果；原 XPI 仍沿 HIF 通路交付实际原生 Child。TE intake 分别保存原始描述并核对 Child，实际请求表加载成功后，才通知 IH 消费对应队列头。
 
+<a id="fig-06"></a>
+
+**图 4-2：原始 AR 结果与原生命令会合（原 FIG-06）**
+
 ~~~mermaid
 flowchart TB
   A["已接受的原始 AR"] --> F["原始事实发布与跨域入口"]
@@ -975,6 +1006,10 @@ flowchart TB
   T -->|"后端实际接受"| E["TE 请求资源"]
   E -.->|"同一请求接受确认"| H
 ~~~
+
+**读图说明：** 原始AR解释结果与原生Child分别抵达TE intake，后端实际接受才允许对应原生头消费。两路不要求固定拍距。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [A07 DWC_ddr_arb_top.sv L4666-4712](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[X04 DWC_ddr_umctl2_xpi_read.sv L480-493;1849-1903](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_read.sv>)；[N01 ddr6_ih_original_read_normalizer.sv L215-265;302-315;333-364](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_ih_original_read_normalizer.sv>)；[N04 ddr6_te_original_read_intake.sv L169-249;316-355](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_te_original_read_intake.sv>)；[N05 teengine.sv L798-805;853-865;1578-1588;2897-2920](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/teengine.sv>)；[I02 ih_core_in_if.sv L905-913;1129-1180;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 结果保持槽用于在下游等待时保存描述、Fact 与配置上下文，避免同一请求被另一份解释覆盖。它不保存读数据，也不以 Host 最后 R 握手作为释放前提；规范化结果、输入命令 FIFO 和后端 Entry 分别管理。依据：[原始读入口](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/ddr6_hif_original_read_ingress.sv>)，L151–198、[结果槽与请求形状](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_ih_original_read_normalizer.sv>)，L198–229、[等待、拒绝与接收](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_ih_original_read_normalizer.sv>)，L255–308、[保持结果更新](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_ih_original_read_normalizer.sv>)，L320–364。
 
@@ -1118,23 +1153,7 @@ MANIFEST 的选择只说明源码和编译条件，不代表扩展桥已实例�
 
 入口定义及声称的两级截获链来自 [软件指南第 1 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#1-使用前必须知道的完成边界>)、[软件指南第 3 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#3-apb-访问规范>)、[软件指南第 4 节](<../../review_inputs/software_guide/PROGRAMMING_GUIDE.md#4-寄存器表与属性>)，**没有作为本地已确认拓扑绘图**。下面仅画当前源码能确认的原 APB 路径，不增加尚未找到的扩展桥：
 
-```mermaid
-flowchart TB
-    P["DWC_ddrctl 顶层 APB<br/>MANIFEST 选择的 195 源码"]
-    D["adrdec<br/>地址采样、译码与读回选择"]
-    F["slvfsm<br/>访问节拍与等待控制"]
-    W["slvif<br/>寄存器字段存储"]
-    C["coreif<br/>配置输出与状态读回"]
-    P -->|"字地址"| D
-    P -->|"访问控制"| F
-    F -->|"write_en_pulse"| W
-    D -->|"rwselect"| W
-    W -->|"存储的寄存器字"| D
-    W -->|"配置字段来源"| C
-    C -->|"状态字"| D
-    D -->|"读回 / 错误"| P
-    F -->|"pready"| P
-```
+学习图已移至[图 A-1：APB 访问与字段路由学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-07)；其适用条件与RTL依据随图保留。
 
 图中 adrdec、slvfsm、slvif 和 coreif 均在 U_apb_slvtop 内；顶层将 paddr 的最低两位去除后交给内部译码。图省略安全筛选、部分状态连接和 CDC 内部级数，只表示已核对的模块级方向。顶层端口与实例连接见 [当前顶层 APB](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddrctl.sv>)，L2591–2601、5295–5324；译码、存储、FSM 与读回来源见 [原 APB 内部连接](<../../11_rtl_project/rtl/source/src/apb/DWC_ddrctl_apb_slvtop.sv>)，L1868、1878–1904、2136–2160、2434–2454、2716–2718、2761。地址宏采用字节常量右移两位供内部比较，见 [地址单位](<../../11_rtl_project/rtl/source/src/apb/DWC_ddrctl_apb_defines.svh>)，L20–26。这些事实不能证明软件指南的新桥已经接入当前构建。
 
@@ -1208,6 +1227,10 @@ XPI 位于 Host 与 MC 内部命令、数据接口之间。它先保存 Host 给
 
 下面只画 XPI 的接口职责，完整 MC 路径见[第 3 章](#ddr5-original-architecture)。箭头表示信息交付或资格反馈，不规定跨队列、跨时钟域的固定拍距。
 
+<a id="fig-08"></a>
+
+**图 5-1：XPI 命令、写数据及响应职责（原 FIG-08）**
+
 ~~~mermaid
 flowchart LR
   A["Host AW / AR"] --> XC["XPI<br/>请求保存与拆包"]
@@ -1225,6 +1248,10 @@ flowchart LR
   classDef xpi fill:#eaf3fc,stroke:#5279a6;
   class XC,XW,XR,XB xpi;
 ~~~
+
+**读图说明：** 请求、W数据、R返回和B响应是XPI的不同路径。公开完成语义不能由某一本地接受事件替代。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [X01 DWC_ddr_umctl2_xpi.sv L1468-1474;1724-1729;2382-2388](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi.sv>)；[X02 DWC_ddr_umctl2_xpi_rrb.sv L706-726](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_rrb.sv>)；[H01 DWC_ddr_umctl2_hif_cmd.sv L90-134;199-344;350-466](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)；[H02 DWC_ddr_umctl2_hif_data.sv L373-398;422-438;450-491;583-583;685-719](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)；[A03 DWC_ddr_arb_top.sv L2707-2744;3032-3033;3072-3072;3151-3250;3299-3357](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 蓝色节点表示同一个 XPI 的不同接口职责，HIF_DATA 也按写数据、读返回和内部写响应分别示意，没有新增实例。两类返回在 XPI 内分别进入读重排与写响应路径，并不共用一条响应队列。候选公开 B 的外层控制见第 5.4.5 节。
 
@@ -1295,6 +1322,10 @@ assign release_token_l = rd & ~empty & rd_last;
 
 来源：[RRB Token 释放](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/xpi/DWC_ddr_umctl2_xpi_rrb.sv>)，L665–680。非双通道下的 TM 回接见 [释放返回 TM](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/xpi/DWC_ddr_umctl2_xpi.sv>)，L6153–6154。原 SBAM 还保存 start_token、tokens_allocated、tokens_received，所以一笔 Host 请求关联多个 Token 本来就有实现基础，见 [E03](#rtl-evidence-index)。
 
+<a id="fig-09"></a>
+
+**图 5-2：读 Token 分配与归还事件（原 FIG-09）**
+
 ~~~mermaid
 sequenceDiagram
   participant H as Host
@@ -1317,6 +1348,10 @@ sequenceDiagram
   Note over D,H: 数据可继续保持，Host 反压不等于 Token 仍占用
   D-->>H: R 数据与状态；最后 R 握手结束 Host 读事务
 ~~~
+
+**读图说明：** gen_token来自内部读包握手，返回接收和RRB输出交付是两个阶段；release_token经登记归还，不以Host R握手为触发。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [X01 DWC_ddr_umctl2_xpi.sv L1468-1474;1724-1729;2382-2388](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi.sv>)；[X02 DWC_ddr_umctl2_xpi_rrb.sv L706-726](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_rrb.sv>)；[X03 DWC_ddr_umctl2_xpi_tm.sv L94-125;145-156](<../../11_rtl_project/rtl/source/src/xpi/DWC_ddr_umctl2_xpi_tm.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 图表示可能的事件先后；一笔请求有多个内部包时，Token 使用与返回步骤按包重复。释放条件服务于内部缓冲复用，Host outstanding 计数则在最后 R 握手减少，见 [原读事务计数](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/xpi/DWC_ddr_umctl2_xpi.sv>)，L6511–6512。两者对应 [REQ-XPI-002](#req-xpi-002) 中不同的资源对象。
 
@@ -1389,18 +1424,27 @@ assign iq_rd = e_wvalid & e_wready & e_wlast_pkt;
 
 ### 5.4.3 读侧保持：Fact 与原生 Child 随真实请求队列保存
 
-读侧把 Parent、原始 AR Fact 和原 AXI USER 组合成内部记录，沿原请求保持级传递。RP 输出一个内部包时，Child 检查逻辑用该包的实际地址、跨度和首末标记，核对它是否属于原 AR 的范围，再把检查结果与原 RAR 记录一起保存。RAR 因下游不 ready 而停留时，命令、Parent、Fact 与 Child 也一起停留。
+读侧把 Parent、原始 AR Fact 和原 AXI USER 组合成内部记录，沿原请求保持路径传递。RP 输出内部包时，Child 检查逻辑用实际地址、跨度和首末标记核对原 AR 范围，检查结果与命令载荷同源。当前 USE_RAR=0，rar_q=rar_d，不存在额外 RAR 保持级；USE_RAR=1 时才按同一 RAR 写入、保持和消费。下游不 ready 时，由实际已选的原请求/包保持逻辑维持关联。
+
+<a id="fig-10"></a>
+
+**图 5-3：Fact、Parent 与原生 Child 的同源载荷（原 FIG-10）**
 
 ~~~mermaid
 flowchart TB
-  A["原 AR + 已准备 Parent / Fact"] --> Q["原 WS / RAQ 保持路径"]
-  Q --> P["RP<br/>实际内部包地址与范围"]
-  P --> C["Child 区间与边界检查"]
-  P --> F["RAR<br/>原命令载荷"]
-  C -->|"同一 RAR 写入、保持与消费"| F
-  F --> H["PA / HIF_CMD<br/>命令与旁带选择"]
-  H --> I["IH / TE<br/>与原请求描述核对后交付"]
+  A["原AR / Parent / Fact"] --> Q["原请求保持路径<br/>WS / RAQ依配置"]
+  Q --> P["RP 当前原生包"]
+  P -->|"当前地址 / 首末包 / beat属性"| C["U_ddr6_ar_child_check"]
+  P -->|"原命令载荷"| F["rar_d 同源载荷"]
+  C -->|"present / checked / Child"| F
+  F -->|"USE_RAR=0: rar_q=rar_d"| B["当前输出旁路"]
+  B --> H["PA / HIF_CMD同源选择"]
+  H -.->|"经IH原生命令流"| T["TE Child匹配"]
 ~~~
+
+**读图说明：** Parent/Fact随原请求保持，Child根据实际原生包生成并与命令载荷同源。当前rar_d到rar_q为旁路，可选RAR保持级只在USE_RAR=1存在。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [X04 DWC_ddr_umctl2_xpi_read.sv L480-493;1849-1903](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_read.sv>)；[X05 DWC_ddr_umctl2_xpi_rd_q.sv L323-332;1235-1292;1350-1410](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_rd_q.sv>)；[B01 DWC_ddrctl_cc_constants.svh L163-163;2206-2206;3648-3648;4049-4049;7010-7010;9677-9690;11418-11424;15954-15954](<../../11_rtl_project/rtl/source/src/DWC_ddrctl_cc_constants.svh>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 候选内部记录见 [读请求 Parent / Fact 载荷](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_read.sv>)，L465–492；Child 检查见 [真实 RP 区间核对](<../../11_rtl_project/rtl/variants/candidate_read_columns113_v10/ddr6_hif_ar_child_check.sv>)，L50–82；同步写入 RAR 及关闭分支见 [RAR 携带 Child](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_rd_q.sv>)，L1258–1291。
 
@@ -1553,7 +1597,11 @@ XPI 把 Host 请求整理为内部访问后，MC 还需要决定哪些访问可�
 
 即使本次生成配置只有一个 AXI 端口，读和写仍会竞争，读请求也有不同优先类别。因此，单端口配置仍需要资源判断和读写选择；但不能据此推定多端口公平性已经得到验证。
 
-```mermaid
+<a id="fig-11"></a>
+
+**图 6-1：PA 职责与外部接口（原 FIG-11）**
+
+~~~mermaid
 flowchart TB
     X["XPI：保持待交付读写访问"]
     subgraph AT["arb_top：前端集成范围"]
@@ -1571,7 +1619,11 @@ flowchart TB
     H -->|"被选命令"| I
     I -->|"后端请求"| T
     I -.->|"容量 Credit / 命令 Stall，经顶层互连"| P
-```
+~~~
+
+**读图说明：** PA为请求提供选择服务；同一Grant驱动HIF_CMD选源和XPI内部Ready映射，IH容量反馈经顶层返回。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [A03 DWC_ddr_arb_top.sv L2707-2744;3032-3033;3072-3072;3151-3250;3299-3357](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[A04 DWC_ddr_arb_top.sv L4128-4209;4236-4238;4306-4320](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[A05 DWC_ddr_umctl2_pa_dual.sv L45-45;190-280;320-360;405-450](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_dual.sv>)；[H01 DWC_ddr_umctl2_hif_cmd.sv L90-134;199-344;350-466](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)；[I03 ih_core_out_if.sv L160-179;200-220;255-280;310-325;372-390](<../../11_rtl_project/rtl/variants/candidate_strict_iter013_v35/ih_core_out_if.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 图中的实线表示本章讨论的接口方向，虚线表示资源与反压反馈；不表示所有数据都依次穿过这些框。PA 选择来源，命令字段从 XPI 到 HIF_CMD；写数据、读返回仍沿第 3 章和第 5 章说明的独立路径流动。IH 的反馈经顶层互连进入 PA 所用的 HIF 侧端口，并非 HIF_CMD 自行生成容量。
 
@@ -1602,44 +1654,7 @@ PA 看见的是 XPI 已经组织好的内部读写访问，不是直接对外部
 
 下图给出 PA 总体 I/O 架构，标出左侧输入（XPI 请求、配置、Mask、IH 容量反馈）、PA 内部子模块分层（mask 寄存、读写仲裁器、共享预处理）以及右侧输出（Grant、内部 Ready、go2critical、性能观察、DDR6 新增 Reservation 观察）。所有信号方向相对 `U_pa` 边界，当前配置 NPORTS=1、PA_OPT_TYPE=2、DUAL_PA=0。
 
-~~~mermaid
-flowchart LR
-    subgraph LEFT["请求来源与配置"]
-        XPI["XPI（内部读写请求）<br/>经 arb_top pa_mapping 重排"]
-        CFG["顶层寄存器配置<br/>经 arb_top 重排"]
-        MASK["外部 Mask<br/>pa_wmask / pa_rmask"]
-        FB["IH 容量反馈<br/>Credit + Stall<br/>经多层互连返回"]
-    end
-    subgraph PA["DWC_ddr_umctl2_pa_dual  U_pa"]
-        direction TB
-        REGM["U_mask_r<br/>寄存 mask 输入"]
-        WP["U_wr_pa<br/>写仲裁器（含 pa_port + pa_arb）"]
-        RP["U_rd_pa<br/>读仲裁器（含 pa_port + pa_arb）"]
-        PP["U_preproc<br/>共享预处理<br/>Credit / 读写切换 / 页匹配 / 轮转"]
-        REGM --> WP
-        REGM --> RP
-        WP -->|"wgrant_nxt / wswitch_states_en"| PP
-        RP -->|"rgrant / rgrant_nxt / rgrant_en"| PP
-        PP -->|"wreq_pp / wgrant_hold"| WP
-        PP -->|"rreq_pp / rgrant_hold"| RP
-    end
-    subgraph RIGHT["输出去向"]
-        HIF["arb_top.U_hif_cmd<br/>按 Grant 选择命令字段"]
-        XPIRDY["arb_top → XPI<br/>hif_awready / hif_arready"]
-        GO2["arb_top → DDRC<br/>go2critical 紧急提示"]
-        PERF["顶层性能 / 状态观察<br/>credit_cnt / perf_*"]
-        RESV["DDR6 新增<br/>ddr6_reserved_wgrant<br/>ddr6_wreservation_fire<br/>（OPT2 当前为 0）"]
-    end
-    XPI -->|"xa_wreq / xa_rreq / xa_wdata_ptr / xa_rtoken 等"| PA
-    CFG -->|"reg_*_priority / aging_en / urgent_en 等"| PA
-    MASK -->|"xa_wmask / xa_rmask"| PA
-    FB -->|"hif_*_credit / hif_*_stall"| PA
-    PA -->|"pa_wgrant / pa_rgrant / pa_wpri / pa_rpri"| HIF
-    PA -->|"pa_wgrant / pa_rgrant"| XPIRDY
-    PA -->|"hif_go2critical_*"| GO2
-    PA -->|"*_credit_cnt / perf_*"| PERF
-    PA -->|"ddr6_reserved_wgrant / ddr6_wreservation_fire"| RESV
-~~~
+学习图已移至[图 A-2：PA 子实例与外围端口学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-12)；其适用条件与RTL依据随图保留。
 
 依据：[原请求与 Ready 连接](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/arb_top/DWC_ddr_arb_top.sv>)，L2239–2240、2437–2452、2511–2512；[候选保留的读写 PA 组织](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_dual.sv>)，L148–230、238–316、341–464。两版相关常量的对应关系沿用 [PA 原始对照报告](<../phase2/03_pa_comparison.md>)。
 
@@ -1693,44 +1708,26 @@ WR、HPR、LPR 的当前非内联 ECC 分支均以补入与扣减组合更新计
 
 下图把仲裁过程分为资格层、优先级层、轮转选择层、Grant 生成层和 Grant 时状态更新五层，便于理解多端口竞争与 OPT1/OPT2 分支的关系。
 
+<a id="fig-13"></a>
+
+**图 6-2：PA 资格、优先级及轮转依赖（原 FIG-13）**
+
 ~~~mermaid
 flowchart TB
-    subgraph ELIG["① 资格层：决定哪些请求可参与"]
-        direction LR
-        MASKED["masked 请求<br/>xa_wreq_masked / xa_rreq_masked"] --> CRED["Credit 资格<br/>wr / lpr / hpr"] --> DIR["读写方向 FSM<br/>read_en / write_en"] --> PM["页匹配 / 独占锁定过滤"] --> PP["可仲裁请求集合<br/>wreq_pp / rreq_pp"]
-    end
-    subgraph PRIO["② 优先级层：pa_port + pa_priocomp"]
-        direction LR
-        AGE["Aging 计数器<br/>等待中递减→priority0"] --> P0["priority0 集合"]
-        QOS["读类别<br/>HPR / LPR"] --> PC["pa_priocomp<br/>NPORTS=1: port_mask=1"]
-        P0 --> PC
-    end
-    subgraph RR["③ 轮转选择层：pa_arb + pa_roundrobincore"]
-        direction LR
-        PTR["rr_pointer<br/>grant后推进"] --> RR_UP["upper RR core<br/>req & req_saved_w"]
-        PTR --> RR_LO["lower RR core<br/>req"]
-        RR_UP --> RR_MUX["grant_rr<br/>有saved→upper<br/>否则→lower"]
-        RR_LO --> RR_MUX
-    end
-    subgraph GNT["④ Grant 生成层：pa_arb"]
-        direction LR
-        MASK_G["arb_gnt_mask<br/>~(stall | any_other | mask)"] --> GNXT["grant_nxt<br/>grant_rr & mask & en"]
-        GNXT --> OPT2["OPT2（当前）<br/>grant = grant_nxt"]
-        GNXT --> OPT1["OPT1（保留）<br/>grant = saved & mask_switch"]
-    end
-    subgraph UPD["⑤ Grant 时状态更新"]
-        direction LR
-        CRD_DEC["Credit 扣减<br/>按类别"]
-        AGE_RST["Aging 重装<br/>装入初值"]
-        PTR_UPD["轮转指针推进<br/>更新 rr_pointer"]
-        REQ_SV["请求集合更新<br/>req_saved = req & ~grant_rr"]
-    end
-    PP -->|"wreq_pp / rreq_pp"| RR
-    PC -->|"port_mask / priority0"| RR
-    RR_MUX -->|"grant_rr"| GNXT
-    OPT2 -->|"grant / grant_nxt"| UPD
-    OPT1 -.->|"grant_nxt"| UPD
+  M["寄存Mask后的请求"] --> E["U_preproc<br/>Credit / 方向 / 页匹配资格"]
+  E -->|"wreq_pp / rreq_pp"| R["pa_arb 轮转核心"]
+  A["pa_port Aging / 优先级"] -->|"priority0 / port_priority"| E
+  R -->|"grant_rr或lock候选"| N["grant_nxt逻辑"]
+  S["hif_cmd_stall / other_stall / mask"] -->|"arb_gnt_mask / mask_switch"| N
+  N -->|"当前OPT2: grant=grant_nxt"| G["对外Grant"]
+  N -.->|"记账依赖"| U["Credit / 请求集合 / RR状态更新"]
 ~~~
+
+**读图说明：** 图展示当前OPT2组合依赖。grant_rr是候选，Stall及lock/en门控后才得到grant_nxt；不同状态更新还各有使能。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [A01 DWC_ddr_umctl2_pa_arb.sv L149-168;192-239](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_arb.sv>)；[A02 DWC_ddr_umctl2_pa_preproc.sv L280-309;330-338;433-440;466-497;619-626;646-736](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_preproc.sv>)；[A05 DWC_ddr_umctl2_pa_dual.sv L45-45;190-280;320-360;405-450](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_dual.sv>)；[A06 DWC_ddr_umctl2_pa_port.sv L95-150](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_port.sv>)；[A08 DWC_ddr_umctl2_pa.sv L140-205](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa.sv>)；[A09 DWC_ddr_umctl2_pa_priocomp.sv L27-75](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_priocomp.sv>)；[A10 DWC_ddr_umctl2_pa_roundrobincore.sv L28-74](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_roundrobincore.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
+
+OPT1只在条件分支中使用已登记候选形成最终Grant；Credit仍按grant_nxt记账。Aging重装须非Stall及其优先条件；RR pointer须非Stall、req、grant_en及grant_nxt；req_saved按grant_nxt更新，不能把这些笼统归于最终Grant。
 
 依据：[读写状态、请求资格与连续服务控制](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_preproc.sv>)，L528–581、635–637、715–770、827–961；[轮转扫描](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_roundrobincore.sv>)，L48–74；[请求集合、指针与保持](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_pa_arb.sv>)，L112–150、213–232。这些代码定义了静态策略，本次单端口配置与尚未核对的运行寄存器取值，不足以给出多端口等待上界。
 
@@ -1769,28 +1766,8 @@ DDR6 的地址组织、访问单位与命令约束已经在第 2 章说明。它
 
 候选总体上保留 DDR5 的额度管理、Aging、读写切换和端口选择，在 arb_top 中筛选可送入原 PA 的请求，再让同一个 Grant 驱动前端推进和 HIF 命令选择。接收资格并非集中在一个流水级：XPI 先判断是否可以发布内部访问，arb_top 核对关联和上下文，PA 内判断资源与选择，IH 再执行实际接收和队头消费条件。
 
-```mermaid
-flowchart TB
-    X["XPI 待交付访问及关联信息"]
-    Q["arb_top 外围资格<br/>写：AW 事实、会话与上下文<br/>读：Parent / Fact / Child 与已接受 AR 记录"]
-    subgraph P["保留的 PA 核心"]
-        E["端口 mask、Credit、读写资格<br/>及当前 Stall 条件"]
-        A["Aging、优先级与轮转选择"]
-        N["grant_nxt：内部选择事件"]
-        O2["OPT2：直接生成对外 Grant"]
-        O1["OPT1：保持内部候选<br/>经当前 Stall mask 后生成 Grant"]
-    end
-    G["同一读写 Grant"]
-    H["XPI 内部访问推进 / HIF_CMD 选择"]
-    I["IH：命令有效、非 Stall<br/>且满足自身准入与 FIFO 条件时接受"]
-    B["IH 队头消费与 TE 后续接受"]
-    X --> Q
-    Q -->|"可竞争请求与写侧 Stall"| E
-    E --> A --> N
-    N --> O2 --> G
-    N --> O1 --> G
-    G --> H --> I --> B
-```
+<!-- FIG-14: redundancy removed; original frozen in diagram_audit -->
+本重复总图删除；OPT1/OPT2和Grant保持差异仍由[§6.6](#pa-reservation)、图6-4及[附录A-3](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-17)覆盖，IH准入见图6-4。
 
 图将条件按职责分组，不规定各框必须占一个时钟周期；图中两种 OPT 分支互斥选择。Credit 在 `grant_nxt` 处记账，外部 Grant 的呈现时点由 OPT 决定。IH 及 TE 的实际接收条件分别判断，不能由图上的先后关系推导为无条件同拍发生。
 
@@ -1812,41 +1789,33 @@ RTL 依据：[AW 构建条件及外围筛选](<../../11_rtl_project/rtl/variants
 
 下图区分 Valid（请求有效）与 Eligible（具备资格），并标明 DDR5 与 DDR6 候选在外围资格检查上的差异位置。DDR6 新增的 AW Fact/Session、AR Witness/Child 检查位于 arb_top（PA 外围），PA 核心子模块（pa_port、pa_preproc、pa_priocomp、pa_roundrobincore）在两版之间逐字节一致。
 
+<a id="fig-15"></a>
+
+**图 6-3：当前候选 PA 请求资格（原 FIG-15）**
+
 ~~~mermaid
 flowchart TB
-    HOST["Host AXI<br/>AWVALID / ARVALID"]
-    XPI["XPI<br/>拆分、组织内部读写访问"]
-    subgraph EXT5["DDR5：arb_top 外围"]
-        D5["pa_awvalid / pa_arvalid<br/>直接接 PA 请求输入"]
-    end
-    subgraph EXT6["DDR6：arb_top 外围（当前候选）"]
-        D6W["写侧：AW Fact / Session 查找<br/>→ ddr6_packet_wreq"]
-        D6R["读侧：Parent / Fact / Child<br/>+ 已接受 AR witness<br/>→ ddr6_aw_fact_rreq"]
-        D6S["写侧 preflight<br/>→ ddr6_packet_pa_stall"]
-    end
-    subgraph PA_IN["PA 内部资格层（pa_dual → pa_preproc）"]
-        direction TB
-        MASK["Mask 寄存与屏蔽<br/>xa_wreq_masked = req & ~mask_r"]
-        CREDIT["Credit 资格检查<br/>wr/lpr/hpr_credit_avail"]
-        DIR["读写方向资格<br/>DUAL_PA=0 共享 FSM"]
-        PM["页匹配 / 独占锁定"]
-    end
-    PP["可参与仲裁的请求集合<br/>wreq_pp / rreq_pp"]
-    GNT["PA Grant<br/>pa_wgrant / pa_rgrant"]
-    HOST --> XPI
-    XPI --> D5
-    XPI --> D6W
-    XPI --> D6R
-    D5 --> MASK
-    D6W --> MASK
-    D6R --> MASK
-    D6S -.->|"写侧 Stall<br/>hif_wcmd_stall"| GNT
-    MASK --> CREDIT --> DIR --> PM --> PP --> GNT
-    GNT -.->|"状态1: 有效但资源不足 Credit=0"| CREDIT
-    GNT -.->|"状态2: 有效但不满足资格 外围 Fact/Session 失败"| D6W
-    GNT -.->|"状态3: 有资格但本周期未选中"| PP
-    GNT -.->|"状态4: 获得 Grant"| GNT
+  X["XPI原请求 / Parent / Fact / Child"] --> W["AW lookup + Session preflight"]
+  X --> R["AR witness + Child资格"]
+  W -->|"ddr6_packet_wreq"| M["U_pa 寄存Mask"]
+  R -->|"ddr6_aw_fact_rreq"| M
+  M --> E["U_preproc<br/>Credit / 方向 / 页匹配资格"]
+  E -->|"可仲裁集合"| A["优先级与轮转选择"]
+  W -->|"ddr6_packet_pa_stall 写侧"| G["Grant mask与生成"]
+  A -->|"候选"| G
+  S["IH Stall 读侧 / 其他stall"] --> G
 ~~~
+
+**读图说明：** 只画当前候选的AW和AR资格路径。Credit、方向和页匹配决定可竞争集合，Stall参与Grant生成；四种状态见下表。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [A04 DWC_ddr_arb_top.sv L4128-4209;4236-4238;4306-4320](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[A05 DWC_ddr_umctl2_pa_dual.sv L45-45;190-280;320-360;405-450](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_dual.sv>)；[A02 DWC_ddr_umctl2_pa_preproc.sv L280-309;330-338;433-440;466-497;619-626;646-736](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_preproc.sv>)；[A01 DWC_ddr_umctl2_pa_arb.sv L149-168;192-239](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_arb.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
+
+| 状态 | 判定范围 |
+| --- | --- |
+| Valid但未Eligible | 原请求存在，但外围Fact/Session、Mask、Credit、方向或页匹配资格不足 |
+| Eligible但未Grant | 可竞争集合中，轮转/优先级未选择或当前Stall阻止grant_nxt |
+| Grant已产生 | OPT2为grant_nxt；OPT1为登记候选经当前mask，不等同于本周期新记账 |
+| 下游实际接受 | IH fifo_put满足本地准入；TE/CAM接受另有条件 |
 
 ### 6.5.2 DDR6 候选的资格检查
 
@@ -1901,72 +1870,33 @@ assign input_fifo_put=i_hif_cmd_valid && r1_ih_admission;
 assign fifo_put = input_fifo_put && (~input_fifo_full);
 ```
 
-下图把 Grant 到 Accept 的完整路径分为 PA 内部选择、arb_top 中间层、IH 输入层和后端四段，明确 Grant（前端选择事件）与 Accept（FIFO 写入）之间隔着的多层条件。
+下图分别给出当前 OPT2 的 Grant、XPI Ready 与 IH 实际入队门控。它们是不同逻辑事件，编号或箭头均不约定固定串行拍序；后端接受另见第8章。
+
+<a id="fig-16"></a>
+
+**图 6-4：PA 选择、XPI Ready 与 IH 入队（原 FIG-16）**
 
 ~~~mermaid
 flowchart TB
-    subgraph PA["PA（DWC_ddr_umctl2_pa_dual U_pa）"]
-        SEL["1. 请求具有资格<br/>wreq_pp / rreq_pp"]
-        ARB["2. PA 选中请求<br/>grant_rr → grant_nxt"]
-        GNT["3. Grant 产生<br/>pa_wgrant / pa_rgrant<br/>OPT2: grant=grant_nxt"]
-    end
-    subgraph ARB_TOP["arb_top 中间层"]
-        HIF_CMD["4. HIF_CMD 选择命令<br/>U_hif_cmd 按 Grant 选择字段"]
-        XPI_RDY["5. XPI 请求推进<br/>hif_awready/arready<br/>DDR6: && first_core_gate_allow"]
-    end
-    subgraph IH_LAYER["IH 输入层"]
-        IH_VALID["6. IH 命令有效<br/>rst_n && hif_cmd_valid && !stall"]
-        IH_ADMIT["7. IH 准入检查<br/>r1_ih_admission"]
-        IH_FIFO["8. IH FIFO 写入<br/>fifo_put = valid && admission && !full"]
-    end
-    subgraph BE["后端"]
-        IH_HEAD["9. IH 队头消费"]
-        TE["10. TE 接受"]
-        PAS["11. PAS 调度"]
-        PHY["12. PHY 传输"]
-    end
-    subgraph FB["反馈（经多层互连返回 PA）"]
-        CRED["IH Credit 补入<br/>hif_*_credit"]
-        STALL["IH Stall<br/>hif_cmd_stall"]
-    end
-    SEL --> ARB --> GNT
-    GNT -->|"pa_wgrant/rgrant"| HIF_CMD
-    GNT -->|"同一 Grant"| XPI_RDY
-    HIF_CMD -->|"hif_cmd_valid + 命令字段"| IH_VALID
-    IH_VALID --> IH_ADMIT --> IH_FIFO
-    IH_FIFO --> IH_HEAD --> TE --> PAS --> PHY
-    IH_LAYER -.->|"容量/占用/retry"| FB
-    FB -.->|"经 CPF→CP→CP_TOP→DDRC→hif_mux→arb_top"| PA
-    GNT -.->|"Grant = 前端选择事件<br/>不等于后端接收"| IH_FIFO
+  Q["资格请求与轮转选择"] --> N["grant_nxt<br/>含Stall / lock / en门控"]
+  N -->|"当前OPT2"| G["pa_wgrant / pa_rgrant"]
+  N -.->|"实际记账表达式"| C["Credit计数器"]
+  G --> H["U_hif_cmd 组合选源"]
+  G --> R["arb_top Ready映射<br/>并AND first_core_gate_allow"]
+  R --> X["XPI内部包握手"]
+  H -.->|"经U_hif_mux / DDRC / CPF"| I["IH命令入口<br/>reset且valid且非Stall"]
+  I -->|"且admission且非full"| F["IH fifo_put真实入队"]
 ~~~
+
+**读图说明：** 同一Grant分别送组合命令mux和Ready映射。Credit按grant_nxt记账，IH真实入队须独立满足reset、Stall、admission和非满条件。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [A01 DWC_ddr_umctl2_pa_arb.sv L149-168;192-239](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_arb.sv>)；[A02 DWC_ddr_umctl2_pa_preproc.sv L280-309;330-338;433-440;466-497;619-626;646-736](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_preproc.sv>)；[A03 DWC_ddr_arb_top.sv L2707-2744;3032-3033;3072-3072;3151-3250;3299-3357](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[H01 DWC_ddr_umctl2_hif_cmd.sv L90-134;199-344;350-466](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)；[I01 ih_core_in_if.sv L518-534;567-575;631-650;905-913;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
+
+Stall使新grant_nxt为零时，不发生该新Grant造成的Credit扣减；独立Credit补入可继续。OPT1先前已发生的预留扣减不因当前Stall再扣一次。未以静态图证明first_core_gate_allow、IH admission/full与PA Stall逐拍等价。
 
 下面再用时序图展示 Grant 后下游反压与不反压两种情况下各模块的处理差异：
 
-~~~mermaid
-sequenceDiagram
-    participant PA as PA (U_pa)
-    participant HIF as HIF_CMD (U_hif_cmd)
-    participant ARB as arb_top
-    participant XPI as XPI (U_xpi)
-    participant IH as IH (ih_core_in_if)
-    Note over PA: 假设 OPT2，请求有资格且被选中
-    PA->>ARB: pa_wgrant = 1 (grant_nxt)
-    ARB->>HIF: wgrant = pa_wgrant → 选择命令字段
-    ARB->>XPI: hif_awready = pa_wgrant (DDR6: && first_core_gate_allow)
-    Note over HIF: hif_cmd_valid = 1
-    HIF->>IH: hif_cmd_valid = 1
-    alt IH 不反压（stall=0, admission=1, !full）
-        IH->>IH: fifo_put = 1 → 命令进入 FIFO
-        Note over PA: Credit 按 grant_nxt 扣减
-        Note over XPI: 内部请求推进
-    else IH 反压（stall=1 或 full）
-        IH->>IH: fifo_put = 0 → 命令未进入 FIFO
-        IH-->>ARB: hif_cmd_stall = 1（经多层互连）
-        ARB-->>PA: hif_wcmd_stall = 1
-        Note over PA: OPT2: grant 被 arb_gnt_mask 屏蔽<br/>Credit 仍按 grant_nxt 扣减
-        Note over XPI: 内部请求不推进<br/>由 XPI 自身保持逻辑持有
-    end
-~~~
+学习图已移至[图 A-3：OPT2 Stall 与 Credit 事件学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-17)；其适用条件与RTL依据随图保留。
 
 出处：[候选 IH 输入实际接收](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)，L525–534、571；正常准入和读队头消费分别见该文件 L1717–1721、L905–913，相关原证据仍见 [E09](#rtl-evidence-index)。本章沿用第 5 章的 XPI 推进条件，不引入第二套上游握手。
 
@@ -2049,48 +1979,26 @@ PA 还向 DDRC 提供 WR/LPR/HPR 的 go2critical 提示，用于表达紧急或�
 
 下图把反压分为三层：① DDR5 原有资源/反压机制（当前生效），② DDR6 候选新增的外围资格/关联机制，③ 当前构建实际启用的路径。反压闭环经多层互连返回 PA，不是一根直连线。
 
+<a id="fig-18"></a>
+
+**图 6-5：Credit、Stall 与外围反压（原 FIG-18）**
+
 ~~~mermaid
-flowchart TB
-    subgraph L1["① DDR5 原有资源/反压机制（当前生效）"]
-        direction TB
-        IH_CR["IH Credit 补入<br/>hif_wr/hpr/lpr_credit"]
-        PA_CR["PA Credit 计数器<br/>补入加一，grant_nxt 扣减"]
-        IH_ST["IH 命令 Stall<br/>hif_rcmd_stall / hif_wcmd_stall"]
-        PA_MASK["PA Mask<br/>xa_wmask / xa_rmask"]
-        PA_G2C["go2critical 提示"]
-        IH_CR -->|"补入事件"| PA_CR
-        IH_ST -->|"mask Grant"| PA_CR
-        PA_MASK -->|"mask 请求"| PA_CR
-        PA_CR -->|"资源不足时"| PA_G2C
-    end
-    subgraph L2["② DDR6 候选新增的外围资格/关联机制"]
-        direction TB
-        AW_FACT["AW Fact 查找<br/>槽位/代次/边界匹配"]
-        AW_SESS["写侧 Session/上下文<br/>preflight=1 → 阻塞"]
-        AR_WIT["AR Witness 查找<br/>已接受 AR 记录匹配"]
-        AR_QUAL["读侧 Parent/Fact/Child<br/>+ session_open"]
-        RESV_OBS["Reservation 观察<br/>（OPT1 才非零）"]
-        AW_FACT --> AW_SESS
-        AR_WIT --> AR_QUAL
-    end
-    subgraph L3["③ 当前构建实际启用的路径"]
-        direction TB
-        ACT_CR["Credit + Stall + Mask<br/>DDR5 原有，当前生效"]
-        ACT_AW["AW Fact 资格检查<br/>→ ddr6_packet_wreq"]
-        ACT_AR["AR Witness 资格检查<br/>→ ddr6_aw_fact_rreq"]
-        ACT_RESV["Reservation 输出 = 0<br/>OPT2 当前配置"]
-    end
-    subgraph BP_LOOP["反压闭环（经多层互连）"]
-        direction LR
-        IH_OUT["IH.ih_core_out_if<br/>产生 Credit + Stall"]
-        CPF["CPF → CP → CP_TOP<br/>→ DDRC → U_hif_mux"]
-        ARB_T["arb_top → PA"]
-        IH_OUT --> CPF --> ARB_T
-    end
-    L1 -.->|"全部当前生效"| L3
-    L2 -.->|"部分当前生效"| L3
-    BP_LOOP -.->|"返回 PA"| L1
+flowchart LR
+  I["IH core_out_if"] -.->|"经封装 hif_*_credit"| C["PA Credit计数器"]
+  I -.->|"经封装 hif_cmd_stall"| S["读Stall / 写preflight"]
+  W["AW Fact / Session资格"] --> S
+  R["AR witness / Child资格"] --> E["请求资格集合"]
+  W --> E
+  C -->|"credit_avail依赖"| E
+  E --> G["轮转与grant_nxt"]
+  S -->|"Grant mask"| G
+  G -->|"decr"| C
 ~~~
+
+**读图说明：** IH补入Credit、Stall和外围资格在不同位置影响选择。真实grant_nxt反馈计数扣减，不把Stall直接画成计数器操作。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [A01 DWC_ddr_umctl2_pa_arb.sv L149-168;192-239](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_arb.sv>)；[A02 DWC_ddr_umctl2_pa_preproc.sv L280-309;330-338;433-440;466-497;619-626;646-736](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_preproc.sv>)；[A04 DWC_ddr_arb_top.sv L4128-4209;4236-4238;4306-4320](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[I03 ih_core_out_if.sv L160-179;200-220;255-280;310-325;372-390](<../../11_rtl_project/rtl/variants/candidate_strict_iter013_v35/ih_core_out_if.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 | 请求所处状态 | 当前 RTL 中的典型条件 | 能促进进展的机制及限制 |
 | --- | --- | --- |
@@ -2140,30 +2048,8 @@ Reservation 的当前状态应分别理解：OPT2 仍执行新增资格检查，
 
 下图概括 DDR5 与 DDR6 PA 在请求选择、Priority/Aging、Credit、读写切换、Grant、Fact/Session 资格、Reservation 和反压八个方面的对照，标出当前配置是否生效：
 
-~~~mermaid
-flowchart LR
-    subgraph D5["DDR5 原有机制"]
-        D5SEL["请求选择<br/>pa_awvalid/arvalid 直接接 PA"]
-        D5PRIO["Priority/Aging<br/>pa_port 等待计数"]
-        D5CR["Credit<br/>pa_preproc 7位计数器"]
-        D5DIR["读写切换<br/>共享 FSM"]
-        D5GNT["Grant<br/>OPT2=grant_nxt"]
-    end
-    subgraph D6["DDR6 候选变化"]
-        D6SEL["请求选择<br/>改接 ddr6_packet_wreq/<br/>ddr6_aw_fact_rreq"]
-        D6FACT["Fact/Session 资格<br/>AW Fact + AR Witness<br/>（arb_top 外围，核心逐字节一致）"]
-        D6RESV["Reservation<br/>pa_arb 新增两行赋值<br/>OPT2 恒 0"]
-        D6STALL["写侧 Stall 改接<br/>ddr6_packet_pa_stall"]
-    end
-    D5SEL --> D6SEL
-    D5GNT --> D6RESV
-    D5PRIO -.->|"核心未改"| D5PRIO
-    D5CR -.->|"核心未改"| D5CR
-    D5DIR -.->|"核心未改"| D5DIR
-    D6SEL --> D6FACT
-    D6FACT --> D6STALL
-~~~
-
+<!-- FIG-19: redundancy removed; original frozen in diagram_audit -->
+本重复小结图删除；原有小结文字、§6.6构建表及图6-1～6-5保留请求资格、Credit、轮转与Reservation信息。 Credit计数器的参数事实保留为CRDT_CNT_WIDTH=7（pa_dual L45，当前arb_top未覆盖该PA参数），不是新增队列深度。
 
 <a id="hif-detailed-design"></a>
 # 第7章 HIF 详细设计
@@ -2184,34 +2070,27 @@ flowchart LR
 
 下图给出 HIF 在 MC 中的总体 I/O 位置。HIF 不是单一模块，而是 **HIF_CMD + HIF_DATA** 两个协作模块：HIF_CMD 是组合命令 mux（无命令 FIFO、无 clk/rst），按 PA Grant 选命令字段；HIF_DATA 保存写指针队列 `wptrq`、选择写数据、分发读返回（有真实 clk/rst_n）。图中连线全部来自真实 RTL 实例连接，凡经中间层（`U_hif_mux` / DDRC / CP / CPF / DP）的路径均标“经…”。
 
+<a id="fig-20"></a>
+
+**图 7-1：HIF_CMD 与 HIF_DATA 接线（原 FIG-20）**
+
 ~~~mermaid
-flowchart LR
-    subgraph FE["前端 (arb_top 内)"]
-        XPI["XPI<br/>保存 AW/AR 请求与 W 数据"]
-        PA["PA 仲裁<br/>pa_wgrant / pa_rgrant"]
-    end
-    subgraph HIF["协作子系统 HIF"]
-        CMD["HIF_CMD<br/>组合命令 mux<br/>同 Grant 选地址/长度/Token/写指针"]
-        DATA["HIF_DATA<br/>wptrq + 写数据 mux + 读返回 demux"]
-    end
-    subgraph MID["中间层 / 下游"]
-        HIX["U_hif_mux → DDRC → CP_top → CP → CPF"]
-        IH["IH 输入 FIFO<br/>(命令实际保存处)"]
-        WU["DP.memc_wu<br/>写数据接收 + Entry/RAM"]
-        RTRD["DP.rt / rd_wrapper<br/>读返回恢复"]
-        XPI2["XPI RRB / read / RDQ<br/>→ Host R"]
-    end
-    XPI -->|"e_aw/e_ar 地址/长度/Token/写指针<br/>(经 arb_top 重排资格)"| CMD
-    PA -->|"pa_wgrant / pa_rgrant<br/>同时回接 XPI 内部 ready"| CMD
-    CMD -->|"hif_hif_cmd_valid/type/addr/<br/>length/wdata_ptr/token"| HIX
-    HIX -->|"hif_cmd_valid & !hif_cmd_stall<br/>→ input_fifo_put"| IH
-    IH -.->|"core_out_if 登记<br/>hif_wdata_ptr / valid<br/>(经 CPF/CP/DDRC/U_hif_mux 回传)"| DATA
-    XPI -->|"e_wdata/e_wstrb/e_wlast/<br/>e_wlast_pkt (经 arb_top)"| DATA
-    DATA -->|"hif_wdata / hif_wdata_end /<br/>hif_wdata_mask (经 U_hif_mux/DDRC/DP)"| WU
-    WU -.->|"hif_wdata_stall / wu_co_wdata_stall"| DATA
-    RTRD -->|"hif_rdata / hif_rdata_valid /<br/>hif_rdata_end / hif_rdata_token<br/>(经 DP/DDRC/U_hif_mux)"| DATA
-    DATA -->|"e_rvalid / e_rdata /<br/>e_resp_token / e_rerror"| XPI2
+flowchart TB
+  X["XPI命令与数据"] -->|"命令字段"| C["HIF_CMD 无状态mux"]
+  P["PA Grant"] --> C
+  C -.->|"经顶层封装"| I["IH FIFO<br/>put须valid / 非stall / admission / 非full"]
+  X -->|"W数据 / Parent"| H["HIF_DATA wptrq与路由"]
+  I -.->|"登记写指针回传"| H
+  I -.->|"经CPF checked-head gate"| W["WU描述FIFO与数据入口"]
+  H -.->|"经DP写数据"| W
+  W -.->|"data stall"| H
+  R["RT / RD"] -.->|"经DP返回 / Token"| H
+  H -->|"读返回"| B["XPI RRB / RDQ"]
 ~~~
+
+**读图说明：** HIF_CMD选择命令而不保存命令状态，HIF_DATA保存指针并路由数据。WU和RT/RD通过原数据封装连接，数据不经过IH。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [A03 DWC_ddr_arb_top.sv L2707-2744;3032-3033;3072-3072;3151-3250;3299-3357](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[H01 DWC_ddr_umctl2_hif_cmd.sv L90-134;199-344;350-466](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)；[H02 DWC_ddr_umctl2_hif_data.sv L373-398;422-438;450-491;583-583;685-719](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)；[H04 DWC_ddr_arb_top.sv L3389-3428](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[I01 ih_core_in_if.sv L518-534;567-575;631-650;905-913;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)；[W03 dwc_ddrctl_ddrc_dp.sv L735-814;1073-1135;1261-1285;1392-1496](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 当前候选的两个实例及实际端口见 [HIF 实例与命令连接](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L3266–3370、[HIF_DATA 写指针、数据及返回连接](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L3371–3426。本章只对 MANIFEST 选中的源码、明确的参数绑定和可见状态推进作静态判断；不以编入文件代替运行与功能验证。
 
@@ -2232,19 +2111,27 @@ PA Grant 同时反馈前端内部 ready。IH 的命令 stall 参与 PA 掩码，
 
 HIF_CMD 先把前端产生的写路由指针随命令交给 IH。IH 在写请求有效且 TE 不要求 retry 时，经出口寄存器返回同一请求的指针；HIF_DATA 用 `hif_wdata_ptr_valid` 将它写入 `wptrq`。同一后端接受阶段，WU 描述 FIFO 保存 Entry 和相关属性。指针返回不是 PA Grant 当拍无条件入队，也不是新申请一块写数据 RAM。依据：[原 IH 指针返回寄存器](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_core_out_if.sv>)，L158–176、[原 WU 描述入队与流控](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/wu/memc_wu_wdata_if.sv>)，L245–282。
 
+<a id="fig-21"></a>
+
+**图 7-2：写指针、描述和数据接受（原 FIG-21）**
+
 ~~~mermaid
 flowchart TB
-  C["HIF_CMD 选中的写命令<br/>含原写路由指针"] --> I["IH 输入 FIFO<br/>等待后端交付"]
-  I --> A["IH 写交付有效<br/>TE 无 retry，数据资源允许"]
-  A --> P["IH 出口寄存器<br/>返回路由指针与 valid"]
-  A --> Q["WU 描述 FIFO<br/>Entry 与包属性"]
-  P --> H["HIF_DATA wptrq<br/>端口、BID、原事务末包等"]
-  H -->|"队头选数据来源"| M["HIF_DATA 写数据 mux"]
-  X["XPI 数据缓冲<br/>经原包装通路"] --> M
-  M --> R["可选数据重定时"]
-  R --> W["WU 数据接收与 RAM 写通路"]
-  Q -->|"Entry 与包内位置"| W
+  I["IH写命令头 / TE写资格"] -->|"wr_valid且非retry"| P["core_out_if指针寄存器"]
+  I --> G["CPF checked-head gate"]
+  G -->|"raw / head_pop / reset / cg_en"| D["WU描述put<br/>另须wdata_reqd且非retry"]
+  P -.->|"经封装ptr / valid"| Q["HIF_DATA U_wptrq"]
+  Q -->|"队头选源"| M["写数据mux / 可选retime"]
+  X["XPI数据与Parent"] --> M
+  M -.->|"data / end / Parent"| W["WU数据接受与RAM"]
+  D -->|"队头Entry / word_num"| W
 ~~~
+
+**读图说明：** IH出口登记指针；WU描述另经过CPF checked-head及自身put条件。HIF指针头选数据，WU描述头决定RAM位置。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [I03 ih_core_out_if.sv L160-179;200-220;255-280;310-325;372-390](<../../11_rtl_project/rtl/variants/candidate_strict_iter013_v35/ih_core_out_if.sv>)；[I04 dwc_ddrctl_ddrc_cpf.sv L950-995;1999-2003](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_cpf.sv>)；[H02 DWC_ddr_umctl2_hif_data.sv L373-398;422-438;450-491;583-583;685-719](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)；[H03 DWC_ddr_umctl2_hif_data.sv L79-82;167-172;228-233;508-555](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)；[W02 memc_wu_wdata_if.sv L247-293;405-431](<../../11_rtl_project/rtl/variants/candidate_joint_aw_wu021_v5/memc_wu_wdata_if.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
+
+[NEEDS_EVIDENCE] 指针登记与checked-head描述put的逐拍一致性还需相同构建下的运行/断言证据；不能因两队列同源便宣称任何配置都同步。
 
 图中两队列分属 HIF 与 WU，模块间经 MC 顶层/数据通路互连接线；它们没有合并为一个 FIFO。当前包的数据来源由 wptrq 队头的端口字段决定，RAM 位置则由 WU 的 Entry 及包内计数决定。原字段解码见 [写指针内容及端口选择](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/pa/DWC_ddr_umctl2_hif_data.sv>)，L375–396，原 WU 地址关系已在第 3.5 节说明。
 
@@ -2289,25 +2176,27 @@ DDR6 Rev0.x R0、2026-09-14 委员会投票草案中的用户访问单位、BL24
 
 候选保留原命令 mux、写指针 FIFO、可选数据重定时和读返回路由，在已有交接处增加身份与来源检查。下面按三个通路展示 HIF 的实际位置；HIF_DATA 的写路由和读路由只是同一实例的两个功能视图。
 
+<a id="fig-22"></a>
+
+**图 7-3：HIF 命令与数据的两条路径（原 FIG-22）**
+
 ~~~mermaid
 flowchart TB
-  X["XPI 原命令及身份旁带"] --> C["HIF_CMD<br/>同 Grant 选命令与旁带"]
-  P["PA 的读写 Grant"] --> C
-  C --> I["IH 输入 FIFO<br/>同头检查与后端交付"]
-  I --> E["TE 请求资源<br/>后续由 PAS 等调度"]
-  I --> OP["IH 出口寄存器<br/>写路由指针返回"]
-  OP --> Q["HIF_DATA 指针 FIFO"]
-  Q --> W["HIF_DATA 写路由<br/>数据与 Parent 同阶段"]
-  D["XPI 当前数据包<br/>data / Parent"] --> W
-  I --> DQ["WU 描述 FIFO"]
-  DQ --> U["WU 接收/存储资格<br/>后续 MR 与数据关联逻辑"]
-  W -->|"data / end / Parent"| U
-  U -.->|"实际数据反压"| W
-  T["RT<br/>控制记录与返回数据关联"] --> R["RD：后端数据处理"]
-  R --> H["HIF_DATA 读路由<br/>Token 选端口"]
-  H --> G["arb_top 返回入口门控"]
-  G --> B["XPI RRB / 格式恢复<br/>响应队列"]
+  X["XPI命令 / W数据 / Parent"] -->|"原生命令载荷"| C["HIF_CMD同Grant mux"]
+  P["PA Grant"] --> C
+  C -.->|"经封装"| I["IH FIFO与同头检查"]
+  I -.->|"Child / 坐标 / Entry"| T["TE请求资源"]
+  I -.->|"登记指针"| H["HIF_DATA wptrq / 数据路由"]
+  I -.->|"CPF checked-head写描述"| W["WU / MR / DP Join"]
+  X -->|"W数据 / Parent"| H
+  H -.->|"数据及Parent"| W
+  R["RT / RD返回"] -.->|"数据 / Token"| H
+  H -->|"读路由并外围门控"| B["XPI RRB / 响应队列"]
 ~~~
+
+**读图说明：** 命令路径、写数据路径及读返回路径分开。两条写队列通过原命令身份和顺序关联，显式身份比较在下游结构。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [H01 DWC_ddr_umctl2_hif_cmd.sv L90-134;199-344;350-466](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_hif_cmd.sv>)；[H02 DWC_ddr_umctl2_hif_data.sv L373-398;422-438;450-491;583-583;685-719](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)；[H03 DWC_ddr_umctl2_hif_data.sv L79-82;167-172;228-233;508-555](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)；[I01 ih_core_in_if.sv L518-534;567-575;631-650;905-913;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)；[I04 dwc_ddrctl_ddrc_cpf.sv L950-995;1999-2003](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_cpf.sv>)；[W03 dwc_ddrctl_ddrc_dp.sv L735-814;1073-1135;1261-1285;1392-1496](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)；[R01 rt.sv L205-210;442-454](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/rt.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 图中 MC 顶层/DP 的纯接线以边表示，IH 出口寄存器、HIF 指针 FIFO、WU 描述 FIFO等会改变保持和接受时刻的环节均单独标出。TE 不通过 HIF 搬运写数据；PAS 的器件时序检查也不归入 HIF。读片段接收和 RT 前的实际数据源另见[第 7.7 节](#hif-read-return)。
 
@@ -2323,18 +2212,8 @@ flowchart TB
 
 命令通路需要先选来源，再确认接受。PA 的资源与资格判断解决“能否参加本次选择”；有效 Grant 决定 HIF_CMD 使用哪个端口；IH 输入 FIFO 的写入才表示本次命令被该边界接收。FIFO 中的同一队头以后还要通过解释、重试和真实后端接受，才能消费。PAS 发出器件命令发生在更后面的调度阶段。
 
-~~~mermaid
-flowchart TB
-  Q["XPI 当前内部请求<br/>及外围资格"] --> P["PA 优先级与资源选择"]
-  P --> G["有效读写 Grant"]
-  G --> H["HIF_CMD<br/>同来源字段及旁带选择"]
-  G -.->|"内部 ready 回接"| Q
-  H --> A["IH 输入接受<br/>valid、无 stall、准入满足"]
-  A --> F["IH 输入 FIFO 的同一命令头"]
-  F --> T["解释与重试条件满足后<br/>TE 实际接受"]
-  T --> S["PAS 等后端调度与器件发令"]
-  B["IH stall / 外围暂不准入"] -.->|"限制选择资格"| P
-~~~
+<!-- FIG-23: redundancy removed; original frozen in diagram_audit -->
+本重复命令通路图删除；Grant、IH入队与TE接受的不同条件由图6-4、图8-5及原事件表保留。
 
 这是事件依赖图，不给出固定拍距。当前 OPT2 的有效 Grant 是受 stall 屏蔽的组合选择，等待期间不要求 HIF 保存一份不变的 Grant；真正未交付的请求由 XPI 队列保持。IH FIFO 接受和队头消费还可以在同一边沿分别服务不同记录，不能合并成一次统一出队。PA 细节沿用第 6.5.3 节，相关掩码见 [当前仲裁 stall 掩码](<../../11_rtl_project/rtl/source/src/pa/DWC_ddr_umctl2_pa_arb.sv>)，L159–168。
 
@@ -2378,31 +2257,7 @@ HIF_CMD 在比较失败时将对应新增旁带的有效标志保持为零；原
 
 下图区分 DDR5 原有机制与 DDR6 候选新增机制，并标出反压分布。重要边界：HIF 没有在 wptrq 头另外保存并比较命令 Parent，显式 `phase_parent` 与已接受命令 Parent 比较发生在 DP 的 Join，不在 HIF。
 
-~~~mermaid
-flowchart LR
-    subgraph D5["DDR5 原有机制"]
-        D5G["PA Grant 选源"]
-        D5PTR["写指针 wdata_ptr<br/>(端口/BID/末包等路由元数据)"]
-        D5Q["wptrq + WU 描述 FIFO<br/>两条同源队列维持对应"]
-        D5R["读 Token 路由<br/>RT 控制记录恢复"]
-        D5G --> D5PTR --> D5Q
-        D5G --> D5R
-    end
-    subgraph D6C["DDR6 候选新增 (HIF 内)"]
-        D6P["HIF_CMD Parent mux<br/>同 Grant 选 Parent<br/>要求唯一/已知/非零"]
-        D6F["HIF_CMD AW/AR Fact + AR Child<br/>同源校验 (实验开关)"]
-        D6WP["HIF_DATA 写数据 Parent<br/>随 wport_num_oh 选 + 同 retime 保持"]
-        D6P --> D6F
-        D6P -.->|"同 Parent 一致性"| D6WP
-    end
-    subgraph DOWN["下游显式比较 (HIF 之外)"]
-        WU["WU 接收资格<br/>source_known/plan/lease/<br/>retained capture"]
-        JOIN["DP Join<br/>phase_parent vs accepted_parent<br/>行/ordinal/membership 比较"]
-        WU --> JOIN
-    end
-    BP["反压源"] -.->|"IH stall → PA 掩蔽<br/>hif_wdata_stall → e_wready↓<br/>e_bready↓ (WRQ 满)"| D5Q
-    D6WP -.->|"Parent 未知/不匹配<br/>→ 旁带 valid降低<br/>(原 valid 不直接清零)"| WU
-~~~
+学习图已移至[图 A-4：HIF 身份传递与比较边界学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-24)；其适用条件与RTL依据随图保留。
 
 <a id="hif-write-routing"></a>
 ## 7.6 写数据路由与事务对应
@@ -2421,6 +2276,10 @@ flowchart LR
 
 当前 arb_top 仅在 `A_NPORTS==1 && INT_NPORTS_DATA==1` 时直接连接这组数据 Parent，多端口不匹配分支将其有效和数据清零。不能从 HIF_DATA 内部写了端口循环就认定当前顶层已实现多端口身份路径。依据：[数据 Parent 的实际单端口接法](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L1525–1535、[Parent 已知性和同端口选择](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L227–234、[Parent 与数据同阶段保持](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)，L513–562。
 
+<a id="fig-25"></a>
+
+**图 7-4：写数据到 DP Join 的身份关联（原 FIG-25）**
+
 ~~~mermaid
 flowchart TB
   XP["XPI 数据组织记录<br/>data / mask / 包尾 / Parent"] --> H["HIF_DATA<br/>指针选端口，同阶段传 Parent"]
@@ -2433,6 +2292,10 @@ flowchart TB
   J --> F["当前八片段交付<br/>交付不等于最终完成"]
   U -.->|"stall 经原数据接口返回"| H
 ~~~
+
+**读图说明：** WU接收数据并保存行身份，MR取出数据及相位身份，DP Join再将它们与已接受命令比较。HIF只承担选源和同阶段传递。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [H02 DWC_ddr_umctl2_hif_data.sv L373-398;422-438;450-491;583-583;685-719](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)；[H03 DWC_ddr_umctl2_hif_data.sv L79-82;167-172;228-233;508-555](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)；[W01 memc_wu.sv L348-397;708-736;816-853](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/memc_wu.sv>)；[W03 dwc_ddrctl_ddrc_dp.sv L735-814;1073-1135;1261-1285;1392-1496](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)；[W04 ddr6_command_data_join_sender.sv L123-137;328-355;373-390](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/ddr6_command_data_join_sender.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 图中的计划与行保留许可用于确认实际存储位置和可接收性；严格说，HIF 自身没有在指针队头保存另一份命令 Parent 并与数据 Parent 比较。WU 的源身份已知性、描述头位置、计划/保留地址回显和接收容量共同参与 stall。真实数据接受观察为：
 
@@ -2471,21 +2334,7 @@ Join 位于 DP 内，接收命令/行记录和 MR 读出后的相位数据。它
 
 当前候选在 RT 之前增加受限返回接收器，而不是在 HIF_DATA 内新增一个完整片段重组器。接收器先关联实际 IH 接受的请求、核心 tag、命令目录和片段记录；收集八份 128bit 用户数据，再按前四片/后四片形成两份 512bit 返回。DDRC 的真实 mux 在对应 BUILD 成立时选择这些输出，否则按代码回到原 DFI 输入。
 
-~~~mermaid
-flowchart TB
-  A["IH 实际接受的请求<br/>核心 tag 与原始 AR 事实"] -.-> RX["候选读返回接收器<br/>身份检查与四加四重组"]
-  TR["仿真 transport 解包<br/>MD_OFF 数据与片段标识"] --> RX
-  RX -->|"两份 512bit 返回"| M["DDRC 实际数据源 mux"]
-  O["原 DDR5 DFI 数据输入<br/>对应回退分支"] --> M
-  M --> RT["RT 数据处理<br/>配合控制 FIFO 队头"]
-  PI["PI 的实际读发令控制记录"] --> TF["RT 控制 FIFO<br/>保存 partial / tag"]
-  TF --> RT
-  RT --> RD["RD 格式和请求类别处理"]
-  RD --> H["HIF_DATA<br/>Token 低位选端口，数据与错误转发"]
-  H --> G["arb_top 返回入口<br/>first_core_gate_allow"]
-  G --> X["XPI RRB<br/>再经格式恢复与响应队列"]
-  X --> U["Host RVALID / RREADY"]
-~~~
+学习图已移至[图 A-5：候选读返回接收器与原返回链学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-26)；其适用条件与RTL依据随图保留。
 
 图中仿真 transport 是当前模型适配，不是目标 PHY/DFI 已冻结的接口。命令/片段身份来自控制记录和接受事件，不是 DRAM 数据线上携带 Parent。接收器实例的分配、Token 与片段接线见 [返回接收器的真实关联输入](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc.sv>)，L4472–4508；数据源 mux 见 [E23](#rtl-evidence-index)；四加四重组见 [片段核对与两拍输出](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/ddr6_r1_rd_return_receiver122.sv>)，L200–266。
 
@@ -2493,29 +2342,26 @@ HIF 后半段继续使用原机制：`rport_num` 从 Token 低位取得，`e_rva
 
 下图完整展示读返回从后端到 XPI 的路径：PI 发令 → RT 控制 FIFO → 后端返回数据 → RT 附 tag → RD 处理 → DP 接线 → HIF_DATA 端口解复用 → arb_top 门控 → XPI RRB → 格式恢复 → Host R。读返回身份来自发令侧记录 + 返回顺序合同，不是从 DRAM DQ 解出 AXI ID。
 
+<a id="fig-27"></a>
+
+**图 7-5：读返回路由与 Host 交付（原 FIG-27）**
+
 ~~~mermaid
 flowchart LR
-    PI["PI 发令<br/>pi_rt_rd_vld"]
-    RTFIFO["RT 控制 FIFO<br/>保存 partial / tag"]
-    PHY["后端/模型返回数据<br/>DFI valid → rdatavld<br/>(不带 AXI ID)"]
-    RT["RT<br/>按返回顺序附队头 tag<br/>末尾弹出控制记录"]
-    RD["RD / rd_wrapper<br/>处理 ratio/CRC/RMW/MRR<br/>输出 data/valid/end/info"]
-    DP["DP 接线<br/>rd_ra_info → hif_rdata_token<br/>data/valid/end → HIF"]
-    HD["HIF_DATA 读 demux<br/>rport_num = token 低位<br/>e_rvalid 按端口解复用"]
-    GATE["arb_top 返回入口门控<br/>hif_rvalid & first_core_gate_allow"]
-    RRB["XPI RRB<br/>按 Token/beat 重排"]
-    RDQ["read 格式恢复 / RDQ<br/>→ Host RVALID / RREADY"]
-    PI --> RTFIFO
-    RTFIFO --> RT
-    PHY --> RT
-    RT --> RD
-    RD --> DP
-    DP -->|"hif_rdata / valid / end / token<br/>(经 DDRC/U_hif_mux)"| HD
-    HD -->|"e_rvalid / e_rdata /<br/>e_resp_token / e_rerror"| GATE
-    GATE --> RRB
-    RRB --> RDQ
+  P["PI读发令"] -->|"valid / partial / tag"| Q["RT控制FIFO"]
+  S["DDRC所选返回源"] -->|"data / valid"| R["RT附队头tag与end"]
+  Q --> R
+  R --> D["RD / rd_wrapper<br/>按当前mode处理"]
+  D -.->|"经DP / DDRC / hif_mux<br/>data / valid / end / Token"| H["HIF_DATA读demux"]
+  H --> G["arb_top返回入口<br/>first_core_gate_allow"]
+  G --> B["XPI RRB"]
+  B --> F["格式恢复 / RDQ / 可选保持级"]
+  F --> U["Host R握手"]
 ~~~
 
+**读图说明：** PI控制队列与返回数据在RT关联；RD输出经DP回到HIF按Token解复用，再过入口门控、RRB和响应保持到Host。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [R01 rt.sv L205-210;442-454](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/rt.sv>)；[W03 dwc_ddrctl_ddrc_dp.sv L735-814;1073-1135;1261-1285;1392-1496](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)；[H02 DWC_ddr_umctl2_hif_data.sv L373-398;422-438;450-491;583-583;685-719](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_hif_data.sv>)；[A03 DWC_ddr_arb_top.sv L2707-2744;3032-3033;3072-3072;3151-3250;3299-3357](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)；[X02 DWC_ddr_umctl2_xpi_rrb.sv L706-726](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi_rrb.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 HIF 到 XPI 的实际入口还受保护条件控制：arb_top 将 HIF 的端口 valid 接成 hif_rvalid，送 XPI 时与 first_core_gate_allow 相与；RRB 写入使用 XPI 内已选中的返回 valid。因此“HIF 返回有效”和“XPI 入口实际允许接收”仍需分别核对，这不是 Host RREADY 的逐拍反压。依据：[返回有效的入口资格](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/DWC_ddr_arb_top.sv>)，L2774–2784、该文件 L3434；[RRB 返回信息与写入](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/DWC_ddr_umctl2_xpi.sv>)，L5980–6003。
 
@@ -2597,59 +2443,17 @@ HIF 没有因为新增身份旁带就获得一个软件可直接读写的 Parent
 
 本章使用 [选源清单](<../../11_rtl_project/MANIFEST.json>)，L1–18 对应的 control0_empty_provider195_fixture_v18 / candidate_normal_rebind195_v44。宏包括 DDR6_COMMAND_BUILD；RTL 顶层为 DWC_ddrctl，参考测试顶层为 tb_integrated_startup013。主顶层默认值与参考测试绑定分别读取，不把后者自动当成任意顶层实例的运行状态。
 
-下图分三张小图展示 HIF 的时钟/复位、配置/构建参数和错误/状态反馈接口。HIF_CMD 无 clk/rst 端口（纯组合 mux）；HIF_DATA 使用 `core_ddrc_core_clk` / `core_ddrc_rstn`，与 `U_wptrq`、`U_wdata_retime`、`U_par_vec` 同时钟域。IH 指针在 `co_ih_clk` 拍注册后回传 HIF_DATA，跨域关系不按固定周期展开。
+以下三张学习图已移至附录，分别说明 HIF 时钟/复位、构建参数和状态接口。HIF_CMD 无 clk/rst 端口（纯组合 mux）；HIF_DATA 使用 `core_ddrc_core_clk` / `core_ddrc_rstn`，U_wptrq及启用的重定时/校验寄存器使用同一时钟。CPF 把 IH 的 co_ih_clk 直接绑定到 core_ddrc_core_clk，因此该写指针回传是寄存器延迟，不是此连接上的异步 CDC；当前 OCECC_EN=0，WDATA_RETIME=0，可选重定时不实例化。
 
-~~~mermaid
-flowchart LR
-    CLK["core_ddrc_core_clk<br/>arb_top 顶层时钟"]
-    RST["core_ddrc_rstn<br/>arb_top 顶层复位(低有效)"]
-    CMD["HIF_CMD<br/>无 clk / 无 rst 端口<br/>(纯组合 mux)"]
-    DATA["HIF_DATA<br/>.clk = core_ddrc_core_clk<br/>.rst_n = core_ddrc_rstn"]
-    GFIFO["U_wptrq (DWC_ddr_umctl2_gfifo)<br/>.clk / .rst_n 同 HIF_DATA"]
-    RT["U_wdata_retime<br/>(WDATA_RETIME=1 时)"]
-    IHPTR["IH core_out_if 出口寄存器<br/>co_ih_clk 拍注册<br/>hif_wdata_ptr/valid"]
-    CLK --> DATA
-    RST --> DATA
-    DATA --> GFIFO
-    DATA --> RT
-    CMD -.->|"无时钟, 组合选择"| DATA
-    IHPTR -.->|"跨域: 指针在 co_ih_clk 注册<br/>回传到 HIF_DATA(core_ddrc_core_clk)"| DATA
-~~~
+学习图已移至[图 A-6：HIF 与 IH 指针的时钟绑定学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-28)；其适用条件与RTL依据随图保留。
 
 下图展示 DDR5 原有配置与 DDR6 候选新增/绑定参数如何影响 HIF_DATA 行为：
 
-~~~mermaid
-flowchart LR
-    subgraph BASE["DDR5 原有配置"]
-        NP["NPORTS / INT_NPORTS_DATA"]
-        PTR["MEMC_WDATA_PTR_BITS<br/>WDATA_PTR_QD (默认32)"]
-        RT["WDATA_RETIME<br/>(=OCECC_EN)"]
-        RMW["M_USE_RMW / DCH_INTERLEAVE"]
-        OCP["OCPAR_EN / OCCAP_EN"]
-    end
-    subgraph D6["DDR6 候选新增/绑定"]
-        PA2["PA_OPT_TYPE=2 / DUAL_PA=0"]
-        EXP["DDR6_HIF_PARENT_EXPERIMENT<br/>DDR6_HIF_AR_FACT/AR_CHILD_EXPERIMENT<br/>DDR6_IH_AW_FACT_EXPERIMENT"]
-        PKT["DDR6_HOST_PACKET_EXPERIMENT=0"]
-        WPT["DDR6_HIF_WDATA_PARENT_TRANSPORT=1"]
-        R1D["DDR6_R1_FIRST_STORE_ENABLE<br/>→ R1_DATA_BUILD 状态观察"]
-    end
-    BASE --> HIF["影响 HIF_DATA 行为"]
-    D6 --> HIF
-~~~
+学习图已移至[图 A-7：HIF 参数依赖学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-29)；其适用条件与RTL依据随图保留。
 
 下图展示 HIF_DATA 的错误与状态反馈输出，区分常规错误转发与 R1_DATA_BUILD 限定状态观察：
 
-~~~mermaid
-flowchart LR
-    HD["HIF_DATA"]
-    HD -->|"occap_hif_data_par_err"| TOP1["occap 聚合<br/>(wptrq_par_err / par_vec / wdatar)"]
-    HD -->|"wr_poison_intr"| TOP2["Poison 中断<br/>(受 reg_ddrc_wr_poison_intr_en/clr)"]
-    HD -->|"e_aw_slverr"| XPI1["XPI 写错误响应"]
-    HD -->|"e_rerror"| XPI2["XPI 读错误合并"]
-    HD -->|"内部早 B: e_bvalid/e_bid/e_bresp"| XPIB["XPI 写响应(本地早 B)"]
-    HD -.->|"R1_DATA_BUILD 时<br/>r1_data_known/baseline/events"| OBS["状态观察(诊断)"]
-~~~
+学习图已移至[图 A-8：HIF 错误与诊断输出学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-30)；其适用条件与RTL依据随图保留。
 
 | 设计事项 | DDR5 原有机制 | DDR6 候选修改 | 当前生效条件 | 尚待确认或验证 |
 | --- | --- | --- | --- | --- |
@@ -2690,32 +2494,8 @@ DDR6 候选在命令侧增加同 Grant 的身份/事实校验，在数据侧增�
 
 下图对照 DDR5 与 DDR6 HIF 在命令选择、写指针队列、写数据路由、读返回、请求身份传递、来源一致性检查和反压七个方面的差异，标出当前是否生效：
 
-~~~mermaid
-flowchart LR
-    subgraph D5["DDR5 原有机制"]
-        D5CMD["命令选择<br/>同 Grant 选字段<br/>纯组合 mux, 无 FIFO"]
-        D5PTR["写指针队列<br/>wptrq_wr/rd 包尾出队"]
-        D5W["写数据路由<br/>e_wready 三条件 AND"]
-        D5R["读返回<br/>Token 低位选端口"]
-        D5ID["请求身份<br/>Token + wdata_ptr"]
-        D5CHK["来源一致性<br/>两条同源队列顺序对应<br/>无显式 Parent 比较"]
-    end
-    subgraph D6["DDR6 候选修改"]
-        D6CMD["命令选择<br/>+ Parent/Fact/Child 旁带<br/>同源校验(实验开关)"]
-        D6PTR["写指针队列<br/>原字与深度保留<br/>+ FIFO 状态观察(R1_DATA_BUILD)"]
-        D6W["写数据路由<br/>+ Parent 随同 retime/数据阶段保持"]
-        D6R["读返回<br/>HIF 核心保留<br/>前置受限返回接收器(8×128→2×512)"]
-        D6ID["请求身份<br/>命令侧 Parent/Fact/Child<br/>数据侧 Parent 同阶段保持"]
-        D6CHK["来源一致性<br/>HIF 局部检查<br/>显式比较在 DP Join"]
-    end
-    D5CMD --> D6CMD
-    D5PTR --> D6PTR
-    D5W --> D6W
-    D5R --> D6R
-    D5ID --> D6ID
-    D5CHK --> D6CHK
-~~~
-
+<!-- FIG-31: redundancy removed; original frozen in diagram_audit -->
+本重复对照图删除；§7.10～7.11原对照表及图7-1～7-5保留命令mux、wptrq、读路由和DP Join比较位置。
 
 <a id="ih-detailed-design"></a>
 # 第8章 IH 详细设计
@@ -2737,28 +2517,27 @@ flowchart LR
 
 下图给出 IH 在 MC 中的总体 I/O 架构，标出上游（HIF_CMD、PA/HIF_DATA 指针/Credit 回前端）、配置（地址映射寄存器、CPF/CP 控制网络）和下游（TE、WU、MR）的实际连接。写数据不经过 IH；IH 没有直接 IH→PAS 的 ready/valid 端口。
 
+<a id="fig-32"></a>
+
+**图 8-1：IH 控制、描述与 Entry 接口（原 FIG-32）**
+
 ~~~mermaid
-flowchart LR
-    HIF["HIF_CMD<br/>(上游命令/地址)"]:::upstream
-    CFG["配置/地址映射<br/>dh_ih_*, reg_ddrc_*"]:::config
-    TE["TE<br/>(读执行/坐标/retry)"]:::downstream
-    WU["WU<br/>(写描述/停流)"]:::downstream
-    MR["MR<br/>(写Entry归还)"]:::downstream
-    PA["PA/HIF_DATA<br/>(指针/Credit回前端)"]:::upstream
-    CTRL["CPF/CP 控制网络<br/>gsfsm/排空/超时"]:::config
-    IH["IH 输入宿主<br/>地址解释·Entry·接纳·状态"]:::ih
-    HIF -->|"hif_cmd_valid/type/addr/token/<br/>pri/length/wdata_ptr/autopre/latency"| IH
-    CFG -->|"operating_mode, ddr4, density,<br/>dis_hif, burst_rdwr, ecc_type"| IH
-    IH -->|"hif_cmd_stall (反压)"| HIF
-    IH -->|"ih_te_rd/wr_valid, rank/bg/bank/<br/>page/block_num, entry, tag, length"| TE
-    TE -->|"te_ih_free_rd_entry, te_ih_retry,<br/>te_ih_wr_combine"| IH
-    IH -->|"ih_wu_wr_valid, critical_dword<br/>(写描述, 非写数据)"| WU
-    WU -->|"wu_ih_flow_cntrl_req (停流)"| IH
-    MR -->|"mr_ih_free_wr_entry"| IH
-    IH -->|"hif_wdata_ptr, hif_wr/lpr/hpr_credit"| PA
-    IH -->|"ih_busy, ih_fifo_wr/rd_empty,<br/>ih_yy_xact_valid, gs_*_timed_out"| CTRL
-    CTRL -->|"gsfsm_sr_co_if_stall,<br/>te_gs_any_vpr_timed_out"| IH
+flowchart TB
+  C["HIF原生命令<br/>经封装到达"] --> I["IH FIFO / 映射 / Entry"]
+  G["配置 / 控制网络"] --> I
+  I -->|"读写坐标 / Entry / tag"| T["TE"]
+  T -->|"retry / 读Entry归还"| I
+  I -.->|"经CPF写描述gate"| W["WU"]
+  W -.->|"wu_ih_flow_cntrl_req"| I
+  M["MR"] -.->|"写Entry归还"| I
+  I -.->|"Credit / Stall经封装"| P["PA / arb_top资格"]
+  I -.->|"登记写指针"| H["HIF_DATA wptrq"]
+  I -->|"空 / busy / timeout状态"| G
 ~~~
+
+**读图说明：** IH接收原生命令、配置和控制；向TE交付坐标/Entry，向WU交付写描述。TE/MR分别归还资源，WU停流反馈回IH。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [I01 ih_core_in_if.sv L518-534;567-575;631-650;905-913;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)；[I03 ih_core_out_if.sv L160-179;200-220;255-280;310-325;372-390](<../../11_rtl_project/rtl/variants/candidate_strict_iter013_v35/ih_core_out_if.sv>)；[I06 ih_fifo_if.sv L103-148;188-202](<../../11_rtl_project/rtl/variants/candidate_remaining_phase021_v4/ih_fifo_if.sv>)；[I09 ih_te_if.sv L290-335](<../../11_rtl_project/rtl/variants/candidate_strict_iter013_v12/ih_te_if.sv>)；[W01 memc_wu.sv L348-397;708-736;816-853](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/memc_wu.sv>)；[W03 dwc_ddrctl_ddrc_dp.sv L735-814;1073-1135;1261-1285;1392-1496](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)；[L01 te_misc.sv L437-447](<../../11_rtl_project/rtl/variants/candidate_te_misc_metadata_v3/te_misc.sv>)；[L02 mr_ram_rd_pipeline.sv L1395-1423](<../../11_rtl_project/rtl/variants/candidate_local_ram_producer176_v4/mr_ram_rd_pipeline.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 本轮采用既有 MANIFEST 选源，对照真实 DDR5 原包和候选源码；各项构建条件、静态接线、实际状态推进与验证范围分别陈述。没有把软件指南的新控制桥与当前数据路径默认为同一交付版本。
 
@@ -2771,25 +2550,27 @@ IH 输入的是 XPI 拆包后、经 HIF 选择的内部命令地址及类型、�
 
 原 core_in_if 在 `hif_cmd_valid && !hif_cmd_stall` 时把字段写入两条目 FIFO；后续映射使用同一个队头。address_map_wrapper 选择原映射结果，地址位经配置的 offset 形成 rank、BG/bank、row、block 和 critical-word 坐标，再由 te_if 交付。这些是控制器使用的器件坐标，不描述芯片内部存储单元的物理布局。依据：[E08](#rtl-evidence-index)、[E09](#rtl-evidence-index)；[原映射输出与实例](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_address_map_wrapper.sv>)，L153–185、[原请求 tag 与映射坐标交付](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_te_if.sv>)，L253–277。
 
-下图展示 DDR5 IH 的地址解释与映射流程：HIF_CMD 命令经寄存器驱动的 `ih_address_map_wrapper` → `ih_address_map`（Rank/BG/Bank/Row/Column 位解释）→ `ih_address_map_pkt`（burst/包调整）→ `ih_te_if`（按命令类型组织坐标/Entry/tag）→ TE。DDR5 地址映射是寄存器驱动的 donor `ih_address_map`，候选 DDR6 保留这三份文件字节相同。
+下图按真实实例嵌套展示 DDR5 IH 地址映射：`ih_address_map_wrapper` 内实例化 `ih_address_map_pkt0`，后者再实例化 `ih_address_map0`；坐标沿实例输出返回 wrapper，再供 `ih_te_if` 组织 Entry/tag 并交 TE。不是 map 与 pkt 两条并行路径，也不是两个模块依次推进的状态机。候选保留这三份 donor 映射文件字节相同。
+
+<a id="fig-33"></a>
+
+**图 8-2：DDR5 地址映射的真实嵌套结构（原 FIG-33）**
 
 ~~~mermaid
-flowchart LR
-    CMD["HIF_CMD<br/>hif_cmd_addr/type/length"]:::in
-    REG["寄存器配置<br/>dh_ih_*, reg_ddrc_burst_rdwr"]:::in
-    AMW["ih_address_map_wrapper<br/>地址映射集成"]:::ih
-    AM["ih_address_map<br/>Rank/BG/Bank/Row/Column 位解释"]:::ih
-    AMP["ih_address_map_pkt<br/>burst/包相关调整"]:::ih
-    TEIF["ih_te_if<br/>按命令类型组织坐标/Entry/tag"]:::ih
-    TE["TE (后端)"]:::out
-    CMD --> AMW
-    REG --> AMW
-    AMW --> AM
-    AMW --> AMP
-    AM -->|"rank/bankgroup/bank/<br/>page/block/critical_dword"| TEIF
-    AMP -->|"burst 调整字段"| TEIF
-    TEIF -->|"ih_te_rd/wr_*<br/>坐标+Entry+tag+length"| TE
+flowchart TB
+  F["IH FIFO原命令地址"] --> W["ih_address_map_wrapper"]
+  C["寄存器映射配置"] --> W
+  W -->|"am_cpu_address / offsets"| P["ih_address_map_pkt0"]
+  P -->|"地址位解释"| A["ih_address_map0"]
+  A -->|"坐标返回"| P
+  P -->|"map0_am_*"| W
+  W --> T["ih_te_if 坐标与命令分类"]
+  T --> E["TE坐标 / Entry / tag"]
 ~~~
+
+**读图说明：** 箭头表示地址与结果在真实嵌套实例间传递；map位于pkt内部，pkt位于wrapper内部，映射输出经wrapper到ih_te_if。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [I07 ih_address_map_wrapper.sv L160-223](<../../11_rtl_project/rtl/source/src/ih/ih_address_map_wrapper.sv>)；[I08 ih_address_map_pkt.sv L130-180](<../../11_rtl_project/rtl/source/src/ih/ih_address_map_pkt.sv>)；[I09 ih_te_if.sv L290-335](<../../11_rtl_project/rtl/variants/candidate_strict_iter013_v12/ih_te_if.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 原设计也有非法地址处理，不能写成“DDR6 首次增加所有地址检查”。IH 按非二进制密度配置检查特定行位组合，形成 invalid_addr_nonbinary，并向读/写请求附加地址错误标志。原逻辑还形成供后续错误路径使用的修正行号；看见该信号不能据此认定非法地址被正常重映射执行。依据：[原非二进制行地址检查](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih.sv>)，L543–575、[地址错误按请求类别传递](<../../review_inputs/ddr5_original/ddr54_src/i_DWC_ddrctl_ddr54/src/ih/ih_te_if.sv>)，L199–214。
 
@@ -2829,21 +2610,7 @@ assign allocate_wr_entry  = wr_valid_int && (~wr_retry) && (~wr_combine);
 
 原 IH 入口与出口之间已有解耦。入口 put 是 HIF 有效且无 stall；输出 valid 需要 FIFO 非空并且 WU 不要求停流；get 还要无 TE retry。请求类型决定读/写/RMW 的 valid，Entry 在相应有效和非重试条件下使用。原 te_pipeline 和 retry_mux 在本配置中已经是组合传递，不能按名字补出一个额外 FIFO。
 
-~~~mermaid
-flowchart TB
-  H["HIF 内部命令<br/>地址、Token、写指针和属性"] --> F["IH 两条目输入 FIFO<br/>valid 且无 stall 时 put"]
-  F --> M["原地址映射<br/>寄存器 offset 与地址错误标志"]
-  M --> T["te_if 请求分类与坐标交付"]
-  P["IH Entry 空闲编号池"] -->|"候选条目编号"| T
-  T --> E["TE 有效且非 retry 时接受<br/>相应 Entry 分配"]
-  T --> W["WU 写请求描述<br/>关联后续数据组织"]
-  E --> S["PAS 等后端调度"]
-  E -.->|"retry 阻止当前头推进"| F
-  W -.->|"数据侧流控"| F
-  S --> R["TE 读调度释放记录"]
-  R -->|"归还读 Entry"| P
-  MR["MR 实际写数据读出进度"] -->|"归还写 Entry"| P
-~~~
+学习图已移至[图 A-9：DDR5 FIFO 与 Entry 生命周期学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-34)；其适用条件与RTL依据随图保留。
 
 图表示原请求交付和资源关系，不规定固定拍距；数据本身的 HIF→WU 路由已由第 7 章说明。过滤后的分配条件仍按第 8.2.3 节，不把带错误标志的请求都当作普通 CAM 插入。
 
@@ -2872,6 +2639,10 @@ XPI 负责原请求拆分与 Token，PA/HIF 负责选择和同源交付；IH 不
 
 当前方案有两条需要会合的读请求信息流。原生内部命令继续经过 HIF 和原输入 FIFO；原始 AR 事实经独立发布/跨域入口进入 IH 的 normalizer。后者生成统一描述或拒绝结果并保持，TE intake 接收后，再与真正抵达的原生 Child 匹配。它们不能画成“先规范化，随后才由同一槽分配全部原生命令”的单一路径。
 
+<a id="fig-35"></a>
+
+**图 8-3：IH 原生命令与 Canonical 双路径（原 FIG-35）**
+
 ~~~mermaid
 flowchart TB
   A["已接受原始 AR 的事实<br/>经原始读发布/跨域入口"] --> N["IH normalizer<br/>成对上下文、地址及形状检查"]
@@ -2887,6 +2658,10 @@ flowchart TB
   E -.->|"actual_read_accept 回告同一头"| F
   C --> W["写请求交给 TE / WU<br/>按各自接受和流控推进"]
 ~~~
+
+**读图说明：** 上路为独立原始AR规范化及结果保存，下路为IH原生命令头。TE匹配同一Parent/Fact及资源后，实际CAM装入回告原生头消费。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [I01 ih_core_in_if.sv L518-534;567-575;631-650;905-913;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)；[I02 ih_core_in_if.sv L905-913;1129-1180;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)；[I05 ih.sv L1100-1130;1219-1256;1849-1873](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih.sv>)；[N01 ddr6_ih_original_read_normalizer.sv L215-265;302-315;333-364](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_ih_original_read_normalizer.sv>)；[N04 ddr6_te_original_read_intake.sv L169-249;316-355](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_te_original_read_intake.sv>)；[N05 teengine.sv L798-805;853-865;1578-1588;2897-2920](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/teengine.sv>)；[N06 te_rd_cam.sv L424-428](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/te_rd_cam.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
 
 图中的结果槽是 normalizer 内部存储，TE intake 还有独立的保留记录；它们都不是原命令 FIFO 或 Entry 池。写侧沿原交付框架加入事实、解释和受限分列资格，不经过这个仅用于原始读解释的结果槽。图省略 MC 封装的纯接线；真实接受回接和相邻模块关系分别在第 8.6、8.7 节展开。
 
@@ -2939,29 +2714,28 @@ flowchart TB
 
 下图展示 DDR6 候选的分层地址合法性检查流程，按 Profile 区分 8B/16B 单位与 PSD/BG 含义，分层检查配置、编码、坐标、形状和能力，输出 descriptor（合法）、typed reject（非法）或 capability_wait（合法但超能力）：
 
+<a id="fig-36"></a>
+
+**图 8-4：Geometry 检查与结果判定（原 FIG-36）**
+
 ~~~mermaid
-flowchart TD
-    RAW["原始请求 raw<br/>address/length/size/burst"]:::in
-    CFG["cfg/geometry snapshot<br/>profile_id, density, acv/gmv"]:::in
-    CTX["owner context/domain<br/>publication/reset_epoch"]:::in
-    DECODE["ddr6_host_address_decode<br/>按Profile切位: 2p3=8B / 2p6,1p6=16B"]:::chk
-    GEO["ddr6_canonical_geometry_builder<br/>几何/版本/上下文一致"]:::chk
-    COORD["ddr6_geometry_coordinate_check<br/>bank/row/column 范围合法"]:::chk
-    RES["ddr6_geometry_resource_map<br/>rank/package/cid/resource_identity"]:::chk
-    NORM["normalizer 综合判定<br/>error_now / unsupported / capability_wait"]:::chk
-    RAW --> DECODE
-    CFG --> DECODE
-    CTX --> DECODE
-    DECODE --> GEO
-    DECODE --> COORD
-    DECODE --> RES
-    GEO --> NORM
-    COORD --> NORM
-    RES --> NORM
-    NORM -->|"error_now=NONE 且 finite_shape"| OKD["descriptor_now<br/>(合法, 交TE候选)"]:::ok
-    NORM -->|"error_now!=NONE"| REJ["reject_now<br/>(typed reject)"]:::bad
-    NORM -->|"unsupported / owner_wait<br/>(合法但超capability)"| WAIT["capability_wait<br/>(保持等待, 不自动reject)"]:::wait
+flowchart TB
+  A["原AR / Fact / owner关联"] --> D["normalizer目标decode<br/>内含builder / coordinate / resource map"]
+  C["已发布cfg / geometry / context"] --> D
+  A --> K["逐列坐标检查 / 形状检查"]
+  C --> K
+  D --> N["error_now / unsupported判定"]
+  K --> N
+  N -->|"req_fire且无error"| Q["单结果槽: descriptor"]
+  N -->|"req_fire且有error"| R["单结果槽: typed reject"]
+  O["running / coherent / owner / slot资格"] -.->|"req_ready门控"| N
 ~~~
+
+**读图说明：** 目标decode和逐列检查提供判定输入，ready门控决定何时登记描述或拒绝。Profile未开、超形状和身份矛盾另按图下注释分类。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [N01 ddr6_ih_original_read_normalizer.sv L215-265;302-315;333-364](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_ih_original_read_normalizer.sv>)；[N02 ddr6_ih_original_read_normalizer.sv L121-195;266-299](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_ih_original_read_normalizer.sv>)；[N03 ddr6_host_address_decode.sv L110-137;152-200;220-253](<../../11_rtl_project/rtl/source/src/ddr6/ddr6_host_address_decode.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
+
+[CONFIRMED/CONDITIONAL] finite_shape为INCR、size6、length1/3、128B对齐、lock/autopre0且同1KB前缀。unsupported阻止req_ready且不自动reject；owner未齐、capability未绑定、Profile未启用/上下文不成对分别门控。真正矛盾可锁存fault/containment；编码/坐标错误只有在req_fire后才形成带原因拒绝，不承诺等待自动成功。
 
 当前 builder 对 Profile 编码 3（1p12）及 Metadata 模式 1/2 返回规范待落实的门控状态，对产品位图未开、拓扑不匹配和构建容量不足则分别分类。这是当前实现的限制，不能改写成“DDR6 标准禁止这些模式”。MD_OFF、CRC 和 Non-data 的具体搬运范围沿用[第 7 章的数据路径边界](#hif-build-scope)，本章不据地址表扩大支持范围。
 
@@ -2992,17 +2766,25 @@ flowchart TD
 
 槽内的有效位 valid_q 和类型位 reject_kind_q 决定当前保存描述还是拒绝；描述含目标坐标、资源身份、事务与版本等，拒绝含事务身份、原因和复位代次，两者共用 Fact、证明域和上下文保存。结果槽只容纳一个尚未交付的解释结果，TE intake 可以另外按事务保存已接收结果，不能据此认定整个 MC 只能有一个在途请求。
 
+<a id="fig-37"></a>
+
+**图 8-5：单结果槽与 TE intake 独立记录（原 FIG-37）**
+
 ~~~mermaid
 flowchart TB
-  A["原始读请求通过本地 ready/valid"] --> Q["IH 单结果槽<br/>描述或拒绝、Fact、证明域、上下文"]
-  Q --> H["TE 未 ready：保留槽内容<br/>上下文及会话资格持续检查"]
-  H --> Q
-  Q --> F["描述握手或拒绝握手<br/>terminal_fire"]
-  F --> T["TE intake 保存事务记录<br/>后续等待并匹配真实 Child"]
-  F --> S["IH 结果槽可释放<br/>同拍可写入下一结果"]
-  T --> C["Child 匹配及资源身份合格"]
-  C --> L["实际 CAM 插入确认<br/>另行控制 IH 原生命令头消费"]
+  A["原始读req_valid且req_ready"] --> Q["IH单结果槽<br/>valid_q及描述或拒绝"]
+  Q -->|"descriptor_valid且descriptor_ready"| D["TE intake描述 / Fact / context记录"]
+  Q -->|"reject_valid且reject_ready"| R["TE intake拒绝记录"]
+  D --> J["匹配原生Child与资源owner"]
+  J -.->|"经资格 / retry / clock使能"| C["实际CAM装入"]
+  T["terminal_fire为两种结果握手之或"] -.->|"清valid_q；req_fire可同拍覆盖"| Q
 ~~~
+
+**读图说明：** 同一结果槽只保存描述或拒绝之一；两类握手进入TE的不同记录，只有描述参与正常Child匹配。terminal_fire清槽，req_fire可同拍替换。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [N01 ddr6_ih_original_read_normalizer.sv L215-265;302-315;333-364](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_ih_original_read_normalizer.sv>)；[N04 ddr6_te_original_read_intake.sv L169-249;316-355](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_te_original_read_intake.sv>)；[N05 teengine.sv L798-805;853-865;1578-1588;2897-2920](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/teengine.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
+
+反压时valid_q及结果/Fact/context保持；running失效可能隐藏valid但保留引用。TE按事务保留seen/Child历史，容量由BUILD_TXN_SLOTS决定（本参考32），与IH单结果槽独立；拒绝握手不进入正常Child/CAM。
 
 释放条件是结果接口握手，而非原生命令出队或 Host RLAST：
 
@@ -3034,24 +2816,27 @@ IH 的 canonical 分支以 actual_read_accept、cr_head_consume_prepared 和非 
 
 下图展示请求从 IH 结果/描述经 TE intake Child 匹配到 CAM 装入与 Entry 分配的完整流程，并标出七个需要分别判断的事件：
 
+<a id="fig-38"></a>
+
+**图 8-6：Child join、CAM 装入与 FIFO get（原 FIG-38）**
+
 ~~~mermaid
-flowchart TD
-    SLOT["IH normalizer<br/>结果槽 descriptor"]:::ih
-    FIFO["IH 原生命令 FIFO<br/>(两条目, 头部child命令)"]:::ih
-    ENTRY["IH Entry 空闲池<br/>ih_fifo_if/token_fifo<br/>分配/归还"]:::ih
-    INTAKE["TE intake<br/>保存结果, 同源Child匹配"]:::te
-    CHILD["child_candidate_valid<br/>→ child_join_valid"]:::te
-    CAM["te_rd_cam<br/>load_cam / cr_actual_cam_load"]:::te
-    TEENG["teengine<br/>cr_actual_read_accept"]:::te
-    SLOT -->|"descriptor_valid/ready"| INTAKE
-    FIFO -->|"原生child命令/parent"| CHILD
-    INTAKE --> CHILD
-    CHILD -->|"child_join_valid + owner/fence/target"| CAM
-    CAM -->|"cr_actual_cam_load"| TEENG
-    TEENG -->|"cr_actual_read_accept"| FIFO
-    ENTRY -->|"ih_te_rd/wr_entry (分配编号)"| INTAKE
-    TEENG -.->|"te_ih_free_rd_entry 归还"| ENTRY
+flowchart TB
+  S["IH normalizer结果槽"] -->|"descriptor握手"| I["TE intake独立事务记录"]
+  F["IH原生命令FIFO头"] -->|"Parent / Fact / Child / 坐标"| J["child_candidate_valid / child_join_valid"]
+  I --> J
+  J -->|"并owner / carrier / 读资格"| C["te_rd_cam load_cam<br/>非retry且companion许可"]
+  C -->|"并ddrc_cg_en"| A["cr_actual_cam_load"]
+  A -->|"并canonical enable / qualified reset"| R["cr_actual_read_accept"]
+  R --> G["IH get门控<br/>prepared / 非retry / 同头 / admission / 非empty"]
+  G -->|"fifo_get"| F
 ~~~
+
+**读图说明：** 候选Child、join、load_cam、实际CAM load、actual_read_accept和fifo_get逐层受不同条件约束。Entry空闲池为另一资源对象，见下方说明。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [I01 ih_core_in_if.sv L518-534;567-575;631-650;905-913;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)；[I02 ih_core_in_if.sv L905-913;1129-1180;1717-1721](<../../11_rtl_project/rtl/variants/candidate_rd_return_receiver122_v4/ih_core_in_if.sv>)；[I06 ih_fifo_if.sv L103-148;188-202](<../../11_rtl_project/rtl/variants/candidate_remaining_phase021_v4/ih_fifo_if.sv>)；[N04 ddr6_te_original_read_intake.sv L169-249;316-355](<../../11_rtl_project/rtl/variants/candidate_normal_bundle040_v1/ddr6_te_original_read_intake.sv>)；[N05 teengine.sv L798-805;853-865;1578-1588;2897-2920](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/teengine.sv>)；[N06 te_rd_cam.sv L424-428](<../../11_rtl_project/rtl/variants/candidate_write_cohort194_v8/te_rd_cam.sv>)；[L01 te_misc.sv L437-447](<../../11_rtl_project/rtl/variants/candidate_te_misc_metadata_v3/te_misc.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
+
+IH Entry由ih_fifo_if/token_fifo分配，编号随原命令交TE，而非分配给intake结果记录。读Entry由te_misc在调度ts_op_is_rd、clock enable条件下归还，写Entry由MR读RAM进度归还；均不同于Host完成。
 
 因此，波形中看到解释成功、descriptor_fire 或 child_join_valid，都不足以单独认定原命令头已经推进。调试时应同时观察结果握手、实际 CAM 插入和实际 FIFO get，分别回答“结果交出了吗”“后端接受了吗”“这一头出队了吗”。
 
@@ -3068,30 +2853,26 @@ IH 既要向后端交付坐标，也要服从后端能否接受的反馈。当�
 
 下图分别展示 IH 写请求交接（6A）和读请求交接（6B）。写数据不经过 IH，只送写描述与 critical_dword；读返回数据也不直接经过 IH，IH 的 token 用于关联但数据 payload 不进 IH。
 
-~~~mermaid
-flowchart LR
-    WCMD["HIF_CMD 写命令<br/>type=block write, addr, wdata_ptr"]:::in
-    IH["IH 地址解释<br/>ih_te_wr_* + ih_wu_wr_valid"]:::ih
-    CPF["CPF checked-head gate<br/>AW_COLUMNS 开启时要求<br/>raw valid + 同头pop + reset + clk_en"]:::cpf
-    WU["DP.memc_wu<br/>写描述FIFO put/pop"]:::wu
-    WDATA["用户写数据<br/>HIF_DATA → WU"]:::data
-    WCMD --> IH
-    IH --> CPF --> WU
-    WDATA -.->|"写数据不经IH"| WU
-    IH -->|"wu_ih_flow_cntrl_req"| IH
-~~~
+<a id="fig-39"></a>
+
+**图 8-7：IH 写描述、WU 停流与旁路写数据（原 FIG-39）**
 
 ~~~mermaid
 flowchart LR
-    RCMD["HIF_CMD 读命令<br/>type=read, addr, token"]:::in
-    IHR["IH 地址解释<br/>+ Canonical 结果槽"]:::ih
-    TE["TE intake / te_rd_cam<br/>Child匹配 + CAM load"]:::te
-    PAS["PAS 等后端调度"]:::te
-    RET["读返回数据<br/>经后端返回结构 → HIF_DATA"]:::ret
-    RCMD --> IHR --> TE --> PAS
-    PAS -.->|"读返回数据<br/>不直接经IH"| RET
-    TE -->|"cr_actual_read_accept"| IHR
+  H["HIF_CMD写命令"] -.->|"经封装"| I["IH写头与坐标 / Entry"]
+  I -->|"raw写描述valid"| C["CPF checked-head gate<br/>head_pop / reset / ddrc_cg_en"]
+  C -->|"ih_wu_wr_valid"| Q["WU描述FIFO<br/>put另须wdata_reqd且非retry"]
+  Q -->|"队头Entry / word_num"| W["WU数据接受与RAM地址"]
+  D["HIF_DATA写数据 / Parent"] -.->|"经DP直达"| W
+  Q -.->|"full驱动wu_ih_flow_cntrl_req<br/>经DP / CPF回传"| I
 ~~~
+
+**读图说明：** 写描述必须经过CPF同头消费门控及WU描述FIFO准入；HIF_DATA写数据经DP直接送WU。描述头Entry/word_num关联数据位置，描述FIFO满向IH停流。
+
+**RTL 依据与适用条件：** DDR6_COMMAND_BUILD当前选源；候选新增分支限reference dut及类型/参数/运行资格，bare top默认与生产目标分开。 [I04 dwc_ddrctl_ddrc_cpf.sv L950-995;1999-2003](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_cpf.sv>)；[W01 memc_wu.sv L348-397;708-736;816-853](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/memc_wu.sv>)；[W02 memc_wu_wdata_if.sv L247-293;405-431](<../../11_rtl_project/rtl/variants/candidate_joint_aw_wu021_v5/memc_wu_wdata_if.sv>)；[W03 dwc_ddrctl_ddrc_dp.sv L735-814;1073-1135;1261-1285;1392-1496](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/dwc_ddrctl_ddrc_dp.sv>)。证据等级为静态源码及绑定，未新增elaboration/仿真/波形通过声明。
+
+<!-- FIG-40: redundancy removed; original frozen in diagram_audit -->
+本合并读通路图删除；原生命令流与Canonical结果流分别保留在图4-2、图8-3和图8-5中，不能合并成串行处理链。
 
 | 交互对象 | IH 输入或输出的信息 | 协作目的 | 责任边界 |
 | --- | --- | --- | --- |
@@ -3102,23 +2883,7 @@ flowchart LR
 | XPI/PA | XPI 请求经 PA 选择、HIF 汇合进入 IH；IH 的读写 Credit 经封装反馈上游请求资格 | 将前端授权与后端资源预算衔接 | XPI 负责拆分/Token，PA 负责服务选择；IH 不是重新执行一次 Host 仲裁 |
 | MR 等资源归还路径 | 写 Entry 归还经 MC 封装到 IH；读 Entry 由 TE 调度记录归还 | 复用原 Entry 池并维持独立资源生命周期 | Entry 归还不等于读数据已返回或写 B 已产生 |
 
-~~~mermaid
-flowchart TB
-  X["XPI 原始请求组织"] --> P["PA 服务选择"]
-  P --> H["HIF 命令汇合及数据路由"]
-  H -->|"原生命令与旁带"| I["IH FIFO、地址解释和 Entry 交接"]
-  I -.->|"Credit 经封装回传"| P
-  I -.->|"stall 与写路由指针"| H
-  I -->|"坐标、Entry、身份及读解释结果"| T["TE 请求表与 Child 匹配"]
-  T -.->|"retry、实际读接受、读 Entry 归还"| I
-  I -->|"写请求描述"| W["WU 写数据组织"]
-  W -.->|"停流"| I
-  H -->|"写数据"| W
-  T --> S["PAS 等后端调度"]
-  I -.->|"队列空状态"| G["MC 运行/排空控制"]
-  G -.->|"停流条件"| I
-  S --> B["相邻读写后端及 PI<br/>外部传输另有接口合同"]
-~~~
+学习图已移至[图 A-10：四模块协作学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-41)；其适用条件与RTL依据随图保留。
 
 图以逻辑接口分组，省略纯封装接线和并行反馈，不表达固定串行延迟。TE→PAS 的执行路径沿用[第 3 章](#ddr5-original-architecture)，写数据和返回链路沿用[第 7 章](#hif-detailed-design)。IH 不直接据这些箭头生成 PHY 电气时序。
 
@@ -3161,37 +2926,8 @@ normalizer 接受的有限形状含 INCR、SIZE=6、LEN=1 或 3，分别为两�
 
 下图直观展示 2p3、2p6、1p6 和 256B 四种 Profile/访问形状在地址解释、合法性检查、请求交接和完整数据路径四个层次的当前支持状态，强调“地址合法性通过 ≠ 完整读写数据路径支持”：
 
-~~~mermaid
-flowchart LR
-    subgraph P23["2p3 / 8B 单位"]
-        P23A["地址解释: 有 8B 列与 PSD 分支"]
-        P23B["合法性: 逐列/坐标/上下文检查"]
-        P23C["交接: TE 可解释 8B 列<br/>当前 fixture 未开位图"]
-        P23D["数据路径: 未确认<br/>16×8B 读返回桥未验证"]
-        P23A --> P23B --> P23C --> P23D
-    end
-    subgraph P26["2p6 / 16B 单位"]
-        P26A["地址解释: 16B 列、双 PSD 几何"]
-        P26B["合法性: 范围/版本/坐标检查"]
-        P26C["交接: 诊断绑定开启读接受链"]
-        P26D["数据路径: 受限八片段模型<br/>本任务不提供功能通过声明"]
-        P26A --> P26B --> P26C --> P26D
-    end
-    subgraph P16["1p6 / 16B 单位"]
-        P16A["地址解释: 16B 列, PSD 进 BG"]
-        P16B["合法性: 几何与坐标检查"]
-        P16C["交接: 形状相容<br/>当前 fixture 未开位图"]
-        P16D["数据路径: 未确认"]
-        P16A --> P16B --> P16C --> P16D
-    end
-    subgraph P256["256B 访问"]
-        P256A["地址解释: 两个 128B Child"]
-        P256B["合法性: 最多32列有限范围检查"]
-        P256C["交接: TE 有两 Child 语义<br/>不证明通过全部分列资格"]
-        P256D["数据路径: 固定128B/8片段<br/>不能充当完整256B证据"]
-        P256A --> P256B --> P256C --> P256D
-    end
-~~~
+<!-- FIG-42: redundancy removed; original frozen in diagram_audit -->
+本重复Profile图删除；下方原有范围表保留2p3、2p6、1p6、256B及完整数据路径的全部限制，不增加Profile支持声明。
 
 | Profile/访问形状 | IH 地址解释 | 合法性检查 | 请求交接 | 完整数据路径 | 当前限制与证据 |
 | --- | --- | --- | --- | --- | --- |
@@ -3209,40 +2945,13 @@ flowchart LR
 
 反压并不只有“FIFO 满”一种来源。原命令会遇到 Credit 预算、TE retry 和 WU 停流；新增读解释会遇到单结果槽占用、上下文未齐和 TE intake 事务槽不可覆盖。当前读关联不合格还会并入 TE retry，见 [读关联资格并入重试](<../../11_rtl_project/rtl/variants/candidate_normal_rebind195_v44/teengine.sv>)，L853–865。retry 只是当周期不能正常消费的结果，并未说明原因一定会自行消失。
 
-下图把“不向前推进”按原因分为非法请求（typed reject）、合法但超能力（等待）、合法但资源不足（反压/等待）三类，避免混为一谈：
+下面的学习图入口将编码/坐标错误、Profile未启用、超实现形状、关联未齐、资源反压和实质矛盾分开；形成拒绝还须本地接受，超能力请求没有等待后自动成功的保证：
 
-~~~mermaid
-flowchart TD
-    REQ["原始请求"]:::wait
-    REQ -->|"direction/system_metadata/burst 非法"| I1["CR_ERR_REQUEST_ENCODING<br/>(非法编码)"]:::illegal
-    REQ -->|"acv/reset_epoch 不匹配"| I2["CR_ERR_VERSION_MISMATCH<br/>(版本非法)"]:::illegal
-    REQ -->|"地址范围/坐标越界"| I3["CR_ERR_DEVICE/BANK/ROW/COLUMN<br/>(坐标越界)"]:::illegal
-    REQ -->|"profile_id=3 gated"| I4["CR_ERR_PROFILE_CONTEXT<br/>(Profile 非法)"]:::illegal
-    REQ -->|"finite_shape 不满足"| S1["unsupported<br/>(形状超当前实现)"]:::shape
-    REQ -->|"witness/proof 未就绪"| S2["owner_wait<br/>(身份/证明待就绪)"]:::res
-    REQ -->|"capability_binding 未就绪"| S3["capability_wait<br/>(能力绑定待就绪)"]:::res
-    S1 --> WAIT["等待, 不自动reject"]:::wait
-    S2 --> WAIT
-    S3 --> WAIT
-    REQ -->|"合法且能力就绪"| OK["descriptor 交付<br/>→ TE Child匹配 → CAM"]:::ok
-    WAIT -->|"就绪后"| OK
-    I1 --> REJ["typed reject<br/>(reject_q)"]:::illegal
-    I2 --> REJ
-    I3 --> REJ
-    I4 --> REJ
-~~~
+学习图已移至[图 A-11：拒绝、超能力与隔离学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-43)；其适用条件与RTL依据随图保留。
 
-下面再用一张图区分资源/反压类等待（不属非法），它们应保持请求而非 reject：
+另一张学习图按实际门控位置说明资源与反压；身份或上下文实质矛盾另按故障/隔离处理，不能统一归入普通Stall：
 
-~~~mermaid
-flowchart LR
-    R1["Entry 空闲池不足"]:::res --> STALL["反压/等待<br/>(不是reject)"]:::bp
-    R2["结果槽被占用<br/>slot_available=0"]:::res --> STALL
-    R3["下游 TE Stall<br/>descriptor_ready=0"]:::res --> STALL
-    R4["WU 停流<br/>wu_ih_flow_cntrl_req=1"]:::res --> STALL
-    R5["te_ih_retry=1"]:::res --> STALL
-    R6["Child/owner/carrier<br/>不匹配"]:::res --> STALL
-~~~
+学习图已移至[图 A-12：暂时反压的独立作用点学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-44)；其适用条件与RTL依据随图保留。
 
 | 场景 | 当前应如何理解状态推进 | 核对重点 |
 | --- | --- | --- |
@@ -3320,42 +3029,15 @@ flowchart LR
 
 下图分三张小图展示 IH 的时钟/复位、配置/地址映射和错误/状态接口。IH 端口 `co_ih_clk`=core_ddrc_core_clk，`core_ddrc_rstn`；DDR6 normalizer 另用 `qualified_functional_reset_n`、`raw_reset_n`、`async_owner_session_valid`，权限丢失时 `permission_lost_q` 置位但结果槽不被异步清。
 
-~~~mermaid
-flowchart LR
-    CLK["co_ih_clk<br/>core_ddrc_core_clk"]:::clk
-    RST["core_ddrc_rstn<br/>(qualified/raw)"]:::rst
-    IH["IH 内部<br/>输入FIFO/地址解释/Entry/状态"]:::ih
-    NORM["DDR6 normalizer<br/>qualified_functional_reset_n<br/>+ raw_permission_n<br/>+ async_owner_session_valid"]:::ih
-    CLK --> IH
-    RST --> IH
-    CLK --> NORM
-    RST --> NORM
-~~~
+学习图已移至[图 A-13：IH 时钟、功能复位与权限学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-45)；其适用条件与RTL依据随图保留。
 
 下图展示 DDR5 寄存器配置与 DDR6 cfg/geometry snapshot 如何分别驱动 donor `ih_address_map` 与 `ddr6_host_address_decode`：
 
-~~~mermaid
-flowchart LR
-    REG["DDR5 寄存器配置<br/>dh_ih_operating_mode/ddr4/<br/>nonbinary_device_density/dis_hif/<br/>reg_ddrc_burst_rdwr/ecc_type"]:::cfg
-    IHD["IH donor address_map"]:::ih
-    SNAP["DDR6 cfg/geometry snapshot<br/>profile_id/density/acv/gmv/<br/>topology/active_device_count"]:::d6
-    DECODE["ddr6_host_address_decode<br/>policy=1, BUILD_BOUND=1"]:::d6
-    GEO["geometry_builder/coordinate_check"]:::d6
-    REG --> IHD
-    SNAP --> DECODE --> GEO
-~~~
+学习图已移至[图 A-14：原地址映射与候选 Geometry 配置学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-46)；其适用条件与RTL依据随图保留。
 
 下图展示 IH 的错误标志、状态输出和上游反压接口：
 
-~~~mermaid
-flowchart LR
-    IH["IH"]:::ih
-    IH -->|"ih_te_rd/wr_valid_addr_err"| ERR["地址错误标志→CP过滤"]:::err
-    IH -->|"hif_wdata_ptr_addr_err"| ERR
-    IH -->|"ih_busy, ih_fifo_wr/rd_empty,<br/>ih_yy_xact_valid, ih_gs_*_timed_out"| ST["排空/超时/深度状态→调度"]:::st
-    IH -->|"result_reference_present,<br/>containment, first_fault_*<br/>(DDR6 normalizer)"| D6["候选诊断/containment状态"]:::st
-    IH -->|"hif_cmd_stall"| UP["上游反压"]:::bp
-~~~
+学习图已移至[图 A-15：IH 地址错误、反压与诊断学习图](appendices/DDR6_MC_IO_Diagram_Study_Appendix.md#fig-47)；其适用条件与RTL依据随图保留。
 
 IH 顶层 canonical、快照、Host 解码等默认开关为 0；参考测试通过参数显式开启 canonical read、类型/格式绑定、快照、Host 解码、AR Child 和相应交接。参考参数存在只能确认测试绑定意图，不能替代当前一次运行的初始化状态、正常业务资格或握手证据。
 
@@ -3398,36 +3080,5 @@ HIF 交付命令和路由数据，TE 维护请求关联，WU 组织写数据，P
 
 下图对照 DDR5 与 DDR6 IH 在地址映射、Profile/Geometry、地址合法性检查、Entry 管理、请求接纳、Canonical 结果保持、下游消费门控、非法请求处理和反压机制九个方面的差异：
 
-~~~mermaid
-flowchart LR
-    subgraph D5["DDR5 原有机制"]
-        D5MAP["地址映射<br/>寄存器驱动 donor ih_address_map"]
-        D5GEO["Profile/Geometry<br/>无独立上下文"]
-        D5CHK["合法性检查<br/>donor address_map 内置范围"]
-        D5ENT["Entry 管理<br/>ih_fifo_if/token_fifo 空闲池"]
-        D5ADM["请求接纳<br/>valid && !stall + retry/WU"]
-        D5CAN["Canonical 结果保持<br/>无同等单结果状态"]
-        D5REJ["非法请求处理<br/>donor 范围内 stall/retry"]
-        D5BP["反压<br/>hif_cmd_stall + retry + WU flow"]
-    end
-    subgraph D6["DDR6 候选修改"]
-        D6MAP["地址映射<br/>旧三份字节保留 + host decode policy1"]
-        D6GEO["Profile/Geometry<br/>cfg/geometry snapshot + 版本化校验"]
-        D6CHK["合法性检查<br/>逐列 bank/row/column + finite_shape + owner"]
-        D6ENT["Entry 管理<br/>原算法保留 + 观察接口"]
-        D6ADM["请求接纳<br/>+ 复位/session/normal admission"]
-        D6CAN["Canonical 结果保持<br/>normalizer 单结果槽<br/>(候选实现, 非JEDEC强制)"]
-        D6CONS["下游消费门控<br/>cr_actual_read_accept + prepared + !retry"]
-        D6REJ["非法请求处理<br/>typed reject + unsupported/wait"]
-        D6BP["反压<br/>+ normal admission fence"]
-    end
-    D5MAP --> D6MAP
-    D5GEO --> D6GEO
-    D5CHK --> D6CHK
-    D5ENT --> D6ENT
-    D5ADM --> D6ADM
-    D5CAN --> D6CAN
-    D5REJ --> D6REJ
-    D5BP --> D6BP
-    D6CAN --> D6CONS
-~~~
+<!-- FIG-48: redundancy removed; original frozen in diagram_audit -->
+本重复小结图删除；本节原对照表及图8-1～8-7保留地址映射、Entry、单结果槽、真实消费和异常边界。
